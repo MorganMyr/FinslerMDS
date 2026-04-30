@@ -1,6 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
+from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
+
+from .graph import metric_graph_from_support, symmetric_knn_graph
 
 
 def set_window_title(fig, title):
@@ -159,6 +163,437 @@ def plot_proj_points(proj, X=None, knn=None, X_noiseless=None, shape_type=None, 
     return fig, ax
 
 
+def plot_categorical_embedding(
+    embedding,
+    labels=None,
+    title=None,
+    xlabel="Embedding 1",
+    ylabel="Embedding 2",
+    save_path=None,
+    fig_ax=None,
+    s=8,
+    cmap="tab20",
+):
+    """Plot a 2D embedding, optionally colored by categorical labels."""
+    embedding = np.asarray(embedding)
+    if embedding.ndim != 2 or embedding.shape[1] != 2:
+        raise ValueError("embedding must have shape (n_samples, 2).")
+
+    if fig_ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig, ax = fig_ax
+
+    if labels is None:
+        ax.scatter(embedding[:, 0], embedding[:, 1], s=s, lw=0)
+    else:
+        if hasattr(labels, "astype") and hasattr(labels.astype("category"), "cat"):
+            values = labels.astype("category")
+            codes = values.cat.codes.to_numpy()
+            categories = list(values.cat.categories)
+        else:
+            categories, codes = np.unique(np.asarray(labels), return_inverse=True)
+            categories = list(categories)
+
+        scatter = ax.scatter(
+            embedding[:, 0],
+            embedding[:, 1],
+            c=codes,
+            cmap=cmap,
+            s=s,
+            lw=0,
+        )
+        handles, _ = scatter.legend_elements()
+        ax.legend(
+            handles,
+            categories,
+            title="labels",
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            borderaxespad=0,
+            fontsize=8,
+        )
+
+    if title is not None:
+        ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path)
+    return fig, ax
+
+
+def nearest_point_index(points, coord):
+    """Return the index of the point closest to ``coord``."""
+    points = np.asarray(points)
+    coord = np.asarray(coord)
+    if points.ndim != 2:
+        raise ValueError("points must have shape (n_samples, n_features).")
+    if coord.shape != (points.shape[1],):
+        raise ValueError(f"coord must have shape ({points.shape[1]},).")
+    return int(np.argmin(np.linalg.norm(points - coord, axis=1)))
+
+
+def build_geodesic_plot_graph(
+    embedding,
+    metric,
+    n_neighbors=5,
+    support_graph=None,
+    neighbors_algorithm="auto",
+    n_jobs=None,
+):
+    """Build the directed metric-weighted kNN graph used for path plots."""
+    embedding = np.asarray(embedding)
+    if support_graph is None:
+        support_graph = symmetric_knn_graph(
+            embedding,
+            n_neighbors=n_neighbors,
+            neighbors_algorithm=neighbors_algorithm,
+            n_jobs=n_jobs,
+        )
+    return metric_graph_from_support(embedding, support_graph, metric)
+
+
+def geodesic_path_indices(
+    embedding,
+    source,
+    target,
+    metric,
+    n_neighbors=5,
+    graph=None,
+    directed=True,
+):
+    """Return the vertex indices of the shortest path between two points."""
+    embedding = np.asarray(embedding)
+    if graph is None:
+        graph = build_geodesic_plot_graph(embedding, metric, n_neighbors=n_neighbors)
+
+    _, predecessors = dijkstra(
+        graph,
+        directed=directed,
+        indices=int(source),
+        return_predecessors=True,
+    )
+    return _path_from_predecessors(predecessors, int(source), int(target))
+
+
+def add_geodesic_path(
+    ax,
+    embedding,
+    source,
+    target,
+    metric,
+    n_neighbors=5,
+    graph=None,
+    directed=True,
+    color="crimson",
+    linewidth=3,
+    alpha=1.0,
+    endpoint_color="black",
+    endpoint_size=60,
+    source_marker="o",
+    target_marker="X",
+    show_arrow=False,
+    arrow_size=0.5,
+    zorder=10,
+):
+    """Add one graph-geodesic path to an existing 2D or 3D embedding plot."""
+    embedding = np.asarray(embedding)
+    path = geodesic_path_indices(
+        embedding,
+        source,
+        target,
+        metric,
+        n_neighbors=n_neighbors,
+        graph=graph,
+        directed=directed,
+    )
+    if path is None:
+        return None
+    _plot_path(ax, embedding, path, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+    _plot_path_endpoints(
+        ax,
+        embedding,
+        path,
+        color=endpoint_color,
+        size=endpoint_size,
+        source_marker=source_marker,
+        target_marker=target_marker,
+        zorder=zorder + 1,
+    )
+    if show_arrow:
+        _plot_path_arrow(
+            ax,
+            embedding,
+            path,
+            color=endpoint_color,
+            arrow_size=arrow_size,
+            alpha=alpha,
+            zorder=zorder + 2,
+        )
+    return path
+
+
+def add_geodesic_path_by_coords(
+    ax,
+    embedding,
+    source_coord,
+    target_coord,
+    metric,
+    n_neighbors=5,
+    graph=None,
+    directed=True,
+    **plot_kwargs,
+):
+    """Add a path between the points nearest to two coordinates."""
+    source = nearest_point_index(embedding, source_coord)
+    target = nearest_point_index(embedding, target_coord)
+    return add_geodesic_path(
+        ax,
+        embedding,
+        source,
+        target,
+        metric,
+        n_neighbors=n_neighbors,
+        graph=graph,
+        directed=directed,
+        **plot_kwargs,
+    )
+
+
+def add_random_geodesic_paths(
+    ax,
+    embedding,
+    n_paths,
+    metric,
+    n_neighbors=5,
+    random_state=None,
+    graph=None,
+    directed=True,
+    colors=None,
+    linewidth=3,
+    alpha=0.9,
+    endpoint_darken=0.45,
+    endpoint_size=45,
+    source_marker="o",
+    target_marker="X",
+    show_arrows=False,
+    arrow_size=0.5,
+    zorder=10,
+):
+    """Add random graph-geodesic paths to an existing embedding plot."""
+    embedding = np.asarray(embedding)
+    rng = np.random.default_rng(random_state)
+    if graph is None:
+        graph = build_geodesic_plot_graph(embedding, metric, n_neighbors=n_neighbors)
+
+    pairs = _random_distinct_pairs(len(embedding), n_paths, rng)
+    colors = _path_colors(n_paths, colors)
+    sources = np.unique(pairs[:, 0])
+    _, predecessors = dijkstra(
+        graph,
+        directed=directed,
+        indices=sources,
+        return_predecessors=True,
+    )
+    source_to_row = {source: row for row, source in enumerate(sources)}
+
+    paths = []
+    for path_id, (source, target) in enumerate(pairs):
+        pred_row = predecessors[source_to_row[source]]
+        path = _path_from_predecessors(pred_row, int(source), int(target))
+        if path is None:
+            continue
+        path_color = colors[path_id]
+        endpoint_color = _darken_color(path_color, endpoint_darken)
+        _plot_path(ax, embedding, path, color=path_color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+        _plot_path_endpoints(
+            ax,
+            embedding,
+            path,
+            color=endpoint_color,
+            size=endpoint_size,
+            source_marker=source_marker,
+            target_marker=target_marker,
+            zorder=zorder + 1,
+        )
+        if show_arrows:
+            _plot_path_arrow(
+                ax,
+                embedding,
+                path,
+                color=endpoint_color,
+                arrow_size=arrow_size,
+                alpha=alpha,
+                zorder=zorder + 2,
+            )
+        paths.append(path)
+    return paths
+
+
+def _path_colors(n_paths, colors):
+    if colors is None:
+        cmap = plt.get_cmap("tab10")
+        colors = [cmap(i % cmap.N) for i in range(n_paths)]
+    elif len(colors) == 0:
+        raise ValueError("colors must be None or contain at least one color.")
+    else:
+        colors = [colors[i % len(colors)] for i in range(n_paths)]
+    return colors
+
+
+def _darken_color(color, factor):
+    rgb = np.asarray(to_rgb(color))
+    return tuple(np.clip(factor * rgb, 0, 1))
+
+
+def _random_distinct_pairs(n_points, n_pairs, rng):
+    if n_points < 2:
+        raise ValueError("At least two points are needed to draw paths.")
+    pairs = rng.integers(0, n_points, size=(n_pairs, 2))
+    same = pairs[:, 0] == pairs[:, 1]
+    while np.any(same):
+        pairs[same, 1] = rng.integers(0, n_points, size=np.sum(same))
+        same = pairs[:, 0] == pairs[:, 1]
+    return pairs
+
+
+def _path_from_predecessors(predecessors, source, target):
+    if source == target:
+        return [source]
+
+    path = [target]
+    current = target
+    while current != source:
+        previous = int(predecessors[current])
+        if previous < 0:
+            return None
+        path.append(previous)
+        current = previous
+    path.reverse()
+    return path
+
+
+def _plot_path(ax, embedding, path, *, color, linewidth, alpha, zorder):
+    path_points = embedding[path]
+    if embedding.shape[1] == 2:
+        ax.plot(
+            path_points[:, 0],
+            path_points[:, 1],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+            zorder=zorder,
+        )
+    elif embedding.shape[1] == 3:
+        ax.plot(
+            path_points[:, 0],
+            path_points[:, 1],
+            path_points[:, 2],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+            zorder=zorder,
+        )
+    else:
+        raise ValueError("embedding must be 2D or 3D.")
+
+
+def _plot_path_endpoints(
+    ax,
+    embedding,
+    path,
+    *,
+    color,
+    size,
+    source_marker,
+    target_marker,
+    zorder,
+):
+    source = embedding[path[0]]
+    target = embedding[path[-1]]
+    if embedding.shape[1] == 2:
+        ax.scatter(source[0], source[1], color=color, s=size, marker=source_marker, zorder=zorder)
+        ax.scatter(target[0], target[1], color=color, s=size, marker=target_marker, zorder=zorder)
+    elif embedding.shape[1] == 3:
+        ax.scatter(
+            source[0],
+            source[1],
+            source[2],
+            color=color,
+            s=size,
+            marker=source_marker,
+            zorder=zorder,
+        )
+        ax.scatter(
+            target[0],
+            target[1],
+            target[2],
+            color=color,
+            s=size,
+            marker=target_marker,
+            zorder=zorder,
+        )
+
+
+def _plot_path_arrow(ax, embedding, path, *, color, arrow_size, alpha, zorder):
+    if len(path) < 2:
+        return
+
+    path_points = embedding[path]
+    segment_id = _first_nonzero_segment(path_points)
+    if segment_id is None:
+        return
+
+    start = path_points[segment_id]
+    end = path_points[segment_id + 1]
+    direction = end - start
+    length = np.linalg.norm(direction)
+    if length <= 1e-12:
+        return
+
+    base = start
+    arrow = arrow_size * direction / length
+    if embedding.shape[1] == 2:
+        ax.annotate(
+            "",
+            xy=base + arrow,
+            xytext=base,
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": color,
+                "lw": 1.8,
+                "alpha": alpha,
+                "mutation_scale": 14,
+            },
+            zorder=zorder,
+        )
+    elif embedding.shape[1] == 3:
+        ax.quiver(
+            base[0],
+            base[1],
+            base[2],
+            arrow[0],
+            arrow[1],
+            arrow[2],
+            color=color,
+            arrow_length_ratio=0.45,
+            linewidth=1.8,
+            alpha=alpha,
+            zorder=zorder,
+        )
+
+
+def _first_nonzero_segment(path_points):
+    segments = path_points[1:] - path_points[:-1]
+    lengths = np.linalg.norm(segments, axis=1)
+    nonzero = np.flatnonzero(lengths > 1e-12)
+    if len(nonzero) == 0:
+        return None
+    return int(nonzero[0])
+
+
 def get_extrema(X, radius=1):
     assert X.shape[1] == 3
 
@@ -247,6 +682,13 @@ __all__ = [
     "set_axes_equal",
     "plot_points",
     "plot_proj_points",
+    "plot_categorical_embedding",
+    "nearest_point_index",
+    "build_geodesic_plot_graph",
+    "geodesic_path_indices",
+    "add_geodesic_path",
+    "add_geodesic_path_by_coords",
+    "add_random_geodesic_paths",
     "get_extrema",
     "plot_randers_w_arrow",
 ]

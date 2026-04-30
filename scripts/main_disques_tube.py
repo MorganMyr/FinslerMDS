@@ -4,7 +4,6 @@ import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.decomposition import KernelPCA
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -17,24 +16,26 @@ from finsler_mds.api import fit_finsler_mds
 def main_disques_tube():
     # Hyperparameters
     n_disk = 80
-    n_tube = 30
-    disk_radius = 1.7
+    n_tube = 25
+    disk_radius = 1.5
     tube_radius = 0.45
     center_gap = 2.0
     disk_normal_noise = 0.04
     tube_radial_noise = 0.18
     randers_alpha_tube = 0.45
     randers_alpha_disk = 0.25
-    randers_alpha_embedding = 0.45
-    k = 8
+    randers_alpha_smacof_embedding = 0.45
+    randers_alpha_geodesic_embedding = 0.45
+    k = 7
     proj_dim = 3
-    max_iter_smacof = 3000
-    max_iter_path_frozen = 50
-    inner_iter_path_frozen = 5
+    max_iter_smacof = 800
+    max_iter_path_frozen = 40
+    inner_iter_path_frozen = 10
+    n_path_plot = 5
     max_iter_datasp = 25
     n_graph_updates_datasp = 10
     beta_datasp = 10.0
-    seed = 42
+    seed = 41
     dir_res = "res/disques_tube"
 
     rng = np.random.default_rng(seed)
@@ -65,13 +66,8 @@ def main_disques_tube():
         f"Original disks+tube: tube alpha={randers_alpha_tube}, disk alpha={randers_alpha_disk}",
         dir_res,
         "disques_tube_original.pdf",
-        quiver_field=randers_field,
+        quiver_field=-randers_field,
     )
-
-    print("Original data")
-    print(f"  n={len(X)}, disk_radius={disk_radius}, tube_radius={tube_radius}, center_gap={center_gap}")
-    print("  one disk is horizontal, one disk is vertical")
-    print(f"  Randers field alpha in curved tube={randers_alpha_tube}, alpha in disks={randers_alpha_disk}")
 
     print("Target Randers geodesic distances")
     dists_f, _ = utils.compute_dist_matrix(
@@ -94,23 +90,12 @@ def main_disques_tube():
     ax_dists.set_title("Target Randers geodesic distances")
     fig_dists.savefig(os.path.join(dir_res, "disques_tube_target_distances.pdf"))
 
-    print("UMAP warm-start")
-    dists_sym = (dists_f + dists_f.T) / 2
-    proj_umap = umap_warm_start(dists_sym, proj_dim, seed)
-    plot_embedding(
-        proj_umap,
-        color,
-        "UMAP warm-start",
-        dir_res,
-        "disques_tube_umap.pdf",
-    )
-
     print("Randers SMACOF")
     proj_smacof, stress_smacof = fit_finsler_mds(
         dists_f,
-        metric=RandersMetric(alpha=randers_alpha_embedding),
+        metric=RandersMetric(alpha=randers_alpha_smacof_embedding),
         optimizer="smacof_randers",
-        init=proj_umap,
+        init=init,
         n_components=proj_dim,
         n_init=1,
         n_jobs=1,
@@ -125,7 +110,7 @@ def main_disques_tube():
     plot_embedding(
         proj_smacof,
         color,
-        f"Randers SMACOF alpha={randers_alpha_embedding}",
+        f"Randers SMACOF alpha={randers_alpha_smacof_embedding}",
         dir_res,
         "disques_tube_randers_smacof.pdf",
     )
@@ -133,9 +118,9 @@ def main_disques_tube():
     print("Randers path-frozen")
     proj_path_frozen, stress_path_frozen = fit_finsler_mds(
         dists_f,
-        metric=RandersMetric(alpha=randers_alpha_embedding),
+        metric=RandersMetric(alpha=randers_alpha_geodesic_embedding),
         optimizer="path_frozen",
-        init=proj_umap,
+        init=init,
         n_components=proj_dim,
         weight=weights,
         n_neighbors=k,
@@ -146,20 +131,33 @@ def main_disques_tube():
         optimizer_options={"ftol": 1e-9, "maxls": 50},
         print_time=True,
     )
-    plot_embedding(
+    fig_path_frozen, ax_path_frozen = plot_embedding(
         proj_path_frozen,
         color,
-        f"Randers path-frozen alpha={randers_alpha_embedding}",
+        f"Randers path-frozen alpha={randers_alpha_geodesic_embedding}",
         dir_res,
         "disques_tube_randers_path_frozen.pdf",
     )
+    utils.add_random_geodesic_paths(
+        ax_path_frozen,
+        proj_path_frozen,
+        n_paths=n_path_plot,
+        metric=RandersMetric(alpha=randers_alpha_geodesic_embedding),
+        n_neighbors=k,
+        random_state=seed,
+        linewidth=3,
+        alpha=0.9,
+        arrow_size=1,
+    )
+    fig_path_frozen.savefig(os.path.join(dir_res, "disques_tube_randers_path_frozen.pdf"))
 
+    """
     print("Randers DataSP")
     proj_datasp, stress_datasp = fit_finsler_mds(
         dists_f,
-        metric=RandersMetric(alpha=randers_alpha_embedding),
+        metric=RandersMetric(alpha=randers_alpha_geodesic_embedding),
         optimizer="datasp",
-        init=proj_umap,
+        init=init,
         n_components=proj_dim,
         weight=weights,
         n_neighbors=k,
@@ -174,15 +172,16 @@ def main_disques_tube():
     plot_embedding(
         proj_datasp,
         color,
-        f"Randers DataSP alpha={randers_alpha_embedding}, beta={beta_datasp}",
+        f"Randers DataSP alpha={randers_alpha_geodesic_embedding}, beta={beta_datasp}",
         dir_res,
         "disques_tube_randers_datasp.pdf",
     )
+    """
 
     print("Stress summary")
     print("  Randers SMACOF:", stress_smacof)
     print("  Randers path-frozen:", stress_path_frozen)
-    print("  Randers DataSP:", stress_datasp)
+    #print("  Randers DataSP:", stress_datasp)
 
     plt.show()
 
@@ -240,32 +239,11 @@ def sample_disks_tube(
     ])
 
     randers_field = np.vstack([
-        inward_disk_field(horizontal_disk, horizontal_center, randers_alpha_disk),
-        inward_disk_field(vertical_disk, vertical_center, randers_alpha_disk),
-        -randers_alpha_tube * tube_tangents,
+        -inward_disk_field(horizontal_disk, horizontal_center, randers_alpha_disk),
+        -inward_disk_field(vertical_disk, vertical_center, randers_alpha_disk),
+        randers_alpha_tube * tube_tangents,
     ])
     return X, labels, randers_field
-
-
-def umap_warm_start(dists, n_components, random_state):
-    try:
-        import umap
-
-        reducer = umap.UMAP(
-            n_components=n_components,
-            metric="precomputed",
-            random_state=random_state,
-            n_neighbors=10,
-        )
-        return reducer.fit_transform(dists)
-    except ImportError:
-        kernel_pca = KernelPCA(
-            n_components=n_components,
-            kernel="precomputed",
-            eigen_solver="auto",
-        ).set_output(transform="default")
-        gram = -0.5 * dists ** 2
-        return kernel_pca.fit_transform(gram)
 
 
 def sample_oriented_disk(n, radius, *, center, tangent_1, tangent_2, normal, normal_noise, rng):
