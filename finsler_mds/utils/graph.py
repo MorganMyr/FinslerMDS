@@ -126,6 +126,131 @@ def compute_metric_dist_matrix(
     )
 
 
+def velocity_directed_graph(
+        X,
+        velocity,
+        n_neighbors=30,
+        alpha=1.0,
+        velocity_neighbors=None,
+        average_velocity=True,
+        symmetrize_support=True,
+        neighbors_algorithm="auto",
+        n_jobs=None,
+):
+    """Build a directed kNN graph whose edge weights follow a velocity field.
+
+    For an edge ``i -> j``, the weight is
+    ``||X_j - X_i|| * exp(-alpha * cos(theta))``, where ``theta`` is the angle
+    between the local velocity at ``i`` and ``X_j - X_i``. Moving with the
+    velocity is cheaper, moving against it is more expensive.
+    """
+    X = np.asarray(X, dtype=float)
+    velocity = np.asarray(velocity, dtype=float)
+    if X.shape != velocity.shape:
+        raise ValueError("X and velocity must have the same shape.")
+
+    support = symmetric_knn_graph(
+        X,
+        n_neighbors=n_neighbors,
+        neighbors_algorithm=neighbors_algorithm,
+        n_jobs=n_jobs,
+    )
+    if not symmetrize_support:
+        nbrs = NearestNeighbors(
+            n_neighbors=n_neighbors,
+            algorithm=neighbors_algorithm,
+            n_jobs=n_jobs,
+        )
+        nbrs.fit(X)
+        support = kneighbors_graph(nbrs, n_neighbors, mode="distance", n_jobs=n_jobs).tocsr()
+
+    velocity_used = velocity
+    if average_velocity:
+        velocity_used = average_vectors_on_graph(
+            velocity,
+            support,
+            include_self=True,
+            n_neighbors=velocity_neighbors,
+        )
+
+    support_coo = support.tocoo()
+    edge_vectors = X[support_coo.col] - X[support_coo.row]
+    edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+    source_velocity = velocity_used[support_coo.row]
+    velocity_norms = np.linalg.norm(source_velocity, axis=1)
+
+    denom = velocity_norms * edge_lengths
+    cosines = np.divide(
+        np.sum(source_velocity * edge_vectors, axis=1),
+        denom,
+        out=np.zeros_like(edge_lengths),
+        where=denom > 1e-12,
+    )
+    cosines = np.clip(cosines, -1.0, 1.0)
+    edge_weights = edge_lengths * np.exp(-alpha * cosines)
+
+    graph = scipy.sparse.csr_matrix(
+        (edge_weights, (support_coo.row, support_coo.col)),
+        shape=support.shape,
+    )
+    return graph, velocity_used
+
+
+def average_vectors_on_graph(vectors, graph, include_self=True, n_neighbors=None):
+    """Average vectors over graph outgoing neighborhoods."""
+    vectors = np.asarray(vectors, dtype=float)
+    graph = graph.tocsr()
+    averaged = np.zeros_like(vectors)
+
+    for i in range(graph.shape[0]):
+        neighbors = graph.indices[graph.indptr[i]:graph.indptr[i + 1]]
+        if n_neighbors is not None and len(neighbors) > n_neighbors:
+            distances = graph.data[graph.indptr[i]:graph.indptr[i + 1]]
+            keep = np.argpartition(distances, int(n_neighbors) - 1)[:int(n_neighbors)]
+            neighbors = neighbors[keep]
+        if include_self:
+            neighbors = np.concatenate(([i], neighbors))
+        if len(neighbors) == 0:
+            averaged[i] = vectors[i]
+        else:
+            averaged[i] = np.mean(vectors[neighbors], axis=0)
+
+    return averaged
+
+
+def compute_velocity_dist_matrix(
+        X,
+        velocity,
+        n_neighbors=30,
+        alpha=1.0,
+        velocity_neighbors=None,
+        average_velocity=True,
+        symmetrize_support=True,
+        path_method="auto",
+        neighbors_algorithm="auto",
+        n_jobs=None,
+):
+    """Compute directed shortest-path distances induced by a velocity field."""
+    graph, velocity_used = velocity_directed_graph(
+        X,
+        velocity,
+        n_neighbors=n_neighbors,
+        alpha=alpha,
+        velocity_neighbors=velocity_neighbors,
+        average_velocity=average_velocity,
+        symmetrize_support=symmetrize_support,
+        neighbors_algorithm=neighbors_algorithm,
+        n_jobs=n_jobs,
+    )
+    dist_matrix, predecessors = shortest_path(
+        graph,
+        method=path_method,
+        directed=True,
+        return_predecessors=True,
+    )
+    return dist_matrix, predecessors, graph, velocity_used
+
+
 def dijkstra_all_pairs(graph, directed=True):
     return dijkstra(
         graph,
@@ -270,6 +395,9 @@ __all__ = [
     "nearest_neighbors",
     "symmetric_knn_graph",
     "softmin_with_probs",
+    "average_vectors_on_graph",
+    "velocity_directed_graph",
+    "compute_velocity_dist_matrix",
     "metric_graph_from_support",
     "compute_metric_dist_matrix",
     "dijkstra_all_pairs",

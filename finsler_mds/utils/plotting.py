@@ -33,25 +33,44 @@ def _set_axes_radius(ax, origin, radius):
     ax.set_zlim3d([z - radius, z + radius])
 
 
-def plot_points(X, X_noiseless=None, shape_type=None, quiver_field=None, step_quiver=None):
+def sample_plot_indices(n_points, point_fraction=1.0, random_state=None):
+    if point_fraction is None or point_fraction >= 1:
+        return np.arange(n_points)
+    if point_fraction <= 0:
+        raise ValueError("point_fraction must be in (0, 1].")
+    n_keep = max(1, int(np.ceil(point_fraction * n_points)))
+    rng = np.random.default_rng(random_state)
+    return np.sort(rng.choice(n_points, size=n_keep, replace=False))
+
+
+def plot_points(
+    X,
+    X_noiseless=None,
+    shape_type=None,
+    quiver_field=None,
+    step_quiver=None,
+    point_fraction=1.0,
+    random_state=None,
+):
     assert X.shape[1] == 3
 
     X_ctr = X - np.mean(X, axis=0)
     X_color = X_noiseless if X_noiseless is not None else X
+    plot_idx = sample_plot_indices(len(X), point_fraction=point_fraction, random_state=random_state)
 
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
 
     scale_dot_plt = 200
     if shape_type is None:
-        ax.scatter(X_ctr[:, 0], X_ctr[:, 1], X_ctr[:, 2], s=scale_dot_plt, lw=0, alpha=1)
+        ax.scatter(X_ctr[plot_idx, 0], X_ctr[plot_idx, 1], X_ctr[plot_idx, 2], s=scale_dot_plt, lw=0, alpha=1)
     elif shape_type in ['swiss_roll']:
         factor = 200
         ax.scatter(
-            X_ctr[:, 0],
-            X_ctr[:, 1],
-            X_ctr[:, 2],
-            c=plt.cm.jet((X_color[:, 0] ** 2 + X_color[:, 2] ** 2) / factor),
+            X_ctr[plot_idx, 0],
+            X_ctr[plot_idx, 1],
+            X_ctr[plot_idx, 2],
+            c=plt.cm.jet((X_color[plot_idx, 0] ** 2 + X_color[plot_idx, 2] ** 2) / factor),
             s=scale_dot_plt,
             lw=0,
             alpha=1,
@@ -80,10 +99,22 @@ def plot_points(X, X_noiseless=None, shape_type=None, quiver_field=None, step_qu
     return fig, ax
 
 
-def plot_proj_points(proj, X=None, knn=None, X_noiseless=None, shape_type=None, edge_alpha=1., extrema=None, fig_ax=None):
+def plot_proj_points(
+    proj,
+    X=None,
+    knn=None,
+    X_noiseless=None,
+    shape_type=None,
+    edge_alpha=1.,
+    extrema=None,
+    fig_ax=None,
+    point_fraction=1.0,
+    random_state=None,
+):
     assert (proj.shape[1] == 2 or proj.shape[1] == 3)
 
     X_color = X_noiseless if X_noiseless is not None else X
+    plot_idx = sample_plot_indices(len(proj), point_fraction=point_fraction, random_state=random_state)
 
     if fig_ax is None:
         fig = plt.figure(figsize=(10, 10))
@@ -94,16 +125,20 @@ def plot_proj_points(proj, X=None, knn=None, X_noiseless=None, shape_type=None, 
     else:
         fig, ax = fig_ax
 
-    proj_scatter = (proj[:, 0], proj[:, 1]) if proj.shape[1] == 2 else (proj[:, 0], proj[:, 1], proj[:, 2])
+    proj_scatter = (
+        (proj[plot_idx, 0], proj[plot_idx, 1])
+        if proj.shape[1] == 2
+        else (proj[plot_idx, 0], proj[plot_idx, 1], proj[plot_idx, 2])
+    )
 
     if shape_type is None:
         ax.scatter(*proj_scatter, s=200, lw=0, alpha=1)
     elif shape_type in ['swiss_roll']:
         factor = 200
-        c = plt.cm.jet((X_color[:, 0] ** 2 + X_color[:, 2] ** 2) / factor) if X_color is not None else 'blue'
+        c = plt.cm.jet((X_color[plot_idx, 0] ** 2 + X_color[plot_idx, 2] ** 2) / factor) if X_color is not None else 'blue'
         ax.scatter(*proj_scatter, c=c, s=200, lw=0, alpha=1)
     elif shape_type in ['river', 'sea']:
-        c = plt.cm.jet(X_color[:, 0] / (X_color[:, 0].max() - X_color[:, 0].min())) if X_color is not None else 'blue'
+        c = plt.cm.jet(X_color[plot_idx, 0] / (X_color[:, 0].max() - X_color[:, 0].min())) if X_color is not None else 'blue'
         ax.scatter(*proj_scatter, c=c, s=100, lw=0, alpha=1, zorder=-1)
     else:
         raise ValueError('shape_type not implemented.')
@@ -138,7 +173,7 @@ def plot_proj_points(proj, X=None, knn=None, X_noiseless=None, shape_type=None, 
         fig_extrema.savefig('res/' + shape_type + '_extrema_overlay.pdf', format='pdf', transparent=True)
 
     if knn is not None:
-        for i in range(len(X)):
+        for i in plot_idx:
             neighbors = knn[i]
             for j in range(len(neighbors)):
                 if proj.shape[1] == 2:
@@ -680,6 +715,7 @@ def plot_randers_w_arrow(data, ax, shape_type=None, location='top_left'):
 __all__ = [
     "set_window_title",
     "set_axes_equal",
+    "sample_plot_indices",
     "plot_points",
     "plot_proj_points",
     "plot_categorical_embedding",

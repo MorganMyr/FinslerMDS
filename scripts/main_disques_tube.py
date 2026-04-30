@@ -130,6 +130,11 @@ def main_disques_tube():
         method="L-BFGS-B",
         optimizer_options={"ftol": 1e-9, "maxls": 50},
         print_time=True,
+        local_neighbors=8,
+        n_landmarks=30,
+        landmark_mode="sources",
+        n_random_pairs=500,
+        mask_random_state=seed,
     )
     fig_path_frozen, ax_path_frozen = plot_embedding(
         proj_path_frozen,
@@ -341,15 +346,20 @@ def local_disk_radius(X, labels):
     return radial
 
 
-def plot_embedding(embedding, color, title, dir_res, filename, quiver_field=None):
+def plot_embedding(embedding, color, title, dir_res, filename, quiver_field=None, point_fraction=1.0, random_state=None):
+    plot_idx = utils.sample_plot_indices(
+        len(embedding),
+        point_fraction=point_fraction,
+        random_state=random_state,
+    )
     fig = plt.figure(figsize=(8, 7))
     utils.set_window_title(fig, title)
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(
-        embedding[:, 0],
-        embedding[:, 1],
-        embedding[:, 2],
-        c=color,
+        embedding[plot_idx, 0],
+        embedding[plot_idx, 1],
+        embedding[plot_idx, 2],
+        c=color[plot_idx],
         cmap="viridis",
         s=22,
         lw=0,

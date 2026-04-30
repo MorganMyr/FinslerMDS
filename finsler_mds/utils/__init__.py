@@ -1,4 +1,11 @@
-from .graph import compute_dist_matrix, compute_metric_dist_matrix, nearest_neighbors
+from .graph import (
+    average_vectors_on_graph,
+    compute_dist_matrix,
+    compute_metric_dist_matrix,
+    compute_velocity_dist_matrix,
+    nearest_neighbors,
+    velocity_directed_graph,
+)
 from .initialization import IsomapWithPreds
 from .plotting import (
     add_geodesic_path,
@@ -12,6 +19,7 @@ from .plotting import (
     plot_points,
     plot_proj_points,
     plot_randers_w_arrow,
+    sample_plot_indices,
     set_axes_equal,
     set_window_title,
 )
@@ -21,10 +29,14 @@ __all__ = [
     "nearest_neighbors",
     "compute_dist_matrix",
     "compute_metric_dist_matrix",
+    "compute_velocity_dist_matrix",
+    "velocity_directed_graph",
+    "average_vectors_on_graph",
     "IsomapWithPreds",
     "set_axes_equal",
     "set_window_title",
     "nearest_point_index",
+    "sample_plot_indices",
     "build_geodesic_plot_graph",
     "geodesic_path_indices",
     "add_geodesic_path",
