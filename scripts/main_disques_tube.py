@@ -135,6 +135,7 @@ def main_disques_tube():
         landmark_mode="sources",
         n_random_pairs=500,
         mask_random_state=seed,
+        device="auto",
     )
     fig_path_frozen, ax_path_frozen = plot_embedding(
         proj_path_frozen,

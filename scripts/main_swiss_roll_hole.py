@@ -155,6 +155,7 @@ def main_swiss_roll_partial():
             n_neighbors=k,
             max_iter=max_iter_finsler,
             inner_iter=inner_iter_finsler,
+            device="auto",
             print_time=True,
         )
         #np.save(os.path.join(dir_res_raw, 'proj_smacof_f_unif_' + param_str + '.npy'), proj_smacof_f_unif)
@@ -340,6 +341,7 @@ def main_swiss_roll_partial():
             n_neighbors=k,
             max_iter=max_iter_finsler,
             inner_iter=inner_iter_finsler,
+            device="auto",
             print_time=True,
         )
         #np.save(os.path.join(dir_res_raw, 'proj_smacof_f_unif_hole_' + param_str + '.npy'), proj_smacof_f_unif_hole)
@@ -383,6 +385,7 @@ def main_swiss_roll_partial():
             max_iter=max_iter_finsler,
             inner_iter=inner_iter_finsler,
             eps=1e-3,
+            device="auto",
             print_time=True,
         )
         #np.save(os.path.join(dir_res_raw, 'proj_smacof_f_wormhole_hole_' + param_str + '.npy'), proj_smacof_f_wormhole_hole)

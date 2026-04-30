@@ -10,12 +10,18 @@ The optimizer alternates between:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 import scipy.optimize
 from scipy.sparse.csgraph import dijkstra
 from sklearn.utils import check_random_state
 
+from finsler_mds.metrics import (
+    ConvexifiedMatsumotoMetric,
+    MatsumotoMetric,
+    RandersMetric,
+)
 from finsler_mds.optimizers.common import (
     initial_embedding,
     prepare_weights_and_mask,
@@ -55,6 +61,243 @@ class _ActivePairs:
     sampleable: np.ndarray
     denom: float
     n_pairs: int
+
+
+def _load_cupy():
+    try:
+        import cupy as cp
+    except Exception as exc:
+        return None, exc
+
+    try:
+        if cp.cuda.runtime.getDeviceCount() <= 0:
+            return None, RuntimeError("CuPy did not find a CUDA device.")
+        # CuPy can see a device while still missing runtime compiler libraries
+        # such as libnvrtc.so. Exercise indexing and an elementwise operation so
+        # device="auto" falls back before scipy.optimize enters its first call.
+        values = cp.arange(4, dtype=cp.float64)
+        indices = cp.asarray([0, 2], dtype=cp.int32)
+        cp.asnumpy(values[indices] + 1.0)
+    except Exception as exc:
+        return None, exc
+    return cp, None
+
+
+def _gpu_metric_supported(metric):
+    if isinstance(metric, MatsumotoMetric) and metric.forbidden_grad_norm is not None:
+        return False
+    return isinstance(metric, (RandersMetric, MatsumotoMetric, ConvexifiedMatsumotoMetric))
+
+
+def _resolve_gpu_backend(device, metric, verbose):
+    if device not in {"cpu", "auto", "gpu", "cuda"}:
+        raise ValueError("device must be one of 'cpu', 'auto', 'gpu', or 'cuda'.")
+    if device == "cpu":
+        return None
+    if not _gpu_metric_supported(metric):
+        message = (
+            "path_frozen GPU backend currently supports RandersMetric, "
+            "MatsumotoMetric, and ConvexifiedMatsumotoMetric only."
+        )
+        if device == "auto":
+            if verbose:
+                print(message + " Falling back to CPU.")
+            return None
+        raise ValueError(message)
+
+    cp, error = _load_cupy()
+    if cp is None:
+        message = f"path_frozen GPU backend unavailable: {error}"
+        if device == "auto":
+            if verbose:
+                print(message + " Falling back to CPU.")
+            return None
+        raise RuntimeError(message) from error
+
+    if verbose:
+        device_id = cp.cuda.Device().id
+        device_name = cp.cuda.runtime.getDeviceProperties(device_id)["name"]
+        if hasattr(device_name, "decode"):
+            device_name = device_name.decode()
+        print(f"path_frozen GPU backend enabled on CUDA device {device_id}: {device_name}")
+    return cp
+
+
+def _cupy_metric_length_and_grad(cp, edge_vectors, metric):
+    r = cp.linalg.norm(edge_vectors, axis=1)
+    z = edge_vectors[:, -1]
+    nonzero = r > 1e-12
+    safe_r = cp.where(nonzero, r, 1.0)
+    s = cp.where(nonzero, z / safe_r, 0.0)
+
+    if isinstance(metric, RandersMetric):
+        length = r + metric.alpha * z
+        grad = cp.where(nonzero[:, None], edge_vectors / safe_r[:, None], 0.0)
+        grad[:, -1] += metric.alpha
+        grad = cp.where(nonzero[:, None], grad, 0.0)
+        return length, grad
+
+    if isinstance(metric, MatsumotoMetric):
+        denominator = 1 - metric.alpha * s
+        allowed = denominator > 0
+        phi = cp.where(allowed, 1.0 / denominator, cp.inf)
+        dphi = cp.where(allowed, metric.alpha / denominator**2, cp.nan)
+        if metric.max_phi is not None:
+            clipped = phi >= metric.max_phi
+            phi = cp.minimum(phi, metric.max_phi)
+            dphi = cp.where(clipped, 0.0, dphi)
+        if metric.forbidden_grad_norm is not None and cp.any(~allowed & nonzero).item():
+            raise ValueError(
+                "The path_frozen GPU backend does not support MatsumotoMetric "
+                "with forbidden_grad_norm. Use device='cpu' for this metric."
+            )
+    elif isinstance(metric, ConvexifiedMatsumotoMetric):
+        if metric.alpha == 0:
+            phi = cp.ones_like(s)
+            dphi = cp.zeros_like(s)
+        else:
+            linear = s > 1 / (2 * metric.alpha)
+            denominator = 1 - metric.alpha * s
+            phi = cp.where(linear, 4 * metric.alpha * s, 1 / denominator)
+            dphi = cp.where(linear, 4 * metric.alpha, metric.alpha / denominator**2)
+    else:
+        raise TypeError(f"Unsupported GPU metric {type(metric).__name__}.")
+
+    length = r * phi
+    coeff = phi - s * dphi
+    direction = cp.where(nonzero[:, None], edge_vectors / safe_r[:, None], 0.0)
+    grad = coeff[:, None] * direction
+    grad[:, -1] += dphi
+    grad = cp.where(nonzero[:, None], grad, 0.0)
+    return length, grad
+
+
+class _GpuPathFrozenObjective:
+    def __init__(
+            self,
+            cp,
+            *,
+            shape,
+            forest,
+            active_pairs,
+            metric,
+            normalized_stress,
+            max_path_edges,
+    ):
+        self.cp = cp
+        self.shape = shape
+        self.metric = metric
+        self.normalized_stress = normalized_stress
+        self.denom = active_pairs.denom
+
+        path_offsets, path_edge_ids, weights, dissimilarities = _flatten_active_paths(
+            forest,
+            active_pairs,
+            max_path_edges=max_path_edges,
+        )
+        path_counts = np.diff(path_offsets)
+        path_ids = np.repeat(np.arange(len(path_counts), dtype=np.int32), path_counts)
+
+        self.path_offsets = cp.asarray(path_offsets[:-1], dtype=cp.int64)
+        self.path_edge_ids = cp.asarray(path_edge_ids, dtype=cp.int32)
+        self.path_ids = cp.asarray(path_ids, dtype=cp.int32)
+        self.weights = cp.asarray(weights, dtype=cp.float64)
+        self.dissimilarities = cp.asarray(dissimilarities, dtype=cp.float64)
+        self.edge_tails = cp.asarray(forest.edge_tails, dtype=cp.int32)
+        self.edge_heads = cp.asarray(forest.edge_heads, dtype=cp.int32)
+        self.n_edges = len(forest.edge_tails)
+
+    def __call__(self, X_flat):
+        cp = self.cp
+        X = cp.asarray(X_flat.reshape(self.shape))
+        grad = cp.zeros_like(X)
+
+        edge_vectors = X[self.edge_heads] - X[self.edge_tails]
+        edge_lengths, edge_grads = _cupy_metric_length_and_grad(cp, edge_vectors, self.metric)
+        if (
+            not cp.all(cp.isfinite(edge_lengths)).item()
+            or not cp.all(cp.isfinite(edge_grads)).item()
+        ):
+            raise ValueError(
+                "The metric produced a non-finite edge length or gradient "
+                "on a frozen shortest-path tree."
+            )
+
+        path_lengths = cp.add.reduceat(edge_lengths[self.path_edge_ids], self.path_offsets)
+        residual = path_lengths - self.dissimilarities
+        raw_stress = cp.sum(self.weights * residual**2)
+
+        pair_coeff = 2.0 * self.weights * residual
+        usage_coeff = pair_coeff[self.path_ids]
+        edge_adjoint = cp.bincount(
+            self.path_edge_ids,
+            weights=usage_coeff,
+            minlength=self.n_edges,
+        )
+        edge_contrib = edge_adjoint[:, None] * edge_grads
+        cp.add.at(grad, self.edge_tails, -edge_contrib)
+        cp.add.at(grad, self.edge_heads, edge_contrib)
+
+        stress = raw_stress
+        if self.normalized_stress:
+            if self.denom <= 0:
+                stress = cp.asarray(cp.inf)
+                grad *= 0.0
+            elif (raw_stress <= 0).item():
+                stress = cp.asarray(0.0)
+                grad *= 0.0
+            else:
+                stress = cp.sqrt(raw_stress / self.denom)
+                grad *= 1.0 / (2.0 * cp.sqrt(raw_stress * self.denom))
+
+        return float(stress.get()), cp.asnumpy(grad).ravel()
+
+
+def _flatten_active_paths(forest, active_pairs, *, max_path_edges):
+    path_offsets = [0]
+    path_edge_ids = []
+    weights = []
+    dissimilarities = []
+    n_samples = forest.parents.shape[1]
+
+    for source_pos, source in enumerate(forest.sources):
+        source = int(source)
+        node_to_edge = np.full(n_samples, -1, dtype=np.int32)
+        node_to_edge[forest.edge_nodes[source_pos]] = forest.edge_ids[source_pos]
+        parent = forest.parents[source_pos]
+
+        for target, weight, dissimilarity in zip(
+                active_pairs.targets[source_pos],
+                active_pairs.weights[source_pos],
+                active_pairs.dissimilarities[source_pos],
+        ):
+            current = int(target)
+            path_start = len(path_edge_ids)
+            while current != source:
+                edge_id = int(node_to_edge[current])
+                if edge_id < 0:
+                    raise ValueError("An active target path is missing from the frozen forest.")
+                path_edge_ids.append(edge_id)
+                current = int(parent[current])
+                if current < 0:
+                    raise ValueError("An active target is unreachable in the predecessor tree.")
+            if len(path_edge_ids) == path_start:
+                raise ValueError("Diagonal active pairs are not supported in flattened GPU paths.")
+            if max_path_edges is not None and len(path_edge_ids) > max_path_edges:
+                raise MemoryError(
+                    "Flattened frozen paths exceed gpu_max_path_edges="
+                    f"{max_path_edges}. Increase the limit or use device='cpu'."
+                )
+            path_offsets.append(len(path_edge_ids))
+            weights.append(float(weight))
+            dissimilarities.append(float(dissimilarity))
+
+    return (
+        np.asarray(path_offsets, dtype=np.int64),
+        np.asarray(path_edge_ids, dtype=np.int32),
+        np.asarray(weights, dtype=float),
+        np.asarray(dissimilarities, dtype=float),
+    )
 
 
 def _path_frozen_stress_and_grad(
@@ -500,6 +743,8 @@ def path_frozen(
     target_sampling="random",
     target_random_state=None,
     rescale_sampled_weights=True,
+    device="cpu",
+    gpu_max_path_edges=50_000_000,
     method="L-BFGS-B",
     optimizer_options=None,
     neighbors_algorithm="auto",
@@ -526,8 +771,13 @@ def path_frozen(
         At each outer iteration, sample at most this many targets for each
         sampleable source. Landmark sources are sampleable; if no sparse mask
         is requested, all sources are treated as sampleable.
+    ``device``
+        ``"cpu"`` keeps the historical implementation. ``"auto"`` uses a
+        CuPy/CUDA stress-gradient backend when available and falls back to CPU.
+        ``"gpu"``/``"cuda"`` require the CuPy backend to be available.
     """
     metric = validate_metric(metric)
+    gpu_backend = _resolve_gpu_backend(device, metric, verbose)
     D, W = prepare_weights_and_mask(dissimilarities, weight)
     if mask_random_state is None:
         mask_random_state = random_state
@@ -589,15 +839,39 @@ def path_frozen(
             n_jobs=n_jobs,
         )
 
-        def objective(x_flat):
-            return _path_frozen_stress_and_grad(
-                x_flat,
-                shape=shape,
-                forest=forest,
-                active_pairs=iteration_pairs,
-                metric=metric,
-                normalized_stress=normalized_stress,
-            )
+        objective = None
+        if gpu_backend is not None:
+            try:
+                objective = _GpuPathFrozenObjective(
+                    gpu_backend,
+                    shape=shape,
+                    forest=forest,
+                    active_pairs=iteration_pairs,
+                    metric=metric,
+                    normalized_stress=normalized_stress,
+                    max_path_edges=gpu_max_path_edges,
+                )
+            except MemoryError:
+                if device in {"gpu", "cuda"}:
+                    raise
+                warnings.warn(
+                    "Falling back to the CPU path_frozen objective because "
+                    "the flattened paths are too large for the configured GPU limit.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                objective = None
+
+        if objective is None:
+            def objective(x_flat):
+                return _path_frozen_stress_and_grad(
+                    x_flat,
+                    shape=shape,
+                    forest=forest,
+                    active_pairs=iteration_pairs,
+                    metric=metric,
+                    normalized_stress=normalized_stress,
+                )
 
         result = scipy.optimize.minimize(
             objective,

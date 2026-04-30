@@ -95,6 +95,7 @@ def main_donut():
         eps=1e-6,
         method="L-BFGS-B",
         optimizer_options={"ftol": 1e-9, "maxls": 50},
+        device="auto",
         print_time=True,
     )
     plot_embedding(
@@ -119,6 +120,7 @@ def main_donut():
         eps=1e-6,
         method="L-BFGS-B",
         optimizer_options={"ftol": 1e-9, "maxls": 50},
+        device="auto",
         print_time=True,
     )
     plot_embedding(

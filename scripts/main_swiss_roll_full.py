@@ -26,16 +26,17 @@ def main_swiss_roll_full():
     init_strat = 'isomap'               # 'isomap' | 'isomap', 'rand'
     k = 10                              # 10
     proj_dim = 3                        # 3
-    dir_res = 'res/'                 # '../res/'
+    dir_res = 'res/swiss_roll_full'
     folder_res_raw = 'raw/'             # 'raw/'
     max_iter_path_frozen = 10          # 10
-    inner_iter_path_frozen = 30         # 5
+    inner_iter_path_frozen = 100         # 5
     n_landmarks_path_frozen = 350      # 350
     landmark_mode_path_frozen = "sources"
     local_neighbors_path_frozen = None      # 8
     n_random_pairs_path_frozen = 0      # keep 0: random sources would trigger many Dijkstra runs
     max_targets_per_source_path_frozen = int(0.2 * n)
     target_sampling_path_frozen = "random"
+    path_frozen_device = "auto"         # "auto" uses CuPy/CUDA when available, CPU otherwise
     plot_point_fraction = 0.05          # fraction of points shown in 3D plots
 
     seed = 42                          
@@ -189,6 +190,8 @@ def main_swiss_roll_full():
             + str(max_targets_per_source_path_frozen)
             + '_'
             + target_sampling_path_frozen
+            + '_'
+            + path_frozen_device
         )
         if not os.path.exists(os.path.join(dir_res_raw, 'swiss_roll_full_proj_path_frozen_' + path_frozen_param_str + '.npy')):
             proj_path_frozen, _ = fit_finsler_mds(
@@ -212,6 +215,7 @@ def main_swiss_roll_full():
                 target_sampling=target_sampling_path_frozen,
                 target_random_state=seed + 3,
                 rescale_sampled_weights=True,
+                device=path_frozen_device,
                 verbose=1,
                 print_time=True,
             )
