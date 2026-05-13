@@ -15,6 +15,12 @@ scanpy==1.12.1
 scvelo==0.3.4
 anndata==0.12.11
 pandas==2.3.3
+setuptools==80.10.2
+igraph==0.11.9
+louvain==0.8.2
+fa2-modified==0.4
 
-# Optional GPU acceleration for path_frozen:
+# Optional GPU acceleration for path_frozen and Randers-SMACOF:
 # install the CuPy wheel matching your CUDA runtime, e.g. cupy-cuda12x.
+# Randers-SMACOF also needs cuBLAS at runtime; with pip CUDA libraries this is
+# provided by nvidia-cublas-cu12.

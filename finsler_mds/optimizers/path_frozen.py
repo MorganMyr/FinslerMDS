@@ -22,10 +22,18 @@ from finsler_mds.metrics import (
     MatsumotoMetric,
     RandersMetric,
 )
+from finsler_mds.evaluation import geodesic_embedding_stress
 from finsler_mds.optimizers.common import (
     initial_embedding,
     prepare_weights_and_mask,
     validate_metric,
+)
+from finsler_mds.optimizers.pair_groups import (
+    ActivePairs as _ActivePairs,
+    build_local_global_pairs,
+    empty_active_pairs,
+    merge_active_pairs,
+    sample_active_pairs,
 )
 from finsler_mds.utils.graph import (
     metric_graph_from_support,
@@ -53,13 +61,11 @@ class _FrozenForest:
 
 
 @dataclass(frozen=True)
-class _ActivePairs:
+class _FlatPairs:
     sources: np.ndarray
-    targets: list[np.ndarray]
-    weights: list[np.ndarray]
-    dissimilarities: list[np.ndarray]
-    sampleable: np.ndarray
-    denom: float
+    targets: np.ndarray
+    weights: np.ndarray
+    dissimilarities: np.ndarray
     n_pairs: int
 
 
@@ -183,18 +189,43 @@ class _GpuPathFrozenObjective:
             metric,
             normalized_stress,
             max_path_edges,
+            direct_pairs=None,
     ):
         self.cp = cp
         self.shape = shape
         self.metric = metric
         self.normalized_stress = normalized_stress
-        self.denom = active_pairs.denom
+        direct_pairs = empty_active_pairs() if direct_pairs is None else direct_pairs
+        self.denom = active_pairs.denom + direct_pairs.denom
 
         path_offsets, path_edge_ids, weights, dissimilarities = _flatten_active_paths(
             forest,
             active_pairs,
             max_path_edges=max_path_edges,
         )
+        edge_tails = forest.edge_tails
+        edge_heads = forest.edge_heads
+        flat_direct = _flatten_pairs(direct_pairs)
+        if flat_direct.n_pairs > 0:
+            direct_edge_ids = np.arange(
+                len(edge_tails),
+                len(edge_tails) + flat_direct.n_pairs,
+                dtype=np.int32,
+            )
+            path_offsets = np.concatenate([
+                path_offsets,
+                path_offsets[-1] + np.arange(1, flat_direct.n_pairs + 1, dtype=np.int64),
+            ])
+            path_edge_ids = np.concatenate([path_edge_ids, direct_edge_ids])
+            weights = np.concatenate([weights, flat_direct.weights])
+            dissimilarities = np.concatenate([dissimilarities, flat_direct.dissimilarities])
+            edge_tails = np.concatenate([edge_tails, flat_direct.sources])
+            edge_heads = np.concatenate([edge_heads, flat_direct.targets])
+            if max_path_edges is not None and len(path_edge_ids) > max_path_edges:
+                raise MemoryError(
+                    "Flattened frozen paths exceed gpu_max_path_edges="
+                    f"{max_path_edges}. Increase the limit or use device='cpu'."
+                )
         path_counts = np.diff(path_offsets)
         path_ids = np.repeat(np.arange(len(path_counts), dtype=np.int32), path_counts)
 
@@ -203,9 +234,9 @@ class _GpuPathFrozenObjective:
         self.path_ids = cp.asarray(path_ids, dtype=cp.int32)
         self.weights = cp.asarray(weights, dtype=cp.float64)
         self.dissimilarities = cp.asarray(dissimilarities, dtype=cp.float64)
-        self.edge_tails = cp.asarray(forest.edge_tails, dtype=cp.int32)
-        self.edge_heads = cp.asarray(forest.edge_heads, dtype=cp.int32)
-        self.n_edges = len(forest.edge_tails)
+        self.edge_tails = cp.asarray(edge_tails, dtype=cp.int32)
+        self.edge_heads = cp.asarray(edge_heads, dtype=cp.int32)
+        self.n_edges = len(edge_tails)
 
     def __call__(self, X_flat):
         cp = self.cp
@@ -251,6 +282,91 @@ class _GpuPathFrozenObjective:
                 grad *= 1.0 / (2.0 * cp.sqrt(raw_stress * self.denom))
 
         return float(stress.get()), cp.asnumpy(grad).ravel()
+
+
+class _DirectPairsObjective:
+    def __init__(self, *, shape, direct_pairs, metric):
+        self.shape = shape
+        self.metric = metric
+        self.flat_pairs = _flatten_pairs(direct_pairs)
+
+    def __call__(self, X_flat):
+        X = X_flat.reshape(self.shape)
+        grad = np.zeros_like(X)
+        pairs = self.flat_pairs
+        if pairs.n_pairs == 0:
+            return 0.0, grad.ravel()
+
+        vectors = X[pairs.targets] - X[pairs.sources]
+        lengths = self.metric.length(vectors)
+        edge_grads = self.metric.grad_u(vectors)
+        if (
+            not np.all(np.isfinite(lengths))
+            or not np.all(np.isfinite(edge_grads))
+        ):
+            raise ValueError("The metric produced non-finite direct local-pair lengths or gradients.")
+
+        residual = lengths - pairs.dissimilarities
+        raw_stress = float(np.sum(pairs.weights * residual**2))
+        contrib = (2.0 * pairs.weights * residual)[:, None] * edge_grads
+        np.add.at(grad, pairs.sources, -contrib)
+        np.add.at(grad, pairs.targets, contrib)
+        return raw_stress, grad.ravel()
+
+
+class _GpuDirectPairsObjective:
+    def __init__(self, cp, *, shape, direct_pairs, metric):
+        self.cp = cp
+        self.shape = shape
+        self.metric = metric
+        pairs = _flatten_pairs(direct_pairs)
+        self.n_pairs = pairs.n_pairs
+        self.sources = cp.asarray(pairs.sources, dtype=cp.int32)
+        self.targets = cp.asarray(pairs.targets, dtype=cp.int32)
+        self.weights = cp.asarray(pairs.weights, dtype=cp.float64)
+        self.dissimilarities = cp.asarray(pairs.dissimilarities, dtype=cp.float64)
+
+    def __call__(self, X_flat):
+        cp = self.cp
+        X = cp.asarray(X_flat.reshape(self.shape))
+        grad = cp.zeros_like(X)
+        if self.n_pairs == 0:
+            return 0.0, cp.asnumpy(grad).ravel()
+
+        vectors = X[self.targets] - X[self.sources]
+        lengths, edge_grads = _cupy_metric_length_and_grad(cp, vectors, self.metric)
+        if (
+            not cp.all(cp.isfinite(lengths)).item()
+            or not cp.all(cp.isfinite(edge_grads)).item()
+        ):
+            raise ValueError("The metric produced non-finite direct local-pair lengths or gradients.")
+
+        residual = lengths - self.dissimilarities
+        raw_stress = cp.sum(self.weights * residual**2)
+        contrib = (2.0 * self.weights * residual)[:, None] * edge_grads
+        cp.add.at(grad, self.sources, -contrib)
+        cp.add.at(grad, self.targets, contrib)
+        return float(raw_stress.get()), cp.asnumpy(grad).ravel()
+
+
+def _flatten_pairs(active_pairs):
+    if active_pairs.n_pairs == 0:
+        return _FlatPairs(
+            sources=np.array([], dtype=int),
+            targets=np.array([], dtype=int),
+            weights=np.array([], dtype=float),
+            dissimilarities=np.array([], dtype=float),
+            n_pairs=0,
+        )
+
+    counts = np.fromiter((len(targets) for targets in active_pairs.targets), dtype=int)
+    return _FlatPairs(
+        sources=np.repeat(active_pairs.sources, counts).astype(int, copy=False),
+        targets=np.concatenate(active_pairs.targets).astype(int, copy=False),
+        weights=np.concatenate(active_pairs.weights).astype(float, copy=False),
+        dissimilarities=np.concatenate(active_pairs.dissimilarities).astype(float, copy=False),
+        n_pairs=active_pairs.n_pairs,
+    )
 
 
 def _flatten_active_paths(forest, active_pairs, *, max_path_edges):
@@ -370,231 +486,67 @@ def _path_frozen_stress_and_grad(
     return float(stress), grad.ravel()
 
 
-def _active_pairs_from_mask(D, W, active_mask, sampleable_sources):
-    sources = np.flatnonzero(np.any(active_mask, axis=1))
-    if len(sources) == 0:
-        raise ValueError("No active pair remains for path_frozen optimization.")
-
-    targets = []
-    weights = []
-    dissimilarities = []
-    denom = 0.0
-    n_pairs = 0
-    for source in sources:
-        source_targets = np.flatnonzero(active_mask[source])
-        source_weights = W[source, source_targets].astype(float, copy=False)
-        source_dissimilarities = D[source, source_targets].astype(float, copy=False)
-        targets.append(source_targets)
-        weights.append(source_weights)
-        dissimilarities.append(source_dissimilarities)
-        denom += float(np.sum(source_weights * source_dissimilarities ** 2))
-        n_pairs += len(source_targets)
-
-    return _ActivePairs(
-        sources=sources.astype(int, copy=False),
-        targets=targets,
-        weights=weights,
-        dissimilarities=dissimilarities,
-        sampleable=sampleable_sources[sources].astype(bool, copy=False),
-        denom=denom,
-        n_pairs=n_pairs,
-    )
+def _direct_pairs_stress_and_grad(X_flat, *, shape, direct_pairs, metric):
+    return _DirectPairsObjective(
+        shape=shape,
+        direct_pairs=direct_pairs,
+        metric=metric,
+    )(X_flat)
 
 
-def _build_active_pairs(
-        D,
-        W,
+def _normalize_stress_and_grad(raw_stress, grad_flat, denom, *, normalized_stress):
+    if not normalized_stress:
+        return float(raw_stress), grad_flat
+    if denom <= 0:
+        return np.inf, np.zeros_like(grad_flat)
+    if raw_stress <= 0:
+        return 0.0, np.zeros_like(grad_flat)
+    stress = np.sqrt(raw_stress / denom)
+    return float(stress), grad_flat * (1.0 / (2.0 * np.sqrt(raw_stress * denom)))
+
+
+def _add_raw_objective(
+        X_flat,
+        raw_objective,
         *,
-        pair_mask,
-        local_neighbors,
-        landmark_indices,
-        n_landmarks,
-        landmark_mode,
-        n_random_pairs,
-        random_state,
+        shape,
+        direct_pairs=None,
+        direct_objective=None,
+        metric=None,
+        denom,
+        normalized_stress,
 ):
-    allowed = (W != 0) & np.isfinite(D)
-    np.fill_diagonal(allowed, False)
+    raw_stress = 0.0
+    grad = np.zeros(shape, dtype=float).ravel()
 
-    if pair_mask is not None:
-        pair_mask = np.asarray(pair_mask, dtype=bool)
-        if pair_mask.shape != D.shape:
-            raise ValueError("pair_mask must have the same shape as dissimilarities.")
-        allowed &= pair_mask
+    if raw_objective is not None:
+        geodesic_stress, geodesic_grad = raw_objective(X_flat)
+        raw_stress += float(geodesic_stress)
+        grad += geodesic_grad
 
-    use_sparse_builder = (
-        local_neighbors is not None
-        or landmark_indices is not None
-        or n_landmarks > 0
-        or n_random_pairs > 0
-    )
-
-    if use_sparse_builder:
-        active = np.zeros_like(allowed, dtype=bool)
-        sampleable_sources = np.zeros(D.shape[0], dtype=bool)
-        if local_neighbors is not None and local_neighbors > 0:
-            _add_local_pairs(active, allowed, D, int(local_neighbors))
-        landmarks = _select_landmarks(
-            D.shape[0],
-            landmark_indices=landmark_indices,
-            n_landmarks=n_landmarks,
-            random_state=random_state,
+    if direct_objective is not None:
+        direct_stress, direct_grad = direct_objective(X_flat)
+        raw_stress += direct_stress
+        grad += direct_grad
+    elif direct_pairs is not None and direct_pairs.n_pairs > 0:
+        if metric is None:
+            raise ValueError("metric is required when direct_objective is not provided.")
+        direct_stress, direct_grad = _direct_pairs_stress_and_grad(
+            X_flat,
+            shape=shape,
+            direct_pairs=direct_pairs,
+            metric=metric,
         )
-        if len(landmarks) > 0:
-            _add_landmark_pairs(active, allowed, landmarks, landmark_mode)
-            if landmark_mode in {"sources", "both"}:
-                sampleable_sources[landmarks] = True
-        if n_random_pairs > 0:
-            _add_random_pairs(active, allowed, int(n_random_pairs), random_state)
-    else:
-        active = allowed
-        sampleable_sources = np.ones(D.shape[0], dtype=bool)
+        raw_stress += direct_stress
+        grad += direct_grad
 
-    return _active_pairs_from_mask(D, W, active, sampleable_sources)
-
-
-def _add_local_pairs(active, allowed, D, local_neighbors):
-    n_samples = D.shape[0]
-    for source in range(n_samples):
-        candidates = np.flatnonzero(allowed[source])
-        if len(candidates) == 0:
-            continue
-        k = min(local_neighbors, len(candidates))
-        distances = D[source, candidates]
-        chosen = candidates[np.argpartition(distances, k - 1)[:k]]
-        active[source, chosen] = True
-
-
-def _select_landmarks(n_samples, *, landmark_indices, n_landmarks, random_state):
-    if landmark_indices is not None:
-        landmarks = np.asarray(landmark_indices, dtype=int)
-        if landmarks.ndim != 1:
-            raise ValueError("landmark_indices must be a 1D array-like.")
-        if np.any((landmarks < 0) | (landmarks >= n_samples)):
-            raise ValueError("landmark_indices contains an out-of-range index.")
-        return np.unique(landmarks)
-
-    if n_landmarks <= 0:
-        return np.array([], dtype=int)
-
-    rng = check_random_state(random_state)
-    n_landmarks = min(int(n_landmarks), n_samples)
-    return np.sort(rng.choice(n_samples, size=n_landmarks, replace=False))
-
-
-def _add_landmark_pairs(active, allowed, landmarks, landmark_mode):
-    if landmark_mode not in {"sources", "targets", "both"}:
-        raise ValueError("landmark_mode must be 'sources', 'targets', or 'both'.")
-    if landmark_mode in {"sources", "both"}:
-        active[landmarks, :] = active[landmarks, :] | allowed[landmarks, :]
-    if landmark_mode in {"targets", "both"}:
-        active[:, landmarks] = active[:, landmarks] | allowed[:, landmarks]
-
-
-def _add_random_pairs(active, allowed, n_random_pairs, random_state):
-    rng = check_random_state(random_state)
-    n_samples = allowed.shape[0]
-    added = 0
-    attempts = 0
-    max_attempts = max(100, 20 * n_random_pairs)
-    while added < n_random_pairs and attempts < max_attempts:
-        attempts += 1
-        source = rng.randint(n_samples)
-        target = rng.randint(n_samples)
-        if allowed[source, target] and not active[source, target]:
-            active[source, target] = True
-            added += 1
-
-    if added >= n_random_pairs:
-        return
-
-    remaining = np.argwhere(allowed & ~active)
-    if len(remaining) == 0:
-        return
-    chosen = rng.choice(len(remaining), size=min(n_random_pairs - added, len(remaining)), replace=False)
-    active[remaining[chosen, 0], remaining[chosen, 1]] = True
-
-
-def _sample_active_pairs(
-        active_pairs,
-        *,
-        max_targets_per_source,
-        target_sampling,
-        random_state,
-        rescale_sampled_weights,
-):
-    if max_targets_per_source is None:
-        return active_pairs
-
-    max_targets_per_source = int(max_targets_per_source)
-    if max_targets_per_source <= 0:
-        raise ValueError("max_targets_per_source must be positive or None.")
-    if target_sampling not in {"random", "farthest", "mixed"}:
-        raise ValueError("target_sampling must be 'random', 'farthest', or 'mixed'.")
-
-    rng = check_random_state(random_state)
-    targets = []
-    weights = []
-    dissimilarities = []
-    denom = 0.0
-    n_pairs = 0
-
-    for source_pos in range(len(active_pairs.sources)):
-        source_targets = active_pairs.targets[source_pos]
-        source_weights = active_pairs.weights[source_pos]
-        source_dissimilarities = active_pairs.dissimilarities[source_pos]
-        n_available = len(source_targets)
-
-        if active_pairs.sampleable[source_pos] and n_available > max_targets_per_source:
-            chosen = _sample_target_indices(
-                source_dissimilarities,
-                max_targets_per_source,
-                target_sampling,
-                rng,
-            )
-            sampled_targets = source_targets[chosen]
-            sampled_weights = source_weights[chosen].copy()
-            sampled_dissimilarities = source_dissimilarities[chosen]
-            if rescale_sampled_weights:
-                sampled_weights *= n_available / max_targets_per_source
-        else:
-            sampled_targets = source_targets
-            sampled_weights = source_weights
-            sampled_dissimilarities = source_dissimilarities
-
-        targets.append(sampled_targets)
-        weights.append(sampled_weights)
-        dissimilarities.append(sampled_dissimilarities)
-        denom += float(np.sum(sampled_weights * sampled_dissimilarities ** 2))
-        n_pairs += len(sampled_targets)
-
-    return _ActivePairs(
-        sources=active_pairs.sources,
-        targets=targets,
-        weights=weights,
-        dissimilarities=dissimilarities,
-        sampleable=active_pairs.sampleable,
-        denom=denom,
-        n_pairs=n_pairs,
+    denom_value = denom() if callable(denom) else denom
+    return _normalize_stress_and_grad(
+        raw_stress,
+        grad,
+        denom_value,
+        normalized_stress=normalized_stress,
     )
-
-
-def _sample_target_indices(dissimilarities, n_keep, target_sampling, rng):
-    n_available = len(dissimilarities)
-    if target_sampling == "random":
-        chosen = rng.choice(n_available, size=n_keep, replace=False)
-    elif target_sampling == "farthest":
-        chosen = np.argpartition(dissimilarities, n_available - n_keep)[-n_keep:]
-    else:
-        n_far = n_keep // 2
-        far = np.argpartition(dissimilarities, n_available - n_far)[-n_far:] if n_far > 0 else np.array([], dtype=int)
-        remaining_mask = np.ones(n_available, dtype=bool)
-        remaining_mask[far] = False
-        remaining = np.flatnonzero(remaining_mask)
-        n_random = n_keep - len(far)
-        random = rng.choice(remaining, size=n_random, replace=False)
-        chosen = np.concatenate([far, random])
-    return np.sort(chosen)
 
 
 def _pruned_tree_order(parents, source, targets):
@@ -631,14 +583,14 @@ def _frozen_forest_from_embedding(
         X,
         *,
         metric,
-        n_neighbors,
+        graph_neighbors,
         active_pairs,
         neighbors_algorithm,
         n_jobs,
 ):
     support = symmetric_knn_graph(
         X,
-        n_neighbors=n_neighbors,
+        n_neighbors=graph_neighbors,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
     )
@@ -662,7 +614,7 @@ def _frozen_forest_from_embedding(
         if np.any(~np.isfinite(dist_matrix[source_pos, targets])):
             raise ValueError(
                 "The current embedding graph has unreachable active pairs. "
-                "Increase n_neighbors, reduce the active-pair mask, or use a "
+                "Increase graph_neighbors, reduce the active-pair mask, or use a "
                 "metric without infinite local edges."
             )
 
@@ -693,38 +645,13 @@ def _frozen_forest_from_embedding(
     return forest, dist_matrix
 
 
-def _full_geodesic_stress(
-        X,
-        D,
-        *,
-        metric,
-        n_neighbors,
-        neighbors_algorithm,
-        n_jobs,
-):
-    support = symmetric_knn_graph(
-        X,
-        n_neighbors=n_neighbors,
-        neighbors_algorithm=neighbors_algorithm,
-        n_jobs=n_jobs,
-    )
-    graph = metric_graph_from_support(X, support, metric)
-    embedded = dijkstra(graph, directed=True, return_predecessors=False)
-    active = np.isfinite(D)
-    np.fill_diagonal(active, False)
-    if np.any(active & ~np.isfinite(embedded)):
-        return np.inf
-    residual = embedded[active] - D[active]
-    return float(np.sum(residual ** 2))
-
-
 def path_frozen(
     dissimilarities,
     *,
     metric,
     n_components=2,
     init=None,
-    n_neighbors=10,
+    graph_neighbors=10,
     max_iter=20,
     inner_iter=5,
     verbose=0,
@@ -733,16 +660,16 @@ def path_frozen(
     normalized_stress=False,
     weight=None,
     pair_mask=None,
-    local_neighbors=None,
+    n_local_neighbors=None,
+    local_pair_mode="geodesic",
     landmark_indices=None,
-    n_landmarks=0,
-    landmark_mode="sources",
-    n_random_pairs=0,
+    n_global_landmarks=0,
     mask_random_state=None,
-    max_targets_per_source=None,
-    target_sampling="random",
+    max_global_targets_per_source=None,
+    global_target_sampling="random",
     target_random_state=None,
-    rescale_sampled_weights=True,
+    local_weight=1.0,
+    local_global_reweighting="none",
     device="cpu",
     gpu_max_path_edges=50_000_000,
     method="L-BFGS-B",
@@ -758,19 +685,23 @@ def path_frozen(
     the original full-stress behavior. For larger data sets, pass one or more
     sparse-pair options:
 
-    ``local_neighbors``
-        Keep the closest target dissimilarities in each row.
-    ``n_landmarks`` or ``landmark_indices``
-        Keep pairs involving selected landmarks. ``landmark_mode="sources"``
-        only launches Dijkstra from landmarks and is the most scalable option.
-    ``n_random_pairs``
-        Add directed random pairs for extra long-range constraints.
+    ``n_local_neighbors``
+        Keep the closest target dissimilarities in each row. With the default
+        ``local_pair_mode="geodesic"``, these local constraints use the frozen
+        graph-geodesic objective. Pass ``local_pair_mode="direct"`` to use
+        direct Finsler distances for local pairs instead.
+    ``n_global_landmarks`` or ``landmark_indices``
+        Keep all valid outgoing pairs from selected landmark sources.
     ``pair_mask``
         Restrict all active-pair choices to a user-provided boolean mask.
-    ``max_targets_per_source``
-        At each outer iteration, sample at most this many targets for each
-        sampleable source. Landmark sources are sampleable; if no sparse mask
-        is requested, all sources are treated as sampleable.
+    ``max_global_targets_per_source``
+        At each outer iteration, sample at most this many global targets for
+        each landmark source. Sampled weights are internally corrected so the
+        global term estimates the full landmark-source objective.
+    ``local_global_reweighting``
+        ``"none"`` keeps the input weights. ``"count"`` balances ``sum w_ij``
+        between local and global groups. ``"energy"`` balances
+        ``sum w_ij D_ij^2``. ``local_weight`` then multiplies the local group.
     ``device``
         ``"cpu"`` keeps the historical implementation. ``"auto"`` uses a
         CuPy/CUDA stress-gradient backend when available and falls back to CPU.
@@ -784,19 +715,39 @@ def path_frozen(
     if target_random_state is None:
         target_random_state = random_state
     target_random_state = check_random_state(target_random_state)
-    active_pairs = _build_active_pairs(
+    pair_groups = build_local_global_pairs(
         D,
         W,
         pair_mask=pair_mask,
-        local_neighbors=local_neighbors,
+        n_local_neighbors=n_local_neighbors,
+        local_pair_mode=local_pair_mode,
         landmark_indices=landmark_indices,
-        n_landmarks=n_landmarks,
-        landmark_mode=landmark_mode,
-        n_random_pairs=n_random_pairs,
+        n_global_landmarks=n_global_landmarks,
         random_state=mask_random_state,
+        local_weight=local_weight,
+        local_global_reweighting=local_global_reweighting,
     )
+    global_pairs = pair_groups.global_pairs
+    local_pairs = pair_groups.local_pairs
+    local_geodesic_pairs = local_pairs if local_pair_mode == "geodesic" else empty_active_pairs()
+    direct_pairs = local_pairs if local_pair_mode == "direct" else empty_active_pairs()
     X = initial_embedding(D, n_components, init, random_state)
     shape = X.shape
+    direct_objective = None
+    if direct_pairs.n_pairs > 0:
+        if gpu_backend is not None:
+            direct_objective = _GpuDirectPairsObjective(
+                gpu_backend,
+                shape=shape,
+                direct_pairs=direct_pairs,
+                metric=metric,
+            )
+        else:
+            direct_objective = _DirectPairsObjective(
+                shape=shape,
+                direct_pairs=direct_pairs,
+                metric=metric,
+            )
 
     options = {"maxiter": inner_iter, "gtol": eps}
     if verbose:
@@ -809,69 +760,99 @@ def path_frozen(
     total_inner_iter = 0
 
     if verbose:
+        geodesic_sources = merge_active_pairs(global_pairs, local_geodesic_pairs).sources
+        n_active_sources = len(np.union1d(geodesic_sources, direct_pairs.sources))
         print(
-            "path_frozen active pairs: "
-            f"{active_pairs.n_pairs} over {D.shape[0] * (D.shape[0] - 1)} off-diagonal pairs; "
-            f"{len(active_pairs.sources)} active sources"
+            "path_frozen: "
+            f"{global_pairs.n_pairs + local_pairs.n_pairs} pairs "
+            f"({global_pairs.n_pairs} global, {local_pairs.n_pairs} local-{local_pair_mode}) "
+            f"over "
+            f"{D.shape[0] * (D.shape[0] - 1)} off-diagonal pairs; "
+            f"{n_active_sources} active sources"
         )
-        if max_targets_per_source is not None:
+        if local_global_reweighting != "none" or local_weight != 1.0:
             print(
-                "path_frozen target sampling: "
-                f"max_targets_per_source={max_targets_per_source}, "
-                f"target_sampling={target_sampling}, "
-                f"sampleable_sources={int(np.sum(active_pairs.sampleable))}"
+                "path_frozen pair weights: "
+                f"reweighting={local_global_reweighting}, "
+                f"global_factor={pair_groups.global_factor:.6g}, "
+                f"local_factor={pair_groups.local_factor:.6g}"
+            )
+        if max_global_targets_per_source is not None:
+            print(
+                "path_frozen global target sampling: "
+                f"max_global_targets_per_source={max_global_targets_per_source}, "
+                f"global_target_sampling={global_target_sampling}, "
+                f"global_sources={len(global_pairs.sources)}"
             )
 
     for outer_it in range(max_iter):
-        iteration_pairs = _sample_active_pairs(
-            active_pairs,
-            max_targets_per_source=max_targets_per_source,
-            target_sampling=target_sampling,
+        iteration_global_pairs = sample_active_pairs(
+            global_pairs,
+            max_targets_per_source=max_global_targets_per_source,
+            target_sampling=global_target_sampling,
             random_state=target_random_state,
-            rescale_sampled_weights=rescale_sampled_weights,
         )
-        forest, _ = _frozen_forest_from_embedding(
-            X,
-            metric=metric,
-            n_neighbors=n_neighbors,
-            active_pairs=iteration_pairs,
-            neighbors_algorithm=neighbors_algorithm,
-            n_jobs=n_jobs,
-        )
+        iteration_pairs = merge_active_pairs(iteration_global_pairs, local_geodesic_pairs)
 
-        objective = None
-        if gpu_backend is not None:
-            try:
-                objective = _GpuPathFrozenObjective(
-                    gpu_backend,
-                    shape=shape,
-                    forest=forest,
-                    active_pairs=iteration_pairs,
-                    metric=metric,
-                    normalized_stress=normalized_stress,
-                    max_path_edges=gpu_max_path_edges,
-                )
-            except MemoryError:
-                if device in {"gpu", "cuda"}:
-                    raise
-                warnings.warn(
-                    "Falling back to the CPU path_frozen objective because "
-                    "the flattened paths are too large for the configured GPU limit.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                objective = None
+        raw_objective = None
+        direct_in_raw_objective = False
+        if iteration_pairs.n_pairs > 0:
+            forest, _ = _frozen_forest_from_embedding(
+                X,
+                metric=metric,
+                graph_neighbors=graph_neighbors,
+                active_pairs=iteration_pairs,
+                neighbors_algorithm=neighbors_algorithm,
+                n_jobs=n_jobs,
+            )
 
-        if objective is None:
-            def objective(x_flat):
-                return _path_frozen_stress_and_grad(
-                    x_flat,
-                    shape=shape,
-                    forest=forest,
-                    active_pairs=iteration_pairs,
-                    metric=metric,
-                    normalized_stress=normalized_stress,
-                )
+            if gpu_backend is not None:
+                try:
+                    raw_objective = _GpuPathFrozenObjective(
+                        gpu_backend,
+                        shape=shape,
+                        forest=forest,
+                        active_pairs=iteration_pairs,
+                        metric=metric,
+                        normalized_stress=False,
+                        max_path_edges=gpu_max_path_edges,
+                    )
+                except MemoryError:
+                    if device in {"gpu", "cuda"}:
+                        raise
+                    warnings.warn(
+                        "Falling back to the CPU path_frozen objective because "
+                        "the flattened paths are too large for the configured GPU limit.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    raw_objective = None
+            else:
+                direct_in_raw_objective = False
+
+            if raw_objective is None:
+                direct_in_raw_objective = False
+                def raw_objective(x_flat):
+                    return _path_frozen_stress_and_grad(
+                        x_flat,
+                        shape=shape,
+                        forest=forest,
+                        active_pairs=iteration_pairs,
+                        metric=metric,
+                        normalized_stress=False,
+                    )
+
+        def objective(x_flat):
+            return _add_raw_objective(
+                x_flat,
+                raw_objective,
+                shape=shape,
+                direct_pairs=direct_pairs,
+                direct_objective=None if direct_in_raw_objective else direct_objective,
+                metric=metric,
+                denom=iteration_pairs.denom + direct_pairs.denom,
+                normalized_stress=normalized_stress,
+            )
 
         result = scipy.optimize.minimize(
             objective,
@@ -886,23 +867,33 @@ def path_frozen(
         total_inner_iter += int(getattr(result, "nit", inner_iter))
 
         if verbose:
-            print(f"path_frozen outer {outer_it}: masked stress {stress} ({iteration_pairs.n_pairs} sampled pairs)")
+            nit = getattr(result, "nit", "?")
+            nfev = getattr(result, "nfev", "?")
+            print(
+                f"path_frozen outer {outer_it}: masked stress {stress} "
+                f"({iteration_global_pairs.n_pairs} global, "
+                f"{local_pairs.n_pairs} local, "
+                f"nit={nit}, nfev={nfev})"
+            )
 
-        if max_targets_per_source is None and old_stress is not None and old_stress != 0:
+        if max_global_targets_per_source is None and old_stress is not None and old_stress != 0:
             if np.abs(1 - stress / old_stress) < eps:
                 break
         old_stress = stress
 
     if verbose:
-        full_stress = _full_geodesic_stress(
+        full_stress = geodesic_embedding_stress(
             X,
             D,
             metric=metric,
-            n_neighbors=n_neighbors,
+            n_neighbors=graph_neighbors,
+            weight=W,
+            normalized_stress=normalized_stress,
             neighbors_algorithm=neighbors_algorithm,
             n_jobs=n_jobs,
+            on_unreachable="inf",
         )
-        print(f"path_frozen final full stress: {full_stress}")
+        print(f"path_frozen final full geodesic stress: {full_stress}")
 
     pf_result = PathFrozenResult(
         embedding=X,

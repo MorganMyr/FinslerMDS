@@ -131,6 +131,7 @@ def velocity_directed_graph(
         velocity,
         n_neighbors=30,
         alpha=1.0,
+        distance_formula="exponential",
         velocity_neighbors=None,
         average_velocity=True,
         symmetrize_support=True,
@@ -139,15 +140,21 @@ def velocity_directed_graph(
 ):
     """Build a directed kNN graph whose edge weights follow a velocity field.
 
-    For an edge ``i -> j``, the weight is
-    ``||X_j - X_i|| * exp(-alpha * cos(theta))``, where ``theta`` is the angle
-    between the local velocity at ``i`` and ``X_j - X_i``. Moving with the
-    velocity is cheaper, moving against it is more expensive.
+    For an edge ``i -> j``, ``theta`` is the angle between the local velocity at
+    ``i`` and ``X_j - X_i``. Supported formulas are:
+
+    - ``"exponential"``: ``||X_j - X_i|| * exp(-alpha * cos(theta))``.
+    - ``"randers"``: ``||X_j - X_i|| * (1 - alpha * cos(theta))``.
+
+    Moving with the velocity is cheaper, moving against it is more expensive.
     """
     X = np.asarray(X, dtype=float)
     velocity = np.asarray(velocity, dtype=float)
     if X.shape != velocity.shape:
         raise ValueError("X and velocity must have the same shape.")
+    distance_formula = _normalize_velocity_distance_formula(distance_formula)
+    if distance_formula == "randers" and not 0 <= alpha < 1:
+        raise ValueError("Randers velocity distances require 0 <= alpha < 1.")
 
     support = symmetric_knn_graph(
         X,
@@ -187,7 +194,12 @@ def velocity_directed_graph(
         where=denom > 1e-12,
     )
     cosines = np.clip(cosines, -1.0, 1.0)
-    edge_weights = edge_lengths * np.exp(-alpha * cosines)
+    if distance_formula == "exponential":
+        edge_weights = edge_lengths * np.exp(-alpha * cosines)
+    elif distance_formula == "randers":
+        edge_weights = edge_lengths * (1 - alpha * cosines)
+    else:  # pragma: no cover - guarded by normalization
+        raise RuntimeError(f"Unhandled velocity distance formula {distance_formula!r}.")
 
     graph = scipy.sparse.csr_matrix(
         (edge_weights, (support_coo.row, support_coo.col)),
@@ -223,6 +235,7 @@ def compute_velocity_dist_matrix(
         velocity,
         n_neighbors=30,
         alpha=1.0,
+        distance_formula="exponential",
         velocity_neighbors=None,
         average_velocity=True,
         symmetrize_support=True,
@@ -236,6 +249,7 @@ def compute_velocity_dist_matrix(
         velocity,
         n_neighbors=n_neighbors,
         alpha=alpha,
+        distance_formula=distance_formula,
         velocity_neighbors=velocity_neighbors,
         average_velocity=average_velocity,
         symmetrize_support=symmetrize_support,
@@ -249,6 +263,23 @@ def compute_velocity_dist_matrix(
         return_predecessors=True,
     )
     return dist_matrix, predecessors, graph, velocity_used
+
+
+def _normalize_velocity_distance_formula(distance_formula):
+    if not isinstance(distance_formula, str):
+        raise TypeError("distance_formula must be 'exponential' or 'randers'.")
+    formula = distance_formula.lower()
+    aliases = {
+        "exp": "exponential",
+        "exponential": "exponential",
+        "softmax": "exponential",
+        "randers": "randers",
+        "local_randers": "randers",
+        "linear_randers": "randers",
+    }
+    if formula not in aliases:
+        raise ValueError("distance_formula must be 'exponential' or 'randers'.")
+    return aliases[formula]
 
 
 def dijkstra_all_pairs(graph, directed=True):

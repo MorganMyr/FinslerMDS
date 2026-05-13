@@ -120,7 +120,7 @@ def main_path_frozen_toy():
         n_components=proj_dim,
         weight=weights,
         beta=50,
-        n_neighbors=4,
+        graph_neighbors=4,
         max_iter=max_iter_datasp,
         eps=1e-6,
         method="L-BFGS-B",

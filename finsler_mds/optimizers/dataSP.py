@@ -11,12 +11,24 @@ from dataclasses import dataclass
 
 import numpy as np
 import scipy.optimize
+from sklearn.utils import check_random_state
 
+from finsler_mds.evaluation import geodesic_embedding_stress
 from finsler_mds.optimizers.common import (
     initial_embedding,
     normalized_stress_scale,
     prepare_weights_and_mask,
     validate_metric,
+)
+from finsler_mds.optimizers.pair_groups import (
+    build_local_global_pairs,
+    empty_active_pairs,
+    merge_active_pairs,
+    sample_active_pairs,
+)
+from finsler_mds.optimizers.path_frozen import (
+    _DirectPairsObjective,
+    _add_raw_objective,
 )
 from finsler_mds.utils.graph import softmin_with_probs, symmetric_knn_graph
 
@@ -37,10 +49,10 @@ class _GraphSupport:
     shape: tuple[int, int]
 
 
-def _support_from_embedding(X, *, n_neighbors, neighbors_algorithm, n_jobs):
+def _support_from_embedding(X, *, graph_neighbors, neighbors_algorithm, n_jobs):
     support = symmetric_knn_graph(
         X,
-        n_neighbors=n_neighbors,
+        n_neighbors=graph_neighbors,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
     ).tocoo()
@@ -172,13 +184,20 @@ def _datasp_stress_and_grad(
     return float(stress), grad.ravel()
 
 
+def _active_pairs_to_weight_matrix(shape, active_pairs):
+    W = np.zeros(shape, dtype=float)
+    for source_pos, source in enumerate(active_pairs.sources):
+        W[source, active_pairs.targets[source_pos]] = active_pairs.weights[source_pos]
+    return W
+
+
 def datasp(
     dissimilarities,
     *,
     metric,
     n_components=2,
     init=None,
-    n_neighbors=10,
+    graph_neighbors=10,
     beta=10.0,
     max_iter=100,
     n_graph_updates=1,
@@ -187,6 +206,17 @@ def datasp(
     random_state=None,
     normalized_stress=False,
     weight=None,
+    pair_mask=None,
+    n_local_neighbors=None,
+    local_pair_mode="geodesic",
+    landmark_indices=None,
+    n_global_landmarks=0,
+    mask_random_state=None,
+    max_global_targets_per_source=None,
+    global_target_sampling="random",
+    target_random_state=None,
+    local_weight=1.0,
+    local_global_reweighting="none",
     method="L-BFGS-B",
     optimizer_options=None,
     neighbors_algorithm="auto",
@@ -200,7 +230,9 @@ def datasp(
     Each graph update rebuilds the kNN support from the current embedding, then
     runs up to ``max_iter`` optimizer iterations with that support fixed. Edge
     lengths, soft all-pairs distances, and their gradients are still recomputed
-    at every objective call.
+    at every objective call. Local/global pair options match ``path_frozen``;
+    they only sparsify the stress adjoint, not the Floyd-Warshall dynamic
+    program itself.
     """
     metric = validate_metric(metric)
     if beta <= 0:
@@ -209,8 +241,35 @@ def datasp(
         raise ValueError("n_graph_updates must be at least 1.")
 
     D, W = prepare_weights_and_mask(dissimilarities, weight)
+    if mask_random_state is None:
+        mask_random_state = random_state
+    if target_random_state is None:
+        target_random_state = random_state
+    target_random_state = check_random_state(target_random_state)
+    pair_groups = build_local_global_pairs(
+        D,
+        W,
+        pair_mask=pair_mask,
+        n_local_neighbors=n_local_neighbors,
+        local_pair_mode=local_pair_mode,
+        landmark_indices=landmark_indices,
+        n_global_landmarks=n_global_landmarks,
+        random_state=mask_random_state,
+        local_weight=local_weight,
+        local_global_reweighting=local_global_reweighting,
+    )
+    global_pairs = pair_groups.global_pairs
+    local_pairs = pair_groups.local_pairs
+    local_geodesic_pairs = local_pairs if local_pair_mode == "geodesic" else empty_active_pairs()
+    direct_pairs = local_pairs if local_pair_mode == "direct" else empty_active_pairs()
+
     X = initial_embedding(D, n_components, init, random_state)
     shape = X.shape
+    direct_objective = (
+        _DirectPairsObjective(shape=shape, direct_pairs=direct_pairs, metric=metric)
+        if direct_pairs.n_pairs > 0
+        else None
+    )
 
     options = {"maxiter": max_iter, "gtol": eps}
     if verbose:
@@ -223,23 +282,43 @@ def datasp(
     stress = np.inf
 
     for graph_update in range(n_graph_updates):
+        iteration_global_pairs = sample_active_pairs(
+            global_pairs,
+            max_targets_per_source=max_global_targets_per_source,
+            target_sampling=global_target_sampling,
+            random_state=target_random_state,
+        )
+        iteration_pairs = merge_active_pairs(iteration_global_pairs, local_geodesic_pairs)
+        iteration_weight = _active_pairs_to_weight_matrix(D.shape, iteration_pairs)
         support = _support_from_embedding(
             X,
-            n_neighbors=n_neighbors,
+            graph_neighbors=graph_neighbors,
             neighbors_algorithm=neighbors_algorithm,
             n_jobs=n_jobs,
         )
 
-        def objective(x_flat):
+        def raw_objective(x_flat):
             return _datasp_stress_and_grad(
                 x_flat,
                 shape=shape,
                 support=support,
                 dissimilarities=D,
-                weight=W,
+                weight=iteration_weight,
                 metric=metric,
                 beta=beta,
                 prob_dtype=prob_dtype,
+                normalized_stress=False,
+            )
+
+        def objective(x_flat):
+            return _add_raw_objective(
+                x_flat,
+                raw_objective if iteration_pairs.n_pairs > 0 else None,
+                shape=shape,
+                direct_pairs=direct_pairs,
+                direct_objective=direct_objective,
+                metric=metric,
+                denom=iteration_pairs.denom + direct_pairs.denom,
                 normalized_stress=normalized_stress,
             )
 
@@ -256,7 +335,27 @@ def datasp(
         total_iter += int(getattr(result, "nit", max_iter))
 
         if verbose:
-            print(f"datasp graph update {graph_update}: stress {stress}")
+            n_active_sources = len(np.union1d(iteration_pairs.sources, direct_pairs.sources))
+            print(
+                f"datasp graph update {graph_update}: stress {stress} "
+                f"({iteration_global_pairs.n_pairs} global, "
+                f"{local_pairs.n_pairs} local-{local_pair_mode}, "
+                f"{n_active_sources} active sources)"
+            )
+
+    if verbose:
+        full_stress = geodesic_embedding_stress(
+            X,
+            D,
+            metric=metric,
+            n_neighbors=graph_neighbors,
+            weight=W,
+            normalized_stress=normalized_stress,
+            neighbors_algorithm=neighbors_algorithm,
+            n_jobs=n_jobs,
+            on_unreachable="inf",
+        )
+        print(f"datasp final full geodesic stress: {full_stress}")
 
     ds_result = DataSPResult(
         embedding=X,

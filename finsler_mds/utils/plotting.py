@@ -80,13 +80,14 @@ def plot_points(
 
     if quiver_field is not None:
         step = 1 if step_quiver is None else step_quiver
+        quiver_idx = plot_idx[::step]
         ax.quiver(
-            X_ctr[:, 0][::step],
-            X_ctr[:, 1][::step],
-            X_ctr[:, 2][::step],
-            quiver_field[:, 0][::step],
-            quiver_field[:, 1][::step],
-            quiver_field[:, 2][::step],
+            X_ctr[quiver_idx, 0],
+            X_ctr[quiver_idx, 1],
+            X_ctr[quiver_idx, 2],
+            quiver_field[quiver_idx, 0],
+            quiver_field[quiver_idx, 1],
+            quiver_field[quiver_idx, 2],
             color='k',
             length=2,
             normalize=True,
@@ -222,13 +223,7 @@ def plot_categorical_embedding(
     if labels is None:
         ax.scatter(embedding[:, 0], embedding[:, 1], s=s, lw=0)
     else:
-        if hasattr(labels, "astype") and hasattr(labels.astype("category"), "cat"):
-            values = labels.astype("category")
-            codes = values.cat.codes.to_numpy()
-            categories = list(values.cat.categories)
-        else:
-            categories, codes = np.unique(np.asarray(labels), return_inverse=True)
-            categories = list(categories)
+        codes, categories = _categorical_codes(labels)
 
         scatter = ax.scatter(
             embedding[:, 0],
@@ -257,6 +252,146 @@ def plot_categorical_embedding(
     if save_path is not None:
         fig.savefig(save_path)
     return fig, ax
+
+
+def plot_3d_embedding_views(
+    embedding,
+    labels=None,
+    title=None,
+    save_path=None,
+    views=None,
+    point_fraction=1.0,
+    random_state=None,
+    s=8,
+    cmap="tab20",
+    figsize=None,
+):
+    """Plot one 3D embedding from several camera angles in a single figure."""
+    embedding = np.asarray(embedding)
+    if embedding.ndim != 2 or embedding.shape[1] != 3:
+        raise ValueError("embedding must have shape (n_samples, 3).")
+
+    if views is None:
+        views = [
+            ("front", 20, -60),
+            ("side", 20, 30),
+            ("top", 90, -90),
+            ("diagonal", 35, 135),
+        ]
+    if len(views) == 0:
+        raise ValueError("views must contain at least one camera angle.")
+
+    plot_idx = sample_plot_indices(
+        len(embedding),
+        point_fraction=point_fraction,
+        random_state=random_state,
+    )
+    color_values, categories, color_map = _categorical_color_values(labels, cmap)
+
+    n_views = len(views)
+    n_cols = min(2, n_views)
+    n_rows = int(np.ceil(n_views / n_cols))
+    if figsize is None:
+        figsize = (6 * n_cols, 5.5 * n_rows)
+    fig = plt.figure(figsize=figsize)
+
+    axes = []
+    for view_id, view in enumerate(views):
+        view_name, elev, azim = view
+        ax = fig.add_subplot(n_rows, n_cols, view_id + 1, projection="3d")
+        axes.append(ax)
+
+        if color_values is None:
+            ax.scatter(
+                embedding[plot_idx, 0],
+                embedding[plot_idx, 1],
+                embedding[plot_idx, 2],
+                s=s,
+                lw=0,
+            )
+        else:
+            ax.scatter(
+                embedding[plot_idx, 0],
+                embedding[plot_idx, 1],
+                embedding[plot_idx, 2],
+                c=color_values[plot_idx],
+                s=s,
+                lw=0,
+            )
+
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(view_name)
+        ax.set_box_aspect([1, 1, 1])
+        set_axes_equal(ax)
+        ax.set_xlabel("Embedding 1")
+        ax.set_ylabel("Embedding 2")
+        ax.set_zlabel("Embedding 3")
+
+    for empty_id in range(n_views, n_rows * n_cols):
+        ax = fig.add_subplot(n_rows, n_cols, empty_id + 1, projection="3d")
+        ax.set_axis_off()
+
+    if title is not None:
+        fig.suptitle(title)
+    if categories is not None:
+        handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="none",
+                markerfacecolor=color_map[cat],
+                markeredgecolor="none",
+                markersize=6,
+                label=str(cat),
+            )
+            for cat in categories
+        ]
+        fig.legend(
+            handles=handles,
+            title="labels",
+            bbox_to_anchor=(1.01, 0.5),
+            loc="center left",
+            fontsize=8,
+        )
+        fig.tight_layout(rect=(0, 0, 0.86, 0.96))
+    else:
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    if save_path is not None:
+        fig.savefig(save_path)
+    return fig, axes
+
+
+def _categorical_color_values(labels, cmap):
+    if labels is None:
+        return None, None, None
+
+    codes, categories = _categorical_codes(labels)
+
+    cmap_obj = plt.get_cmap(cmap)
+    n_colors = getattr(cmap_obj, "N", len(categories))
+    color_map = {
+        category: cmap_obj(code % n_colors)
+        for code, category in enumerate(categories)
+    }
+    color_values = np.asarray([color_map[categories[code]] for code in codes])
+    return color_values, categories, color_map
+
+
+def _categorical_codes(labels):
+    try:
+        values = labels.astype("category")
+    except (AttributeError, TypeError):
+        values = None
+
+    if values is not None and hasattr(values, "cat"):
+        codes = values.cat.codes.to_numpy()
+        categories = list(values.cat.categories)
+    else:
+        categories, codes = np.unique(np.asarray(labels), return_inverse=True)
+        categories = list(categories)
+    return codes, categories
 
 
 def nearest_point_index(points, coord):
@@ -719,6 +854,7 @@ __all__ = [
     "plot_points",
     "plot_proj_points",
     "plot_categorical_embedding",
+    "plot_3d_embedding_views",
     "nearest_point_index",
     "build_geodesic_plot_graph",
     "geodesic_path_indices",

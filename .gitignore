@@ -1,3 +1,14 @@
 .DS_Store
 venv
 .venv
+
+# Generated experiment artifacts: embeddings, cached distances, AnnData dumps.
+scripts/res/**/embeddings/
+scripts/res/**/raw/*.npy
+scripts/res/**/raw/*.npz
+scripts/res/**/raw/*.h5ad
+scripts/res/**/archive/
+
+# Downloaded/generated datasets.
+data/**/*.h5ad
+scripts/data/**/*.h5ad

@@ -10,41 +10,56 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from finsler_mds import RandersMetric, utils
+from finsler_mds import RandersMetric, geodesic_embedding_stress, utils
 from finsler_mds.api import fit_finsler_mds
 
 
 def main_swiss_roll_full():
 
     # Hyperparameters
-    n = 3000                            # 3000
+    n = 1000                            # 3000
     noise_level = 0.                    # 0.
     randers_field_dir = 'length'        # 'length'
-    randers_w_alpha_manifold_list = [0.35]  # [0., 0.1, 0.3, 0.5, 0.6]  # On the input manifold
-    # randers_w_alpha_manifold = 0.5    # 0.5 # on the input manifold
+    randers_w_alpha_manifold = 0.35  # On the input manifold
     randers_w_alpha_embedding = 0.5     # 0.5 # in the flat randers embedding
     init_strat = 'isomap'               # 'isomap' | 'isomap', 'rand'
     k = 10                              # 10
     proj_dim = 3                        # 3
     dir_res = 'res/swiss_roll_full'
     folder_res_raw = 'raw/'             # 'raw/'
-    max_iter_path_frozen = 10          # 10
-    inner_iter_path_frozen = 100         # 5
-    n_landmarks_path_frozen = 350      # 350
-    landmark_mode_path_frozen = "sources"
-    local_neighbors_path_frozen = None      # 8
-    n_random_pairs_path_frozen = 0      # keep 0: random sources would trigger many Dijkstra runs
-    max_targets_per_source_path_frozen = int(0.2 * n)
-    target_sampling_path_frozen = "random"
-    path_frozen_device = "auto"         # "auto" uses CuPy/CUDA when available, CPU otherwise
-    plot_point_fraction = 0.05          # fraction of points shown in 3D plots
+    plot_point_fraction = 0.1          # fraction of points shown in 3D plots
+    seed = 42
 
-    seed = 42                          
+    max_iter_smacof = 100
+    smacof_device = "auto"
+
+    max_iter_path_frozen = 5          # 10
+    inner_iter_path_frozen = 2000         # 5
+    n_global_landmarks_path_frozen = 50      # 350
+    n_local_neighbors_path_frozen = 8      # 8
+    local_pair_mode_path_frozen = "geodesic"  # "direct" | "geodesic"
+    max_global_targets_per_source_path_frozen = int(0.2 * n)
+    global_target_sampling_path_frozen = "random"
+    local_global_reweighting_path_frozen = "count"  # "none" | "count" | "energy"
+    local_weight_path_frozen = 1.0
+    path_frozen_device = "auto"         # "auto" uses CuPy/CUDA when available, CPU otherwise
+
+    beta_soft_bf = 50.0
+    n_relaxations_soft_bf = 50
+    max_iter_soft_bf = 500
+    n_graph_updates_soft_bf = 6
+    n_global_landmarks_soft_bf = 100
+    n_local_neighbors_soft_bf = 10
+    local_pair_mode_soft_bf = "direct"  # "direct" | "geodesic"
+    max_global_targets_per_source_soft_bf = int(0.4 * n)
+    global_target_sampling_soft_bf = "random"
+    local_global_reweighting_soft_bf = "count"  # "none" | "count" | "energy"
+    local_weight_soft_bf = 1.0
+    soft_bf_device = "auto"
+    soft_bf_source_batch_size = 64
 
     np.random.seed(seed)  # Will reseed for each application invoking random number generation
-
     dir_res_raw = os.path.join(dir_res, folder_res_raw)
-
     if not os.path.exists(dir_res):
         os.makedirs(dir_res)
     if not os.path.exists(dir_res_raw):
@@ -78,7 +93,7 @@ def main_swiss_roll_full():
     )
     utils.set_window_title(fig, "Swiss roll full: input")
 
-    fig.savefig(os.path.join(dir_res, 'swiss_roll_full.pdf'))
+    fig.savefig(os.path.join(dir_res, 'swiss_roll_full_input_euclidean.pdf'))
 
     knn = utils.nearest_neighbors(X, k)  # For visualisation purposes only
 
@@ -102,7 +117,7 @@ def main_swiss_roll_full():
     )
     utils.set_window_title(fig_isomap, "Swiss roll full: Isomap initialization")
 
-    fig_isomap.savefig(os.path.join(dir_res, 'swiss_roll_full_isomap.pdf'))
+    fig_isomap.savefig(os.path.join(dir_res, 'swiss_roll_full_isomap_euclidean.pdf'))
 
 
 
@@ -117,116 +132,164 @@ def main_swiss_roll_full():
     else:
         raise ValueError('Unknown Randers field direction')
 
-    fig_smacof_f_unif_all = plt.figure(figsize=(10, 10))
-    utils.set_window_title(fig_smacof_f_unif_all, "Swiss roll full: all Finsler-MDS embeddings")
-    ax_smacof_f_unif_all = fig_smacof_f_unif_all.add_subplot(111, projection='3d')
+    print('Randers field manifold weight: ', randers_w_alpha_manifold)
 
-    #
-    for randers_w_alpha_manifold in randers_w_alpha_manifold_list:
-        print('Randers field manifold weight: ', randers_w_alpha_manifold)
+    randers_field = np.stack([tangent_x, tangent_y, tangent_z], axis=1)
+    randers_field = randers_field / np.linalg.norm(randers_field, axis=1)[:, None]
+    randers_field = randers_w_alpha_manifold * randers_field
 
-        param_str = (str(seed) + '_' + str(n) + '_' + str(proj_dim) + '_' + str(k) + '_' + str(
-            noise_level) + '_' + randers_field_dir +
-                     '_' + str(randers_w_alpha_manifold) + '_' + str(randers_w_alpha_embedding)) + '_' + init_strat
+    # Plotting the Swiss roll with Randers field
+    fig_randers, ax_randers = utils.plot_points(
+        X,
+        X_noiseless=X_noiseless,
+        shape_type='swiss_roll',
+        quiver_field=randers_field,
+        step_quiver=1,
+        point_fraction=plot_point_fraction,
+        random_state=seed,
+    )
+    utils.set_window_title(fig_randers, f"Swiss roll full: Randers field alpha={randers_w_alpha_manifold}")
+    fig_randers.savefig(os.path.join(dir_res, 'swiss_roll_full_randers_field.pdf'))
 
-        randers_field = np.stack([tangent_x, tangent_y, tangent_z], axis=1)
-        randers_field = randers_field / np.linalg.norm(randers_field, axis=1)[:, None]
-        randers_field = randers_w_alpha_manifold * randers_field
+    # ################### Finsler embeddings #################
 
-        # Plotting the Swiss roll with Randers field
-        fig_randers, ax_randers = utils.plot_points(
-            X,
-            X_noiseless=X_noiseless,
-            shape_type='swiss_roll',
-            quiver_field=randers_field,
-            step_quiver=1,
-            point_fraction=plot_point_fraction,
-            random_state=seed,
-        )
-        utils.set_window_title(fig_randers, f"Swiss roll full: Randers field alpha={randers_w_alpha_manifold}")
+    # Compute Randers geodesic distances once, then compare optimizers.
+    dists_f, preds_f = utils.compute_dist_matrix(
+        X,
+        n_neighbors=k,
+        radius=None,
+        path_method="auto",
+        neighbors_algorithm="auto",
+        n_jobs=None,
+        metric="minkowski",
+        p=2,
+        metric_params=None,
+        randers_field=randers_field
+    )
 
-        fig_randers.savefig(os.path.join(dir_res, 'swiss_roll_full_randers_' + param_str + '.pdf'))
+    fig_dists, ax_dists = plt.subplots()
+    utils.set_window_title(fig_dists, f"Swiss roll full: distances alpha={randers_w_alpha_manifold}")
+    im = ax_dists.imshow(dists_f)
 
-        # ################### Finsler embeddings #################
+    np.random.seed(seed + 2)
+    if init_strat == 'isomap':
+        init = proj
+    elif init_strat == 'rand':
+        init = np.random.rand(n, proj_dim)
+    else:
+        raise ValueError('Unknown initialisation strategy')
 
-        # Compute Randers geodesic distances
-
-        dists_f, preds_f = utils.compute_dist_matrix(
-            X,
-            n_neighbors=k,
-            radius=None,
-            path_method="auto",
-            neighbors_algorithm="auto",
-            n_jobs=None,
-            metric="minkowski",
-            p=2,
-            metric_params=None,
-            randers_field=randers_field
-        )
-
-        fig_dists, ax_dists = plt.subplots()
-        utils.set_window_title(fig_dists, f"Swiss roll full: distances alpha={randers_w_alpha_manifold}")
-        im = ax_dists.imshow(dists_f)
-
-        print('Finsler path-frozen')
-        np.random.seed(seed+2)
-        if init_strat == 'isomap':
-            init = proj
-        elif init_strat == 'rand':
-            init = np.random.rand(n, proj_dim)
-        else:
-            raise ValueError('Unknown initialisation strategy')
-        path_frozen_param_str = (
-            param_str
-            + '_pf_'
-            + str(max_iter_path_frozen)
-            + '_'
-            + str(inner_iter_path_frozen)
-            + '_'
-            + str(n_landmarks_path_frozen)
-            + '_'
-            + landmark_mode_path_frozen
-            + '_mt_'
-            + str(max_targets_per_source_path_frozen)
-            + '_'
-            + target_sampling_path_frozen
-            + '_'
-            + path_frozen_device
-        )
-        if not os.path.exists(os.path.join(dir_res_raw, 'swiss_roll_full_proj_path_frozen_' + path_frozen_param_str + '.npy')):
-            proj_path_frozen, _ = fit_finsler_mds(
-                dists_f,
+    methods = [
+        (
+            'randers_smacof',
+            'Randers SMACOF',
+            dict(
+                metric=RandersMetric(alpha=randers_w_alpha_embedding),
+                optimizer="smacof_randers",
+                init=init,
+                n_components=proj_dim,
+                n_init=1,
+                n_jobs=1,
+                max_iter=max_iter_smacof,
+                pseudo_inv_solver="gmres",
+                project_on_V=True,
+                check_monotony=False,
+                device=smacof_device,
+                print_time=True,
+            ),
+        ),
+        (
+            'randers_path_frozen',
+            'Randers path-frozen',
+            dict(
                 metric=RandersMetric(alpha=randers_w_alpha_embedding),
                 optimizer="path_frozen",
                 init=init,
                 n_components=proj_dim,
-                n_neighbors=k,
+                graph_neighbors=k,
                 max_iter=max_iter_path_frozen,
                 inner_iter=inner_iter_path_frozen,
                 eps=1e-6,
                 method="L-BFGS-B",
                 optimizer_options={"ftol": 1e-9, "maxls": 50},
-                n_landmarks=n_landmarks_path_frozen,
-                landmark_mode=landmark_mode_path_frozen,
-                n_random_pairs=n_random_pairs_path_frozen,
-                local_neighbors=local_neighbors_path_frozen,
+                n_global_landmarks=n_global_landmarks_path_frozen,
+                n_local_neighbors=n_local_neighbors_path_frozen,
+                local_pair_mode=local_pair_mode_path_frozen,
                 mask_random_state=seed,
-                max_targets_per_source=max_targets_per_source_path_frozen,
-                target_sampling=target_sampling_path_frozen,
+                max_global_targets_per_source=max_global_targets_per_source_path_frozen,
+                global_target_sampling=global_target_sampling_path_frozen,
                 target_random_state=seed + 3,
-                rescale_sampled_weights=True,
+                local_global_reweighting=local_global_reweighting_path_frozen,
+                local_weight=local_weight_path_frozen,
                 device=path_frozen_device,
                 verbose=1,
                 print_time=True,
+            ),
+        ),
+        (
+            'randers_soft_bf',
+            'Randers soft-BF',
+            dict(
+                metric=RandersMetric(alpha=randers_w_alpha_embedding),
+                optimizer="soft_bellman_ford",
+                init=init,
+                n_components=proj_dim,
+                graph_neighbors=k,
+                beta=beta_soft_bf,
+                n_relaxations=n_relaxations_soft_bf,
+                max_iter=max_iter_soft_bf,
+                n_graph_updates=n_graph_updates_soft_bf,
+                eps=1e-6,
+                method="L-BFGS-B",
+                optimizer_options={"ftol": 1e-9, "maxls": 50},
+                n_global_landmarks=n_global_landmarks_soft_bf,
+                n_local_neighbors=n_local_neighbors_soft_bf,
+                local_pair_mode=local_pair_mode_soft_bf,
+                mask_random_state=seed,
+                max_global_targets_per_source=max_global_targets_per_source_soft_bf,
+                global_target_sampling=global_target_sampling_soft_bf,
+                target_random_state=seed + 3,
+                local_global_reweighting=local_global_reweighting_soft_bf,
+                local_weight=local_weight_soft_bf,
+                device=soft_bf_device,
+                source_batch_size=soft_bf_source_batch_size,
+                verbose=1,
+                print_time=True,
+            ),
+        ),
+    ]
+
+    fig_methods_all = plt.figure(figsize=(10, 10))
+    utils.set_window_title(fig_methods_all, "Swiss roll full: all Randers Finsler-MDS methods")
+    ax_methods_all = fig_methods_all.add_subplot(111, projection='3d')
+
+    for method_key, method_title, kwargs in methods:
+        print(method_title)
+        proj_method, stress_method = fit_finsler_mds(dists_f, **kwargs)
+        full_geodesic_stress = None
+        if kwargs["optimizer"] == "smacof_randers":
+            full_geodesic_stress = geodesic_embedding_stress(
+                proj_method,
+                dists_f,
+                metric=kwargs["metric"],
+                n_neighbors=k,
+                on_unreachable="inf",
             )
+            print(f"  {method_title} final full geodesic stress: {full_geodesic_stress}")
 
-            #np.save(os.path.join(dir_res_raw, 'swiss_roll_full_proj_path_frozen_' + path_frozen_param_str + '.npy'), proj_path_frozen)
-        else:
-            proj_path_frozen = np.load(
-                os.path.join(dir_res_raw, 'swiss_roll_full_proj_path_frozen_' + path_frozen_param_str + '.npy'))
+        cache_payload = dict(
+            embedding=proj_method,
+            stress=np.asarray(stress_method),
+        )
+        if full_geodesic_stress is not None:
+            cache_payload["full_geodesic_stress"] = np.asarray(full_geodesic_stress)
+        np.savez(
+            os.path.join(dir_res_raw, 'swiss_roll_full_' + method_key + '.npz'),
+            **cache_payload,
+        )
 
-        fig_smacof_f_unif, ax_smacof_f_unif = utils.plot_proj_points(
-            proj_path_frozen,
+        fig_method, ax_method = utils.plot_proj_points(
+            proj_method,
             X=X,
             knn=knn,
             X_noiseless=X_noiseless,
@@ -235,24 +298,26 @@ def main_swiss_roll_full():
             point_fraction=plot_point_fraction,
             random_state=seed,
         )
-        utils.set_window_title(fig_smacof_f_unif, f"Swiss roll full: path-frozen alpha={randers_w_alpha_manifold}")
+        utils.set_window_title(
+            fig_method,
+            f"Swiss roll full: {method_title} alpha={randers_w_alpha_manifold}"
+        )
+        fig_method.savefig(os.path.join(dir_res, 'swiss_roll_full_' + method_key + '.pdf'))
 
-        fig_smacof_f_unif.savefig(os.path.join(dir_res, 'swiss_roll_full_path_frozen_' + path_frozen_param_str + '.pdf'))
+        fig_methods_all, ax_methods_all = utils.plot_proj_points(
+            proj_method,
+            X=X,
+            knn=knn,
+            X_noiseless=X_noiseless,
+            shape_type='swiss_roll',
+            edge_alpha=1.,
+            fig_ax=(fig_methods_all, ax_methods_all),
+            point_fraction=plot_point_fraction,
+            random_state=seed,
+        )
+        print(f"  {method_title} optimizer stress: {stress_method}")
 
-        fig_smacof_f_unif_all, ax_smacof_f_unif_all = \
-            utils.plot_proj_points(
-                proj_path_frozen,
-                X=X,
-                knn=knn,
-                X_noiseless=X_noiseless,
-                shape_type='swiss_roll',
-                edge_alpha=1.,
-                fig_ax=(fig_smacof_f_unif_all, ax_smacof_f_unif_all),
-                point_fraction=plot_point_fraction,
-                random_state=seed,
-            )
-
-    fig_smacof_f_unif_all.savefig(os.path.join(dir_res, 'swiss_roll_full_path_frozen_all.pdf'))
+    fig_methods_all.savefig(os.path.join(dir_res, 'swiss_roll_full_randers_methods_all.pdf'))
 
     plt.show()
 
