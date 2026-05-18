@@ -19,6 +19,7 @@ from sklearn.utils import check_random_state
 
 from finsler_mds.metrics import (
     ConvexifiedMatsumotoMetric,
+    ConvexifiedToblerMetric,
     MatsumotoMetric,
     RandersMetric,
 )
@@ -89,10 +90,60 @@ def _load_cupy():
     return cp, None
 
 
+def _default_log_frequency(max_iter):
+    max_iter = max(1, int(max_iter))
+    decade = 10 ** max(0, int(np.floor(np.log10(max_iter))) - 1)
+    threshold = 3 * 10 ** int(np.floor(np.log10(max_iter)))
+    return 5 * decade if max_iter >= threshold else decade
+
+
+def _resolve_log_frequency(log_frequency, max_iter):
+    if log_frequency is None:
+        return _default_log_frequency(max_iter)
+    log_frequency = int(log_frequency)
+    if log_frequency < 0:
+        raise ValueError("log_frequency must be non-negative or None.")
+    return log_frequency
+
+
+def _should_log_iteration(iteration, max_iter, log_frequency):
+    if log_frequency == 0:
+        return False
+    return iteration == 0 or iteration == max_iter - 1 or iteration % log_frequency == 0
+
+
+def _sampled_pair_count(active_pairs, max_targets_per_source):
+    if max_targets_per_source is None:
+        return active_pairs.n_pairs
+    max_targets_per_source = int(max_targets_per_source)
+    return int(sum(min(len(targets), max_targets_per_source) for targets in active_pairs.targets))
+
+
+def _sampled_sources(active_pairs, max_targets_per_source):
+    if max_targets_per_source is None:
+        return active_pairs.sources
+    max_targets_per_source = int(max_targets_per_source)
+    keep = [len(targets) > 0 and max_targets_per_source > 0 for targets in active_pairs.targets]
+    return active_pairs.sources[np.asarray(keep, dtype=bool)]
+
+
+def _geodesic_source_count(global_pairs, local_geodesic_pairs, max_global_targets_per_source):
+    global_sources = _sampled_sources(global_pairs, max_global_targets_per_source)
+    return len(np.union1d(global_sources, local_geodesic_pairs.sources))
+
+
 def _gpu_metric_supported(metric):
     if isinstance(metric, MatsumotoMetric) and metric.forbidden_grad_norm is not None:
         return False
-    return isinstance(metric, (RandersMetric, MatsumotoMetric, ConvexifiedMatsumotoMetric))
+    return isinstance(
+        metric,
+        (
+            RandersMetric,
+            MatsumotoMetric,
+            ConvexifiedMatsumotoMetric,
+            ConvexifiedToblerMetric,
+        ),
+    )
 
 
 def _resolve_gpu_backend(device, metric, verbose):
@@ -103,7 +154,8 @@ def _resolve_gpu_backend(device, metric, verbose):
     if not _gpu_metric_supported(metric):
         message = (
             "path_frozen GPU backend currently supports RandersMetric, "
-            "MatsumotoMetric, and ConvexifiedMatsumotoMetric only."
+            "MatsumotoMetric, ConvexifiedMatsumotoMetric, and "
+            "ConvexifiedToblerMetric only."
         )
         if device == "auto":
             if verbose:
@@ -166,6 +218,21 @@ def _cupy_metric_length_and_grad(cp, edge_vectors, metric):
             denominator = 1 - metric.alpha * s
             phi = cp.where(linear, 4 * metric.alpha * s, 1 / denominator)
             dphi = cp.where(linear, 4 * metric.alpha, metric.alpha / denominator**2)
+    elif isinstance(metric, ConvexifiedToblerMetric):
+        slope_denominator = cp.sqrt(cp.maximum(1 - s**2, 0.0))
+        finite_slope = slope_denominator > 1e-12
+        slope = cp.where(finite_slope, s / slope_denominator, cp.sign(s) * cp.inf)
+        dslope = cp.where(finite_slope, 1.0 / slope_denominator**3, cp.inf)
+        shifted = slope + metric.b
+        base_phi = cp.exp(metric.a * cp.abs(shifted)) / metric.speed
+        base_dphi = base_phi * metric.a * cp.sign(shifted) * dslope
+
+        uphill = s > metric.s_uphill
+        downhill = s < metric.s_downhill
+        phi = cp.where(uphill, s / metric.z_max, base_phi)
+        phi = cp.where(downhill, s / metric.z_min, phi)
+        dphi = cp.where(uphill, 1.0 / metric.z_max, base_dphi)
+        dphi = cp.where(downhill, 1.0 / metric.z_min, dphi)
     else:
         raise TypeError(f"Unsupported GPU metric {type(metric).__name__}.")
 
@@ -674,6 +741,7 @@ def path_frozen(
     gpu_max_path_edges=50_000_000,
     method="L-BFGS-B",
     optimizer_options=None,
+    log_frequency=None,
     neighbors_algorithm="auto",
     n_jobs=None,
     return_n_iter=False,
@@ -706,6 +774,10 @@ def path_frozen(
         ``"cpu"`` keeps the historical implementation. ``"auto"`` uses a
         CuPy/CUDA stress-gradient backend when available and falls back to CPU.
         ``"gpu"``/``"cuda"`` require the CuPy backend to be available.
+    ``log_frequency``
+        Print one progress line every ``log_frequency`` outer iterations. The
+        default adapts to ``max_iter``: 1 below 100, 10 below 1000, 100 below
+        10000, and so on. Pass 0 to suppress per-iteration progress lines.
     """
     metric = validate_metric(metric)
     gpu_backend = _resolve_gpu_backend(device, metric, verbose)
@@ -758,17 +830,22 @@ def path_frozen(
     optimizer_results = []
     old_stress = None
     total_inner_iter = 0
+    log_frequency = _resolve_log_frequency(log_frequency, max_iter)
 
     if verbose:
-        geodesic_sources = merge_active_pairs(global_pairs, local_geodesic_pairs).sources
-        n_active_sources = len(np.union1d(geodesic_sources, direct_pairs.sources))
+        sampled_global_n_pairs = _sampled_pair_count(global_pairs, max_global_targets_per_source)
+        n_geodesic_sources = _geodesic_source_count(
+            global_pairs,
+            local_geodesic_pairs,
+            max_global_targets_per_source,
+        )
         print(
             "path_frozen: "
-            f"{global_pairs.n_pairs + local_pairs.n_pairs} pairs "
-            f"({global_pairs.n_pairs} global, {local_pairs.n_pairs} local-{local_pair_mode}) "
+            f"{sampled_global_n_pairs + local_pairs.n_pairs} pairs "
+            f"({sampled_global_n_pairs} global, {local_pairs.n_pairs} local-{local_pair_mode}) "
             f"over "
             f"{D.shape[0] * (D.shape[0] - 1)} off-diagonal pairs; "
-            f"{n_active_sources} active sources"
+            f"{n_geodesic_sources} active sources"
         )
         if local_global_reweighting != "none" or local_weight != 1.0:
             print(
@@ -782,8 +859,10 @@ def path_frozen(
                 "path_frozen global target sampling: "
                 f"max_global_targets_per_source={max_global_targets_per_source}, "
                 f"global_target_sampling={global_target_sampling}, "
-                f"global_sources={len(global_pairs.sources)}"
+                f"global_sources={len(_sampled_sources(global_pairs, max_global_targets_per_source))}"
             )
+        if log_frequency != 1:
+            print(f"path_frozen logging every {log_frequency} outer iterations")
 
     for outer_it in range(max_iter):
         iteration_global_pairs = sample_active_pairs(
@@ -866,14 +945,12 @@ def path_frozen(
         stress = float(result.fun)
         total_inner_iter += int(getattr(result, "nit", inner_iter))
 
-        if verbose:
+        if verbose and _should_log_iteration(outer_it, max_iter, log_frequency):
             nit = getattr(result, "nit", "?")
             nfev = getattr(result, "nfev", "?")
             print(
                 f"path_frozen outer {outer_it}: masked stress {stress} "
-                f"({iteration_global_pairs.n_pairs} global, "
-                f"{local_pairs.n_pairs} local, "
-                f"nit={nit}, nfev={nfev})"
+                f"(nit={nit}, nfev={nfev})"
             )
 
         if max_global_targets_per_source is None and old_stress is not None and old_stress != 0:

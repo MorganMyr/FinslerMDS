@@ -1,0 +1,3 @@
+stage,a,b,max_iter,inner_iter,masked_stress,full_geodesic_stress,elapsed_s,embedding_path
+phase1_inner40,7.0,0.04,36,40,28662.472850521437,900855.1047767879,30.054482094943523,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p04_phase1_inner40.npz
+phase2_inner12,7.0,0.04,28,12,29127.785052452527,797602.5139894714,18.00819395086728,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p04_phase2_inner12.npz

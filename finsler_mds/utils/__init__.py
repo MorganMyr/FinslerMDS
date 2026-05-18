@@ -7,6 +7,15 @@ from .graph import (
     velocity_directed_graph,
 )
 from .initialization import IsomapWithPreds
+from .embedding_io import (
+    load_saved_embedding,
+    latest_compatible_embedding_path,
+    save_embedding_result,
+)
+from .dissimilarity_graphs import (
+    density_scaled_knn_distances,
+    temporally_asymmetric_knn_distances,
+)
 from .plotting import (
     add_geodesic_path,
     add_geodesic_path_by_coords,
@@ -16,7 +25,9 @@ from .plotting import (
     get_extrema,
     nearest_point_index,
     plot_3d_embedding_views,
+    plot_3d_continuous_embedding_views,
     plot_categorical_embedding,
+    plot_continuous_embedding,
     plot_points,
     plot_proj_points,
     plot_randers_w_arrow,
@@ -34,6 +45,11 @@ __all__ = [
     "velocity_directed_graph",
     "average_vectors_on_graph",
     "IsomapWithPreds",
+    "load_saved_embedding",
+    "latest_compatible_embedding_path",
+    "save_embedding_result",
+    "density_scaled_knn_distances",
+    "temporally_asymmetric_knn_distances",
     "set_axes_equal",
     "set_window_title",
     "nearest_point_index",
@@ -44,7 +60,9 @@ __all__ = [
     "add_geodesic_path_by_coords",
     "add_random_geodesic_paths",
     "plot_3d_embedding_views",
+    "plot_3d_continuous_embedding_views",
     "plot_categorical_embedding",
+    "plot_continuous_embedding",
     "plot_points",
     "plot_proj_points",
     "get_extrema",

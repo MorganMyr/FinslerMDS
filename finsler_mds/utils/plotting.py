@@ -363,6 +363,130 @@ def plot_3d_embedding_views(
     return fig, axes
 
 
+def plot_continuous_embedding(
+    embedding,
+    values,
+    *,
+    title=None,
+    save_path=None,
+    s=7,
+    cmap="viridis",
+    fig_ax=None,
+):
+    """Plot a 2D embedding colored by a continuous value."""
+    if fig_ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig, ax = fig_ax
+    scatter_continuous_embedding(ax, embedding, values, title=title, s=s, cmap=cmap)
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig, ax
+
+
+def plot_3d_continuous_embedding_views(
+    embedding,
+    *,
+    values,
+    title=None,
+    save_path=None,
+    views=None,
+    point_fraction=1.0,
+    random_state=None,
+    s=8,
+    cmap="viridis",
+    value_range=(0.0, 1.0),
+):
+    """Plot one 3D embedding from several camera angles with continuous colors."""
+    embedding = np.asarray(embedding, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if embedding.ndim != 2 or embedding.shape[1] != 3:
+        raise ValueError("embedding must have shape (n_samples, 3).")
+    if values.shape != (len(embedding),):
+        raise ValueError("values must have shape (n_samples,).")
+    if views is None:
+        views = [
+            ("front", 20, -60),
+            ("side", 20, 30),
+            ("top", 90, -90),
+            ("diagonal", 35, 135),
+        ]
+
+    plot_idx = sample_plot_indices(len(embedding), point_fraction=point_fraction, random_state=random_state)
+    finite = np.isfinite(values)
+    n_views = len(views)
+    n_cols = min(2, n_views)
+    n_rows = int(np.ceil(n_views / n_cols))
+    fig = plt.figure(figsize=(6 * n_cols, 5.5 * n_rows))
+    mappable = None
+    vmin, vmax = value_range if value_range is not None else (None, None)
+    for view_id, (view_name, elev, azim) in enumerate(views):
+        ax = fig.add_subplot(n_rows, n_cols, view_id + 1, projection="3d")
+        finite_idx = plot_idx[finite[plot_idx]]
+        missing_idx = plot_idx[~finite[plot_idx]]
+        if len(missing_idx):
+            ax.scatter(
+                embedding[missing_idx, 0],
+                embedding[missing_idx, 1],
+                embedding[missing_idx, 2],
+                c="lightgray",
+                s=s,
+                lw=0,
+            )
+        if len(finite_idx):
+            mappable = ax.scatter(
+                embedding[finite_idx, 0],
+                embedding[finite_idx, 1],
+                embedding[finite_idx, 2],
+                c=values[finite_idx],
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                s=s,
+                lw=0,
+            )
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(view_name)
+        ax.set_box_aspect([1, 1, 1])
+        set_axes_equal(ax)
+        ax.set_xlabel("Embedding 1")
+        ax.set_ylabel("Embedding 2")
+        ax.set_zlabel("Embedding 3")
+
+    if title is not None:
+        fig.suptitle(title)
+    if mappable is not None:
+        fig.colorbar(mappable, ax=fig.axes, fraction=0.025, pad=0.02)
+    fig.tight_layout(rect=(0, 0, 0.96, 0.96))
+    if save_path is not None:
+        fig.savefig(save_path)
+    return fig, fig.axes
+
+
+def scatter_continuous_embedding(ax, embedding, values, *, title=None, s=7, cmap="viridis"):
+    embedding = np.asarray(embedding, dtype=float)
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    if np.any(~finite):
+        ax.scatter(embedding[~finite, 0], embedding[~finite, 1], c="lightgray", s=s, lw=0)
+    scatter = ax.scatter(
+        embedding[finite, 0],
+        embedding[finite, 1],
+        c=values[finite],
+        cmap=cmap,
+        s=s,
+        lw=0,
+    )
+    if title is not None:
+        ax.set_title(title)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+    return scatter
+
+
 def _categorical_color_values(labels, cmap):
     if labels is None:
         return None, None, None

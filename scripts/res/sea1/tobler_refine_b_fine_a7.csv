@@ -1,0 +1,8 @@
+stage,a,b,masked_stress,full_geodesic_stress,elapsed_s,embedding_path
+b_fine,7.0,0.03,30204.58853124894,927628.7894433626,11.026016789954156,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p03_bfine.npz
+b_fine,7.0,0.035,29180.50474047183,854161.4523719322,10.761566411005333,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p035_bfine.npz
+b_fine,7.0,0.04,29450.117493824644,850114.0619293988,10.125819663051516,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p04_bfine.npz
+b_fine,7.0,0.045,31641.54637153385,859707.9074691425,10.20081037003547,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p045_bfine.npz
+b_fine,7.0,0.05,34405.40013005285,899298.4115865665,10.182350232964382,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p05_bfine.npz
+b_fine,7.0,0.055,37626.36339183105,906559.3050965562,10.507702186936513,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p055_bfine.npz
+b_fine,7.0,0.06,41956.53539054923,966247.6419659682,10.25080826296471,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p06_bfine.npz

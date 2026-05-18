@@ -27,6 +27,10 @@ from finsler_mds.optimizers.path_frozen import (
     _GpuDirectPairsObjective,
     _gpu_metric_supported,
     _load_cupy,
+    _geodesic_source_count,
+    _resolve_log_frequency,
+    _sampled_pair_count,
+    _should_log_iteration,
 )
 from finsler_mds.optimizers.pair_groups import (
     build_local_global_pairs,
@@ -82,7 +86,7 @@ def _resolve_gpu_backend(device, metric, verbose):
         message = (
             "soft_bellman_ford GPU backend currently supports RandersMetric, "
             "MatsumotoMetric without forbidden_grad_norm, and "
-            "ConvexifiedMatsumotoMetric only."
+            "ConvexifiedMatsumotoMetric, and ConvexifiedToblerMetric only."
         )
         if device == "auto":
             if verbose:
@@ -629,6 +633,7 @@ def soft_bellman_ford(
     on_unreachable="warn_skip",
     method="L-BFGS-B",
     optimizer_options=None,
+    log_frequency=None,
     neighbors_algorithm="auto",
     n_jobs=None,
     prob_dtype=np.float32,
@@ -642,6 +647,8 @@ def soft_bellman_ford(
     local Finsler constraints instead of launching soft Bellman-Ford from every
     point. Pass ``local_pair_mode="geodesic"`` to run soft Bellman-Ford from
     local sources too. ``device="auto"`` uses a CuPy backend when available.
+    ``log_frequency`` controls progress-line frequency across graph updates,
+    with the same adaptive default as ``path_frozen``.
     """
     metric = validate_metric(metric)
     if beta <= 0:
@@ -705,6 +712,31 @@ def soft_bellman_ford(
     optimizer_results = []
     total_iter = 0
     stress = np.inf
+    log_frequency = _resolve_log_frequency(log_frequency, n_graph_updates)
+
+    if verbose:
+        sampled_global_n_pairs = _sampled_pair_count(global_pairs, max_global_targets_per_source)
+        n_geodesic_sources = _geodesic_source_count(
+            global_pairs,
+            local_geodesic_pairs,
+            max_global_targets_per_source,
+        )
+        print(
+            "soft_bellman_ford: "
+            f"{sampled_global_n_pairs + local_pairs.n_pairs} pairs "
+            f"({sampled_global_n_pairs} global, {local_pairs.n_pairs} local-{local_pair_mode}) "
+            f"over {D.shape[0] * (D.shape[0] - 1)}; "
+            f"{n_geodesic_sources} active sources"
+        )
+        if local_global_reweighting != "none" or local_weight != 1.0:
+            print(
+                "soft_bellman_ford pair weights: "
+                f"reweighting={local_global_reweighting}, "
+                f"global_factor={pair_groups.global_factor:.6g}, "
+                f"local_factor={pair_groups.local_factor:.6g}"
+            )
+        if log_frequency != 1:
+            print(f"soft_bellman_ford logging every {log_frequency} graph updates")
 
     for graph_update in range(n_graph_updates):
         unreachable_tracker = _UnreachableTracker()
@@ -784,24 +816,6 @@ def soft_bellman_ford(
                 normalized_stress=normalized_stress,
             )
 
-        if verbose:
-            n_active_sources = len(np.union1d(iteration_pairs.sources, direct_pairs.sources))
-            print(
-                "soft_bellman_ford: "
-                f"{iteration_global_pairs.n_pairs + local_pairs.n_pairs} pairs "
-                f"({iteration_global_pairs.n_pairs} global, "
-                f"{local_pairs.n_pairs} local-{local_pair_mode}) "
-                f"over {D.shape[0] * (D.shape[0] - 1)}; "
-                f"{n_active_sources} active sources"
-            )
-            if graph_update == 0 and (local_global_reweighting != "none" or local_weight != 1.0):
-                print(
-                    "soft_bellman_ford pair weights: "
-                    f"reweighting={local_global_reweighting}, "
-                    f"global_factor={pair_groups.global_factor:.6g}, "
-                    f"local_factor={pair_groups.local_factor:.6g}"
-                )
-
         result = scipy.optimize.minimize(
             objective,
             X.ravel(),
@@ -824,7 +838,7 @@ def soft_bellman_ford(
                 stacklevel=2,
             )
 
-        if verbose:
+        if verbose and _should_log_iteration(graph_update, n_graph_updates, log_frequency):
             nit = getattr(result, "nit", "?")
             nfev = getattr(result, "nfev", "?")
             print(
