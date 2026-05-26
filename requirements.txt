@@ -24,3 +24,7 @@ fa2-modified==0.4
 # install the CuPy wheel matching your CUDA runtime, e.g. cupy-cuda12x.
 # Randers-SMACOF also needs cuBLAS at runtime; with pip CUDA libraries this is
 # provided by nvidia-cublas-cu12.
+
+# R-side optional dependency for scripts/main_paul15_monocle.py:
+# install Monocle 3 in R, plus Matrix, SingleCellExperiment, and
+# SummarizedExperiment. These are not pip packages.
