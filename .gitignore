@@ -17,3 +17,8 @@ scripts/res/**/archive/
 # Downloaded/generated datasets.
 data/**/*.h5ad
 scripts/data/**/*.h5ad
+
+# Generated Monocle/Paul15 artifacts
+scripts/res/paul15/monocle3/monocle_input*/
+scripts/res/paul15/monocle3/**/*.npz
+scripts/res/paul15/monocle3/**/*.mtx
