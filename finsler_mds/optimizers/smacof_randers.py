@@ -270,6 +270,18 @@ def _cupy_randers_pairwise(cp, X, alpha):
     return euclidean + alpha * (z[None, :] - z[:, None])
 
 
+def _cupy_stress(cp, embedded_dissimilarities, dissimilarities, weight, *, uniform_weight, normalized_stress, denom):
+    residual = embedded_dissimilarities - dissimilarities
+    if weight is None:
+        raw_stress = uniform_weight * cp.sum(residual * residual)
+    else:
+        raw_stress = cp.sum(weight * residual * residual)
+    stress = float(cp.asnumpy(raw_stress))
+    if normalized_stress:
+        stress = np.sqrt(stress / denom) if denom is not None and denom > 0 else np.inf
+    return stress
+
+
 def _cupy_uniform_projected_update(cp, total_right_mat, *, alpha, right_diag, offdiag_weight):
     centered_rhs = total_right_mat - cp.mean(total_right_mat, axis=0, keepdims=True)
     denominators = len(total_right_mat) * offdiag_weight * (1 + alpha * right_diag)
@@ -331,21 +343,20 @@ def _smacof_randers_single_gpu(
             denom = float(cp.asnumpy(cp.sum(weight_gpu * D_gpu * D_gpu)))
 
     old_X_gpu = X_gpu.copy()
-    old_stress = None
+    old_stress = _cupy_stress(
+        cp,
+        _cupy_randers_pairwise(cp, X_gpu, alpha),
+        D_gpu,
+        weight_gpu,
+        uniform_weight=uniform_weight,
+        normalized_stress=normalized_stress,
+        denom=denom,
+    )
+    stress = old_stress
     diag = cp.arange(n_samples)
 
     for it in range(max_iter):
         embedded_dissimilarities = _cupy_randers_pairwise(cp, X_gpu, alpha)
-        residual = embedded_dissimilarities - D_gpu
-        if weight_gpu is None:
-            raw_stress = uniform_weight * cp.sum(residual * residual)
-        else:
-            raw_stress = cp.sum(weight_gpu * residual * residual)
-
-        stress = float(cp.asnumpy(raw_stress))
-        if normalized_stress:
-            stress = np.sqrt(stress / denom) if denom is not None and denom > 0 else np.inf
-
         dis = cp.where(embedded_dissimilarities == 0, 1e-5, embedded_dissimilarities)
         ratio = D_gpu / dis
         B = -uniform_weight * ratio if weight_gpu is None else -ratio * weight_gpu
@@ -374,10 +385,19 @@ def _smacof_randers_single_gpu(
             )
             X_gpu = cp.asarray(X)
 
+        stress = _cupy_stress(
+            cp,
+            _cupy_randers_pairwise(cp, X_gpu, alpha),
+            D_gpu,
+            weight_gpu,
+            uniform_weight=uniform_weight,
+            normalized_stress=normalized_stress,
+            denom=denom,
+        )
         if verbose >= 2:
             print(f"it: {it}, stress {stress}")
 
-        if old_stress is not None and check_monotony:
+        if check_monotony:
             if stress > old_stress + 0.1:
                 X_gpu = old_X_gpu
                 stress = old_stress
@@ -488,18 +508,23 @@ def _smacof_randers_single(
         C = alpha * ((weight * dissimilarities - weight.T * dissimilarities.T) @ mat_one_last_col)
 
     old_X = X.copy()
-    old_stress = None
+    denom = None
+    if normalized_stress:
+        denom = float(np.sum(weight * dissimilarities * dissimilarities))
+    if alpha > 0:
+        embedded_dissimilarities = metric.pairwise(X)
+    else:
+        embedded_dissimilarities = euclidean_distances(X)
+    old_stress = (weight.ravel() * (embedded_dissimilarities.ravel() - dissimilarities.ravel()) ** 2).sum()
+    if normalized_stress:
+        old_stress = np.sqrt(old_stress / denom) if denom > 0 else np.inf
+    stress = old_stress
 
     for it in range(max_iter):
         if alpha > 0:
             embedded_dissimilarities = metric.pairwise(X)
         else:
             embedded_dissimilarities = euclidean_distances(X)
-
-        stress = (weight.ravel() * (embedded_dissimilarities.ravel() - dissimilarities.ravel()) ** 2).sum()
-        if normalized_stress:
-            denom = (weight.ravel() * dissimilarities.ravel() ** 2).sum()
-            stress = np.sqrt(stress / denom) if denom > 0 else np.inf
 
         dis = embedded_dissimilarities.copy()
         dis[dis == 0] = 1e-5
@@ -523,10 +548,17 @@ def _smacof_randers_single(
                 metric_alpha=alpha,
             )
 
+        if alpha > 0:
+            embedded_dissimilarities = metric.pairwise(X)
+        else:
+            embedded_dissimilarities = euclidean_distances(X)
+        stress = (weight.ravel() * (embedded_dissimilarities.ravel() - dissimilarities.ravel()) ** 2).sum()
+        if normalized_stress:
+            stress = np.sqrt(stress / denom) if denom > 0 else np.inf
         if verbose >= 2:
             print(f"it: {it}, stress {stress}")
 
-        if old_stress is not None and check_monotony:
+        if check_monotony:
             if stress > old_stress + 0.1:
                 X = old_X
                 stress = old_stress

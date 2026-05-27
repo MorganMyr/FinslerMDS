@@ -92,9 +92,12 @@ def _load_cupy():
 
 def _default_log_frequency(max_iter):
     max_iter = max(1, int(max_iter))
-    decade = 10 ** max(0, int(np.floor(np.log10(max_iter))) - 1)
-    threshold = 3 * 10 ** int(np.floor(np.log10(max_iter)))
-    return 5 * decade if max_iter >= threshold else decade
+    if max_iter < 30:
+        return 1
+    decade = 10 ** int(np.floor(np.log10(max_iter)))
+    if max_iter < 3 * decade:
+        return max(1, decade // 10)
+    return max(1, 5 * decade // 10)
 
 
 def _resolve_log_frequency(log_frequency, max_iter):
@@ -738,7 +741,7 @@ def path_frozen(
     local_weight=1.0,
     local_global_reweighting="none",
     device="cpu",
-    gpu_max_path_edges=50_000_000,
+    gpu_max_path_edges=100_000_000,
     method="L-BFGS-B",
     optimizer_options=None,
     log_frequency=None,
@@ -776,8 +779,9 @@ def path_frozen(
         ``"gpu"``/``"cuda"`` require the CuPy backend to be available.
     ``log_frequency``
         Print one progress line every ``log_frequency`` outer iterations. The
-        default adapts to ``max_iter``: 1 below 100, 10 below 1000, 100 below
-        10000, and so on. Pass 0 to suppress per-iteration progress lines.
+        default adapts to ``max_iter``: 1 below 30, 5 below 100, 10 below
+        300, 50 below 1000, 100 below 3000, and so on. Pass 0 to suppress
+        per-iteration progress lines.
     """
     metric = validate_metric(metric)
     gpu_backend = _resolve_gpu_backend(device, metric, verbose)

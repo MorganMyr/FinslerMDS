@@ -45,16 +45,16 @@ def main_sea():
     seed = 0
     script_dir = Path(__file__).resolve().parent
 
-    dataset_name = normalize_sea_dataset_name(os.environ.get("SEA_DATASET", "sea2"))
+    dataset_name = normalize_sea_dataset_name(os.environ.get("SEA_DATASET", "sea1"))
 
     dir_res = script_dir / "res" / dataset_name
     dir_fig = dir_res / "figures"
     dir_embeddings = dir_res / "embeddings"
 
     optimizer = os.environ.get("SEA_OPTIMIZER", "path_frozen")  # one of {"smacof", "gd", "path_frozen", "soft_bf"}
-    metric_name = os.environ.get("SEA_METRIC", "randers")
+    metric_name = os.environ.get("SEA_METRIC", "matsumoto")
     alpha_current = 0.8
-    alpha_embedding = 0.8
+    alpha_embedding = 0.7
     tobler = {"a": 7.0, "b": 0.04}
     init_source = os.environ.get(
         "SEA_INIT",
@@ -83,15 +83,15 @@ def main_sea():
     }
     path_frozen = {
         "graph_neighbors": 12,
-        "max_iter": 300,
-        "inner_iter": 2,
+        "max_iter": 20,
+        "inner_iter": 50,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-8, "maxls": 40},
-        "n_global_landmarks": 180,
+        "n_global_landmarks": 200,
         "n_local_neighbors": 12,
         "local_pair_mode": "direct",
-        "max_global_targets_per_source": 100,
+        "max_global_targets_per_source": 400,
         "local_global_reweighting": "count",
         "local_weight": 1.0,
         "device": "auto",

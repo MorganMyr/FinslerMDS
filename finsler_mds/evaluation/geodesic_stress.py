@@ -5,10 +5,10 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-from scipy.sparse.csgraph import dijkstra
 
 from finsler_mds.metrics import AlphaBetaMetric
-from finsler_mds.utils.graph import metric_graph_from_support, symmetric_knn_graph
+
+from .distance_embedding import compute_embedding_distances
 
 
 def geodesic_embedding_stress(
@@ -55,14 +55,14 @@ def geodesic_embedding_stress(
     if on_unreachable not in {"inf", "raise", "warn_skip"}:
         raise ValueError("on_unreachable must be one of {'inf', 'raise', 'warn_skip'}.")
 
-    support = symmetric_knn_graph(
+    embedded = compute_embedding_distances(
         X,
+        metric=metric,
+        mode="geodesic",
         n_neighbors=n_neighbors,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
     )
-    graph = metric_graph_from_support(X, support, metric)
-    embedded = dijkstra(graph, directed=True, return_predecessors=False)
 
     active = (W != 0) & np.isfinite(D)
     np.fill_diagonal(active, False)
