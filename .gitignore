@@ -6,19 +6,10 @@ venv
 *.py[cod]
 *$py.class
 
-# Generated experiment artifacts: embeddings, cached distances, AnnData dumps.
-scripts/res/**/embeddings/
-scripts/res/**/alpha_search/
-scripts/res/**/*.npy
-scripts/res/**/*.npz
-scripts/res/**/*.h5ad
-scripts/res/**/archive/
+# Generated experiment results
+scripts/res/
 
 # Downloaded/generated datasets.
 data/**/*.h5ad
 scripts/data/**/*.h5ad
 
-# Generated Monocle/Paul15 artifacts
-scripts/res/paul15/monocle3/monocle_input*/
-scripts/res/paul15/monocle3/**/*.npz
-scripts/res/paul15/monocle3/**/*.mtx

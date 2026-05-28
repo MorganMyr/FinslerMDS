@@ -1,8 +1,0 @@
-stage,a,b,masked_stress,full_geodesic_stress,elapsed_s,embedding_path
-a_sweep,4.5,0.04,32820.17822523242,1044759.4331819209,13.657108898973092,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta4p5_tb0p04_asweep.npz
-a_sweep,5.0,0.04,30756.80816648157,1050331.536562363,11.922746338881552,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta5_tb0p04_asweep.npz
-a_sweep,5.5,0.04,30540.19036030255,958225.7899210311,12.237588465213776,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta5p5_tb0p04_asweep.npz
-a_sweep,6.0,0.04,29059.778177178363,902567.4958947076,13.22486967407167,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta6_tb0p04_asweep.npz
-a_sweep,6.5,0.04,29482.692486890515,879773.3274490841,13.712301742983982,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta6p5_tb0p04_asweep.npz
-a_sweep,7.0,0.04,29851.838582021162,860280.1162362649,12.452205704059452,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p04_asweep.npz
-a_sweep,8.0,0.04,32755.974577634886,881071.1224420044,12.315715118078515,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta8_tb0p04_asweep.npz

@@ -10,6 +10,7 @@ The optimizer alternates between:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 import warnings
 
 import numpy as np
@@ -23,7 +24,7 @@ from finsler_mds.metrics import (
     MatsumotoMetric,
     RandersMetric,
 )
-from finsler_mds.evaluation import geodesic_embedding_stress
+from finsler_mds.evaluation.distance_embedding import compute_embedding_distances
 from finsler_mds.optimizers.common import (
     initial_embedding,
     prepare_weights_and_mask,
@@ -49,6 +50,9 @@ class PathFrozenResult:
     n_iter: int
     n_path_updates: int
     optimizer_results: list
+    history: list
+    final_full_geodesic_stress: float | None = None
+    final_normalized_full_geodesic_stress: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,53 @@ def _sampled_sources(active_pairs, max_targets_per_source):
 def _geodesic_source_count(global_pairs, local_geodesic_pairs, max_global_targets_per_source):
     global_sources = _sampled_sources(global_pairs, max_global_targets_per_source)
     return len(np.union1d(global_sources, local_geodesic_pairs.sources))
+
+
+def _full_stress_active_mask_and_denominator(D, W):
+    active = (W != 0) & np.isfinite(D)
+    np.fill_diagonal(active, False)
+    denom = float(np.sum(W[active] * D[active] ** 2))
+    return active, denom
+
+
+def _full_geodesic_stress(
+        X,
+        D,
+        W,
+        *,
+        metric,
+        active_mask,
+        denominator,
+        graph_neighbors,
+        neighbors_algorithm,
+        n_jobs,
+        ensure_connected_graph=False,
+        warn_on_connect=False,
+):
+    support_graph = symmetric_knn_graph(
+        X,
+        n_neighbors=graph_neighbors,
+        neighbors_algorithm=neighbors_algorithm,
+        n_jobs=n_jobs,
+        ensure_connected=ensure_connected_graph,
+        warn_on_connect=warn_on_connect,
+    )
+    embedded = compute_embedding_distances(
+        X,
+        metric=metric,
+        mode="geodesic",
+        support_graph=support_graph,
+        neighbors_algorithm=neighbors_algorithm,
+        n_jobs=n_jobs,
+    )
+    active = active_mask & np.isfinite(embedded)
+    if not np.array_equal(active, active_mask):
+        return np.inf, np.inf
+
+    residual = embedded[active] - D[active]
+    raw_stress = float(np.sum(W[active] * residual ** 2))
+    normalized = np.sqrt(raw_stress / denominator) if denominator > 0 else np.inf
+    return raw_stress, float(normalized)
 
 
 def _gpu_metric_supported(metric):
@@ -657,12 +708,15 @@ def _frozen_forest_from_embedding(
         active_pairs,
         neighbors_algorithm,
         n_jobs,
+        verbose=0,
 ):
     support = symmetric_knn_graph(
         X,
         n_neighbors=graph_neighbors,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
+        ensure_connected=True,
+        warn_on_connect=verbose >= 1,
     )
     graph = metric_graph_from_support(X, support, metric)
     dist_matrix, predecessors = dijkstra(
@@ -722,7 +776,7 @@ def path_frozen(
     n_components=2,
     init=None,
     graph_neighbors=10,
-    max_iter=20,
+    outer_iter=20,
     inner_iter=5,
     verbose=0,
     eps=1e-6,
@@ -730,12 +784,12 @@ def path_frozen(
     normalized_stress=False,
     weight=None,
     pair_mask=None,
-    n_local_neighbors=None,
+    n_local_pairs=None,
     local_pair_mode="geodesic",
     landmark_indices=None,
-    n_global_landmarks=0,
+    n_landmark=0,
     mask_random_state=None,
-    max_global_targets_per_source=None,
+    targets_per_landmark=None,
     global_target_sampling="random",
     target_random_state=None,
     local_weight=1.0,
@@ -745,6 +799,7 @@ def path_frozen(
     method="L-BFGS-B",
     optimizer_options=None,
     log_frequency=None,
+    record_history=False,
     neighbors_algorithm="auto",
     n_jobs=None,
     return_n_iter=False,
@@ -756,16 +811,16 @@ def path_frozen(
     the original full-stress behavior. For larger data sets, pass one or more
     sparse-pair options:
 
-    ``n_local_neighbors``
+    ``n_local_pairs``
         Keep the closest target dissimilarities in each row. With the default
         ``local_pair_mode="geodesic"``, these local constraints use the frozen
         graph-geodesic objective. Pass ``local_pair_mode="direct"`` to use
         direct Finsler distances for local pairs instead.
-    ``n_global_landmarks`` or ``landmark_indices``
+    ``n_landmark`` or ``landmark_indices``
         Keep all valid outgoing pairs from selected landmark sources.
     ``pair_mask``
         Restrict all active-pair choices to a user-provided boolean mask.
-    ``max_global_targets_per_source``
+    ``targets_per_landmark``
         At each outer iteration, sample at most this many global targets for
         each landmark source. Sampled weights are internally corrected so the
         global term estimates the full landmark-source objective.
@@ -779,13 +834,20 @@ def path_frozen(
         ``"gpu"``/``"cuda"`` require the CuPy backend to be available.
     ``log_frequency``
         Print one progress line every ``log_frequency`` outer iterations. The
-        default adapts to ``max_iter``: 1 below 30, 5 below 100, 10 below
+        default adapts to ``outer_iter``: 1 below 30, 5 below 100, 10 below
         300, 50 below 1000, 100 below 3000, and so on. Pass 0 to suppress
-        per-iteration progress lines.
+        per-iteration progress lines. With ``verbose >= 2`` or
+        ``record_history=True``, logged iterations also evaluate and record the
+        full geodesic stress; this evaluation time is excluded from the
+        reported elapsed optimization time.
+    ``record_history``
+        If True, record full-stress history at the same frequency as
+        ``log_frequency`` without requiring terminal logs.
     """
     metric = validate_metric(metric)
     gpu_backend = _resolve_gpu_backend(device, metric, verbose)
     D, W = prepare_weights_and_mask(dissimilarities, weight)
+    full_active_mask, full_denominator = _full_stress_active_mask_and_denominator(D, W)
     if mask_random_state is None:
         mask_random_state = random_state
     if target_random_state is None:
@@ -795,10 +857,10 @@ def path_frozen(
         D,
         W,
         pair_mask=pair_mask,
-        n_local_neighbors=n_local_neighbors,
+        n_local_neighbors=n_local_pairs,
         local_pair_mode=local_pair_mode,
         landmark_indices=landmark_indices,
-        n_global_landmarks=n_global_landmarks,
+        n_global_landmarks=n_landmark,
         random_state=mask_random_state,
         local_weight=local_weight,
         local_global_reweighting=local_global_reweighting,
@@ -832,16 +894,22 @@ def path_frozen(
         options.update(optimizer_options)
 
     optimizer_results = []
+    history = []
+    last_logged_outer_iter = None
+    last_full_stress = None
+    last_normalized_full_stress = None
     old_stress = None
     total_inner_iter = 0
-    log_frequency = _resolve_log_frequency(log_frequency, max_iter)
+    log_frequency = _resolve_log_frequency(log_frequency, outer_iter)
+    optimization_start = perf_counter()
+    logging_elapsed = 0.0
 
     if verbose:
-        sampled_global_n_pairs = _sampled_pair_count(global_pairs, max_global_targets_per_source)
+        sampled_global_n_pairs = _sampled_pair_count(global_pairs, targets_per_landmark)
         n_geodesic_sources = _geodesic_source_count(
             global_pairs,
             local_geodesic_pairs,
-            max_global_targets_per_source,
+            targets_per_landmark,
         )
         print(
             "path_frozen: "
@@ -858,20 +926,20 @@ def path_frozen(
                 f"global_factor={pair_groups.global_factor:.6g}, "
                 f"local_factor={pair_groups.local_factor:.6g}"
             )
-        if max_global_targets_per_source is not None:
+        if targets_per_landmark is not None:
             print(
                 "path_frozen global target sampling: "
-                f"max_global_targets_per_source={max_global_targets_per_source}, "
+                f"targets_per_landmark={targets_per_landmark}, "
                 f"global_target_sampling={global_target_sampling}, "
-                f"global_sources={len(_sampled_sources(global_pairs, max_global_targets_per_source))}"
+                f"global_sources={len(_sampled_sources(global_pairs, targets_per_landmark))}"
             )
         if log_frequency != 1:
             print(f"path_frozen logging every {log_frequency} outer iterations")
 
-    for outer_it in range(max_iter):
+    for outer_it in range(outer_iter):
         iteration_global_pairs = sample_active_pairs(
             global_pairs,
-            max_targets_per_source=max_global_targets_per_source,
+            max_targets_per_source=targets_per_landmark,
             target_sampling=global_target_sampling,
             random_state=target_random_state,
         )
@@ -887,6 +955,7 @@ def path_frozen(
                 active_pairs=iteration_pairs,
                 neighbors_algorithm=neighbors_algorithm,
                 n_jobs=n_jobs,
+                verbose=verbose,
             )
 
             if gpu_backend is not None:
@@ -949,32 +1018,84 @@ def path_frozen(
         stress = float(result.fun)
         total_inner_iter += int(getattr(result, "nit", inner_iter))
 
-        if verbose and _should_log_iteration(outer_it, max_iter, log_frequency):
+        should_log = _should_log_iteration(outer_it, outer_iter, log_frequency)
+        should_record_full = (record_history or verbose >= 2) and should_log
+        should_print = verbose and should_log
+        if should_record_full or should_print:
             nit = getattr(result, "nit", "?")
             nfev = getattr(result, "nfev", "?")
-            print(
-                f"path_frozen outer {outer_it}: masked stress {stress} "
-                f"(nit={nit}, nfev={nfev})"
-            )
+            elapsed = perf_counter() - optimization_start - logging_elapsed
+            if should_record_full:
+                log_start = perf_counter()
+                full_stress, normalized_full_stress = _full_geodesic_stress(
+                    X,
+                    D,
+                    W,
+                    metric=metric,
+                    active_mask=full_active_mask,
+                    denominator=full_denominator,
+                    graph_neighbors=graph_neighbors,
+                    neighbors_algorithm=neighbors_algorithm,
+                    n_jobs=n_jobs,
+                    ensure_connected_graph=True,
+                    warn_on_connect=verbose >= 1,
+                )
+                logging_elapsed += perf_counter() - log_start
+                history.append(
+                    {
+                        "outer_iter": outer_it,
+                        "elapsed": elapsed,
+                        "masked_stress": stress,
+                        "full_geodesic_stress": full_stress,
+                        "normalized_full_geodesic_stress": normalized_full_stress,
+                        "nit": nit,
+                        "nfev": nfev,
+                    }
+                )
+                last_logged_outer_iter = outer_it
+                last_full_stress = full_stress
+                last_normalized_full_stress = normalized_full_stress
+            if verbose >= 2:
+                print(
+                    f"path_frozen outer {outer_it}: masked stress {stress}, "
+                    f"full geodesic stress {full_stress}, "
+                    f"normalized {normalized_full_stress} "
+                    f"(elapsed={elapsed:.3f}s, nit={nit}, nfev={nfev})"
+                )
+            elif should_print:
+                print(
+                    f"path_frozen outer {outer_it}: masked stress {stress} "
+                    f"(nit={nit}, nfev={nfev})"
+                )
 
-        if max_global_targets_per_source is None and old_stress is not None and old_stress != 0:
+        if targets_per_landmark is None and old_stress is not None and old_stress != 0:
             if np.abs(1 - stress / old_stress) < eps:
                 break
         old_stress = stress
 
-    if verbose:
-        full_stress = geodesic_embedding_stress(
-            X,
-            D,
-            metric=metric,
-            n_neighbors=graph_neighbors,
-            weight=W,
-            normalized_stress=normalized_stress,
-            neighbors_algorithm=neighbors_algorithm,
-            n_jobs=n_jobs,
-            on_unreachable="inf",
-        )
-        print(f"path_frozen final full geodesic stress: {full_stress}")
+    final_full_stress = None
+    final_normalized_full_stress = None
+    if verbose or record_history:
+        if last_logged_outer_iter == outer_it:
+            final_full_stress = last_full_stress
+            final_normalized_full_stress = last_normalized_full_stress
+        else:
+            final_full_stress, final_normalized_full_stress = _full_geodesic_stress(
+                X,
+                D,
+                W,
+                metric=metric,
+                active_mask=full_active_mask,
+                denominator=full_denominator,
+                graph_neighbors=graph_neighbors,
+                neighbors_algorithm=neighbors_algorithm,
+                n_jobs=n_jobs,
+                ensure_connected_graph=True,
+                warn_on_connect=verbose >= 1,
+            )
+        if verbose:
+            displayed_full_stress = final_normalized_full_stress if normalized_stress else final_full_stress
+            print(f"path_frozen final full geodesic stress: {displayed_full_stress}")
 
     pf_result = PathFrozenResult(
         embedding=X,
@@ -982,6 +1103,9 @@ def path_frozen(
         n_iter=total_inner_iter,
         n_path_updates=outer_it + 1,
         optimizer_results=optimizer_results,
+        history=history,
+        final_full_geodesic_stress=final_full_stress,
+        final_normalized_full_geodesic_stress=final_normalized_full_stress,
     )
 
     if return_result:

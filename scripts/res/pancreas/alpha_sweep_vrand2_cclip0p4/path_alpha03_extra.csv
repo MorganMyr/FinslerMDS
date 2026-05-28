@@ -1,2 +1,0 @@
-optimizer,alpha_embedding,max_iter,inner_iter,stress_optimizer,full_geodesic_stress,cbdir,icvcoh,runtime_s,embedding_file
-path_frozen,0.3,3,3,250864038.4100943,6298527874.228558,0.5805326974272388,0.5850968240228686,16.75075114099309,path_frozen_a0p3_iter3_inner3.npz

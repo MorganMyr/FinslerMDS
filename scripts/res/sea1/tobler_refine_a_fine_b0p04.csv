@@ -1,7 +1,0 @@
-stage,a,b,masked_stress,full_geodesic_stress,elapsed_s,embedding_path
-a_fine,6.6,0.04,29105.357623066666,854885.6935614155,10.33051819796674,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta6p6_tb0p04_afine.npz
-a_fine,6.8,0.04,29036.671840903113,863609.8790480788,9.062321729958057,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta6p8_tb0p04_afine.npz
-a_fine,7.0,0.04,29535.5845072116,876640.3522761764,9.455844325944781,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7_tb0p04_afine.npz
-a_fine,7.2,0.04,29899.213852043522,852731.3033871024,9.315262745833024,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7p2_tb0p04_afine.npz
-a_fine,7.4,0.04,30339.759549653587,857249.8112777924,9.138646349078044,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7p4_tb0p04_afine.npz
-a_fine,7.6,0.04,30677.434863386086,855043.4925654494,9.767845100024715,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta7p6_tb0p04_afine.npz

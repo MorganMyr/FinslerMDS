@@ -29,6 +29,8 @@ def symmetric_knn_graph(
         metric="minkowski",
         p=2,
         metric_params=None,
+        ensure_connected=False,
+        warn_on_connect=False,
 ):
     nbrs = NearestNeighbors(
         n_neighbors=n_neighbors,
@@ -48,7 +50,23 @@ def symmetric_knn_graph(
         mode="distance",
         n_jobs=n_jobs,
     )
-    return graph.maximum(graph.T).tocsr()
+    graph = graph.maximum(graph.T).tocsr()
+    if ensure_connected:
+        n_components, labels = connected_components(graph, directed=False)
+        if n_components > 1:
+            if warn_on_connect:
+                print(f"Warning: reconnected embedding kNN graph ({n_components} components).")
+            graph = _fix_connected_components(
+                X=nbrs._fit_X,
+                graph=graph.tolil(),
+                n_connected_components=n_components,
+                component_labels=labels,
+                mode="distance",
+                metric=nbrs.effective_metric_,
+                **nbrs.effective_metric_params_,
+            )
+            graph = graph.maximum(graph.T).tocsr()
+    return graph
 
 
 def softmin_with_probs(values, beta, axis=-1, prob_dtype=None):

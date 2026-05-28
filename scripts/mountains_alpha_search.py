@@ -188,15 +188,15 @@ def short_params():
         "gd": {"max_iter": 60, "eps": 1e-6, "method": "L-BFGS-B", "optimizer_options": {"ftol": 1e-8, "maxls": 30}, "verbose": 0},
         "path_frozen": {
             "graph_neighbors": 12,
-            "max_iter": 3,
+            "outer_iter": 3,
             "inner_iter": 20,
             "eps": 1e-6,
             "method": "L-BFGS-B",
             "optimizer_options": {"ftol": 1e-8, "maxls": 30},
-            "n_global_landmarks": 70,
-            "n_local_neighbors": 8,
+            "n_landmark": 70,
+            "n_local_pairs": 8,
             "local_pair_mode": "direct",
-            "max_global_targets_per_source": 120,
+            "targets_per_landmark": 120,
             "local_global_reweighting": "count",
             "local_weight": 1.0,
             "device": "auto",
@@ -211,10 +211,10 @@ def refined_params():
     params["gd"]["max_iter"] = 220
     params["gd"]["optimizer_options"] = {"ftol": 1e-9, "maxls": 40}
     params["path_frozen"].update({
-        "max_iter": 8,
+        "outer_iter": 8,
         "inner_iter": 35,
-        "n_global_landmarks": 120,
-        "max_global_targets_per_source": 180,
+        "n_landmark": 120,
+        "targets_per_landmark": 180,
         "optimizer_options": {"ftol": 1e-8, "maxls": 40},
     })
     return params

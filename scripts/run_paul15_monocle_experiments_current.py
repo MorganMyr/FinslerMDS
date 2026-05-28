@@ -98,11 +98,11 @@ def main():
                     "procrustes_rmse",
                     "jump99",
                     "density_gamma",
-                    "max_iter",
+                    "outer_iter",
                     "inner_iter",
                     "local_weight",
-                    "n_global_landmarks",
-                    "n_local_neighbors",
+                    "n_landmark",
+                    "n_local_pairs",
                 ]
             ].to_string(index=False)
         )
