@@ -2,14 +2,14 @@
 venv
 .venv
 
-# Generated experiment artifacts: embeddings, cached distances, AnnData dumps.
-scripts/res/**/embeddings/
-scripts/res/**/alpha_search/
-scripts/res/**/raw/*.npy
-scripts/res/**/raw/*.npz
-scripts/res/**/raw/*.h5ad
-scripts/res/**/archive/
+**/__pycache__
+*.py[cod]
+*$py.class
+
+# Generated experiment results
+scripts/res/
 
 # Downloaded/generated datasets.
 data/**/*.h5ad
 scripts/data/**/*.h5ad
+

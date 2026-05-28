@@ -1,6 +1,0 @@
-label,a,b,graph_neighbors,n_landmarks,max_targets,n_local,local_weight,masked_stress,full_geodesic_stress,elapsed_s,embedding_path
-same_a35_b005,3.5,0.05,12,150,80,12,1.0,28058.569974113943,1222469.6860220535,13.237807085039094,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta3p5_tb0p05_same_a35_b005_short.npz
-softer_a2_b005,2.0,0.05,12,150,80,12,1.0,34505.18659079512,1955469.3401781432,12.044254909968004,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta2_tb0p05_softer_a2_b005_short.npz
-soft_a15_b005,1.5,0.05,12,150,80,12,1.0,38991.23661866797,2347164.059110063,11.302050434984267,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta1p5_tb0p05_soft_a15_b005_short.npz
-biased_a35_b015,3.5,0.15,12,150,80,12,1.0,38125.197006029426,1543946.8123380737,13.474524776916951,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta3p5_tb0p15_biased_a35_b015_short.npz
-more_local_a35_b005,3.5,0.05,14,120,70,18,1.5,25852.469160812754,1496649.8872602624,12.601238515926525,scripts/res/sea/embeddings/sea_a0p8_pf_ctobl_ta3p5_tb0p05_more_local_a35_b005_short.npz
