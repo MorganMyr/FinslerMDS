@@ -37,12 +37,13 @@ def main_pancreas():
     }
     velocity = {
         "mode": "dynamical",
-        "distance_formula": "exponential",  # one of {"exponential", "randers"}
-        "alpha": 3, # should be positive, and <1 for randers
-        "neighbors": 30,
-        "graph_neighbors": 50,
+        "distance_formula": "randers",  # one of {"exponential", "randers"}
+        "alpha": 2, # should be positive; randers needs alpha * cos_clip < 1
+        "cos_clip": 0.4,
+        "neighbors": 30, # to average the velocity locally (if "average" is True)
+        "graph_neighbors": 30,  # to create the kNN graph for calculating dissimilarities through Dijkstra
         "average": True,
-        "symmetrize_support": True,
+        "symmetrize_support": True, # for the kNN graph
         "graph_n_jobs": -1,
         "recover_dynamics_max_iter": 20,
         "recover_dynamics_n_jobs": -1,
@@ -55,39 +56,40 @@ def main_pancreas():
         "negative_sample_rate": 10,
         "init_pos": "spectral",
     }
+    isomap = {
+        "n_neighbors": 30,
+    }
 
-    finsler_optimizer = "soft_bf"  # one of {"smacof_randers", "path_frozen", "soft_bf", None}
-    init_finsler_mds = "soft_bf"  # one of {"umap", "umap_2D", "umap_3D", "smacof", "path_frozen", "soft_bf", None}
+    finsler_optimizer = "path_frozen"  # one of {"smacof_randers", "path_frozen", "soft_bf"}
+    init_finsler_mds = "path_frozen"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "path_frozen", "soft_bf"}
 
     # SMACOF is always run with a Randers embedding metric.
     randers_alpha_embedding = 0.8
     geodesic_metric = {
         # path-frozen and soft-BF can use one of:
         # {"randers", "matsumoto", "convexified_matsumoto"}.
-        "kind": "convexified_matsumoto",
-        "alpha": 0.8,
-        # Optional only for MatsumotoMetric:
-        # "max_phi": None,
-        # "forbidden_grad_norm": None,
+        "kind": "randers",
+        "alpha": 0.5,
     }
     smacof = {
-        "max_iter": 500,
+        "max_iter": 100,
         "device": "auto",
+        "check_monotony": True,
     }
     path_frozen = {
         "graph_neighbors": 20,
-        "max_iter": 100,
-        "inner_iter":50,
+        "outer_iter": 20,
+        "inner_iter": 5,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-9, "maxls": 50},
-        "n_global_landmarks": 600,
-        "n_local_neighbors": 25,
+        "n_landmark": 400,
+        "n_local_pairs": 20,
         "local_pair_mode": "direct",
-        "max_global_targets_per_source": 400,
+        "targets_per_landmark": 400,
         "global_target_sampling": "random",
         "local_global_reweighting": "count",
-        "local_weight": 1.0,
+        "local_weight": 0.1,
         "device": "auto",
         "verbose": 1,
     }
@@ -125,6 +127,7 @@ def main_pancreas():
         velocity_mode=velocity["mode"],
         velocity_distance_formula=normalize_velocity_distance_formula(velocity["distance_formula"]),
         velocity_alpha=velocity["alpha"],
+        velocity_cos_clip=velocity["cos_clip"],
         velocity_neighbors=velocity["neighbors"],
         velocity_graph_neighbors=velocity["graph_neighbors"],
         average_velocity=velocity["average"],
@@ -139,11 +142,13 @@ def main_pancreas():
         seed=seed,
     )
     umap_cache_tag = f"{cache_token(velocity['mode'])}_s{seed}"
+    isomap_cache_tag = f"k{isomap['n_neighbors']}_s{seed}"
     velocity_formula_tag = velocity_distance_formula_tag(velocity["distance_formula"])
     velocity_cache_tag = (
         f"{cache_token(velocity['mode'])}_"
         f"{velocity_formula_tag}_"
-        f"valpha{cache_token(velocity['alpha'])}_s{seed}"
+        f"valpha{cache_token(velocity['alpha'])}_"
+        f"cclip{cache_token(velocity['cos_clip'])}_s{seed}"
     )
     velocity_cache_path = os.path.join(
         dir_res_raw,
@@ -162,6 +167,8 @@ def main_pancreas():
     # directed velocity dissimilarities, so those live in velocity_cache_path.
     umap_2d_embedding_path = pancreas_umap_embedding_path(dir_res_raw, umap_cache_tag, n_components=2)
     umap_3d_embedding_path = pancreas_umap_embedding_path(dir_res_raw, umap_cache_tag, n_components=3)
+    isomap_2d_embedding_path = pancreas_isomap_embedding_path(dir_res_raw, isomap_cache_tag, n_components=2)
+    isomap_3d_embedding_path = pancreas_isomap_embedding_path(dir_res_raw, isomap_cache_tag, n_components=3)
     geodesic_metric_obj = make_embedding_metric(geodesic_metric)
     geodesic_metric_tag = embedding_metric_tag(geodesic_metric_obj)
     path_frozen_cache_path = os.path.join(
@@ -175,7 +182,8 @@ def main_pancreas():
         f"{velocity_formula_tag}_{geodesic_metric_tag}_seed{seed}.npz",
     )
 
-    requested_umap_dim = requested_umap_init_dimension(init_finsler_mds)
+    requested_umap_dim = requested_embedding_init_dimension(init_finsler_mds, "umap")
+    requested_isomap_dim = requested_embedding_init_dimension(init_finsler_mds, "isomap")
 
     adata = None
     cached_inputs = load_velocity_inputs_cache(
@@ -280,6 +288,7 @@ def main_pancreas():
             n_neighbors=velocity["graph_neighbors"],
             alpha=velocity["alpha"],
             distance_formula=velocity["distance_formula"],
+            cos_clip=velocity["cos_clip"],
             velocity_neighbors=velocity["neighbors"],
             average_velocity=velocity["average"],
             symmetrize_support=velocity["symmetrize_support"],
@@ -319,6 +328,38 @@ def main_pancreas():
             )
             adata.obsm["X_umap"] = x_umap
             print(f"Saved 3D UMAP embedding: {umap_3d_embedding_path}")
+        if requested_isomap_dim == 3 and not os.path.exists(isomap_3d_embedding_path):
+            x_isomap_3d = compute_isomap_from_pca(
+                X_pca,
+                isomap,
+                n_components=3,
+            )
+            np.save(isomap_3d_embedding_path, x_isomap_3d)
+            plot_3d_embedding_views(
+                x_isomap_3d,
+                labels=labels,
+                title="scVelo pancreas Isomap 3D",
+                save_path=os.path.join(dir_res, "pancreas_isomap_3d_views.pdf"),
+                point_fraction=1.0,
+                random_state=seed,
+            )
+            print(f"Saved 3D Isomap embedding: {isomap_3d_embedding_path}")
+        elif requested_isomap_dim == 2 and not os.path.exists(isomap_2d_embedding_path):
+            x_isomap = compute_isomap_from_pca(
+                X_pca,
+                isomap,
+                n_components=2,
+            )
+            np.save(isomap_2d_embedding_path, x_isomap)
+            plot_categorical_embedding(
+                x_isomap,
+                labels=labels,
+                title="scVelo pancreas Isomap",
+                xlabel="Isomap 1",
+                ylabel="Isomap 2",
+                save_path=os.path.join(dir_res, "pancreas_isomap.pdf"),
+            )
+            print(f"Saved 2D Isomap embedding: {isomap_2d_embedding_path}")
 
     if requested_umap_dim == 3 and not os.path.exists(umap_3d_embedding_path):
         x_umap_3d, labels_umap_3d = compute_and_save_pancreas_umap_embedding(
@@ -345,6 +386,41 @@ def main_pancreas():
         )
         print(f"Saved 2D UMAP embedding: {umap_2d_embedding_path}")
 
+    if requested_isomap_dim == 3 and not os.path.exists(isomap_3d_embedding_path):
+        x_isomap_3d, labels_isomap_3d = compute_and_save_pancreas_isomap_embedding(
+            isomap_3d_embedding_path,
+            preprocessing=preprocessing,
+            isomap=isomap,
+            n_components=3,
+            random_state=seed,
+        )
+        plot_3d_embedding_views(
+            x_isomap_3d,
+            labels=labels_isomap_3d,
+            title="scVelo pancreas Isomap 3D",
+            save_path=os.path.join(dir_res, "pancreas_isomap_3d_views.pdf"),
+            point_fraction=1.0,
+            random_state=seed,
+        )
+        print(f"Saved 3D Isomap embedding: {isomap_3d_embedding_path}")
+    elif requested_isomap_dim == 2 and not os.path.exists(isomap_2d_embedding_path):
+        x_isomap, labels_isomap = compute_and_save_pancreas_isomap_embedding(
+            isomap_2d_embedding_path,
+            preprocessing=preprocessing,
+            isomap=isomap,
+            n_components=2,
+            random_state=seed,
+        )
+        plot_categorical_embedding(
+            x_isomap,
+            labels=labels_isomap,
+            title="scVelo pancreas Isomap",
+            xlabel="Isomap 1",
+            ylabel="Isomap 2",
+            save_path=os.path.join(dir_res, "pancreas_isomap.pdf"),
+        )
+        print(f"Saved 2D Isomap embedding: {isomap_2d_embedding_path}")
+
     plot_categorical_embedding(
         x_umap,
         labels=labels,
@@ -361,6 +437,9 @@ def main_pancreas():
                 "umap": umap_2d_embedding_path,
                 "umap_2d": umap_2d_embedding_path,
                 "umap_3d": umap_3d_embedding_path,
+                "isomap": isomap_2d_embedding_path,
+                "isomap_2d": isomap_2d_embedding_path,
+                "isomap_3d": isomap_3d_embedding_path,
                 "smacof": latest_embedding_path(dir_res_raw, "pancreas_randers_smacof_*.npz"),
                 "path_frozen": latest_embedding_path(dir_res_raw, "pancreas_path_frozen_*.npz"),
                 "soft_bf": latest_embedding_path(dir_res_raw, "pancreas_soft_bf_*.npz"),
@@ -390,9 +469,10 @@ def main_pancreas():
                 max_iter=smacof["max_iter"],
                 pseudo_inv_solver="gmres",
                 project_on_V=True,
-                check_monotony=False,
+                check_monotony=smacof["check_monotony"],
                 device=smacof["device"],
                 print_time=True,
+                verbose=1,
             )
             full_geodesic_stress = geodesic_embedding_stress(
                 proj_finsler,
@@ -666,6 +746,12 @@ def pancreas_umap_embedding_path(cache_dir, cache_tag, *, n_components):
     return os.path.join(cache_dir, f"pancreas_umap_{int(n_components)}d_{cache_tag}.npy")
 
 
+def pancreas_isomap_embedding_path(cache_dir, cache_tag, *, n_components):
+    if int(n_components) == 2:
+        return os.path.join(cache_dir, f"pancreas_isomap_{cache_tag}.npy")
+    return os.path.join(cache_dir, f"pancreas_isomap_{int(n_components)}d_{cache_tag}.npy")
+
+
 def compute_and_save_pancreas_umap_embedding(
         output_path,
         *,
@@ -715,6 +801,62 @@ def compute_and_save_pancreas_umap_embedding(
     return embedding, labels
 
 
+def compute_and_save_pancreas_isomap_embedding(
+        output_path,
+        *,
+        preprocessing,
+        isomap,
+        n_components,
+        random_state,
+):
+    # Keep imports local so non-pancreas scripts do not require scanpy/scvelo.
+    import scanpy as sc
+    import scvelo as scv
+
+    scv.settings.verbosity = 3
+    scv.settings.set_figure_params("scvelo")
+
+    print(f"Loading scVelo pancreas dataset for {n_components}D Isomap")
+    adata = scv.datasets.pancreas()
+    print(f"Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
+
+    print("Preprocessing for Isomap")
+    scv.pp.filter_and_normalize(
+        adata,
+        min_shared_counts=preprocessing["min_shared_counts"],
+    )
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(
+        adata,
+        n_top_genes=preprocessing["n_top_genes"],
+        flavor="seurat",
+        subset=True,
+    )
+    sc.tl.pca(adata, n_comps=preprocessing["n_pcs"], random_state=random_state)
+    X_pca = np.asarray(adata.obsm["X_pca"][:, :preprocessing["n_pcs"]], dtype=float)
+    embedding = compute_isomap_from_pca(
+        X_pca,
+        isomap,
+        n_components=n_components,
+    )
+    embedding = np.asarray(embedding, dtype=float)
+    labels = labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None)
+    np.save(output_path, embedding)
+    return embedding, labels
+
+
+def compute_isomap_from_pca(X_pca, isomap, *, n_components):
+    print(
+        f"Computing {n_components}D Isomap "
+        f"(n_neighbors={isomap['n_neighbors']})"
+    )
+    embedding = utils.IsomapWithPreds(
+        n_components=n_components,
+        n_neighbors=isomap["n_neighbors"],
+    ).fit_transform(np.asarray(X_pca, dtype=float))
+    return np.asarray(embedding, dtype=float)
+
+
 def compute_umap_from_neighbors(adata, umap, *, n_components, random_state):
     import scanpy as sc
 
@@ -747,13 +889,13 @@ def plot_3d_umap(embedding, *, labels, save_path, random_state):
     print(f"Saved 3D UMAP views: {save_path}")
 
 
-def requested_umap_init_dimension(init_finsler_mds):
+def requested_embedding_init_dimension(init_finsler_mds, method):
     if init_finsler_mds is None:
         return None
     init_kind = normalize_finsler_init_kind(init_finsler_mds)
-    if init_kind == "umap_2d":
+    if init_kind == f"{method}_2d":
         return 2
-    if init_kind == "umap_3d":
+    if init_kind == f"{method}_3d":
         return 3
     return None
 
@@ -772,13 +914,14 @@ def resolve_finsler_init(init_finsler_mds, *, embedding_sources, n_samples, n_co
         )
 
     embedding = load_saved_embedding(source_path)
-    if init_kind in {"umap_2d", "umap_3d"}:
+    if init_kind in {"umap_2d", "umap_3d", "isomap_2d", "isomap_3d"}:
         if embedding.shape[0] != n_samples:
             raise ValueError(
-                f"Saved UMAP init has {embedding.shape[0]} samples, expected {n_samples}: {source_path}"
+                f"Saved {init_kind} init has {embedding.shape[0]} samples, expected {n_samples}: {source_path}"
             )
-        init = umap_to_finsler_init(embedding, n_components)
-        return init, f"saved {embedding.shape[1]}D UMAP ({source_path})"
+        init = low_dim_to_finsler_init(embedding, n_components)
+        init_label = "UMAP" if init_kind.startswith("umap") else "Isomap"
+        return init, f"saved {embedding.shape[1]}D {init_label} ({source_path})"
 
     expected_shape = (n_samples, n_components)
     if embedding.shape != expected_shape:
@@ -792,7 +935,8 @@ def normalize_finsler_init_kind(init_finsler_mds):
     if not isinstance(init_finsler_mds, str):
         raise TypeError(
             "init_finsler_mds must be one of "
-            "{'umap', 'umap_2D', 'umap_3D', 'smacof', 'path_frozen', 'soft_bf', None}."
+            "{'umap', 'umap_2D', 'umap_3D', 'isomap', 'isomap_2D', 'isomap_3D', "
+            "'smacof', 'path_frozen', 'soft_bf', None}."
         )
 
     init_kind = init_finsler_mds.lower()
@@ -800,21 +944,26 @@ def normalize_finsler_init_kind(init_finsler_mds):
         return "umap_2d"
     if init_kind in {"umap_3d", "umap3d"}:
         return "umap_3d"
+    if init_kind in {"isomap", "isomap_2d", "isomap2d"}:
+        return "isomap_2d"
+    if init_kind in {"isomap_3d", "isomap3d"}:
+        return "isomap_3d"
     if init_kind in {"soft_bellman_ford", "sbf"}:
         return "soft_bf"
     if init_kind in {"smacof", "path_frozen", "soft_bf"}:
         return init_kind
     raise ValueError(
         "init_finsler_mds must be one of "
-        "{'umap', 'umap_2D', 'umap_3D', 'smacof', 'path_frozen', 'soft_bf', None}."
+        "{'umap', 'umap_2D', 'umap_3D', 'isomap', 'isomap_2D', 'isomap_3D', "
+        "'smacof', 'path_frozen', 'soft_bf', None}."
     )
 
 
-def umap_to_finsler_init(x_umap, n_components):
-    x_umap = np.asarray(x_umap, dtype=float)
-    init = np.zeros((len(x_umap), n_components), dtype=float)
-    n_copy = min(x_umap.shape[1], n_components)
-    init[:, :n_copy] = x_umap[:, :n_copy]
+def low_dim_to_finsler_init(embedding, n_components):
+    embedding = np.asarray(embedding, dtype=float)
+    init = np.zeros((len(embedding), n_components), dtype=float)
+    n_copy = min(embedding.shape[1], n_components)
+    init[:, :n_copy] = embedding[:, :n_copy]
     return init
 
 
@@ -891,7 +1040,10 @@ def velocity_cache_metadata_matches(cached_metadata, expected_metadata):
         return True
     # Older caches used the exponential formula before the formula was explicit
     # in metadata. Keep them usable to avoid recomputing scVelo unnecessarily.
-    if expected_metadata.get("velocity_distance_formula") != "exponential":
+    if (
+            expected_metadata.get("velocity_distance_formula") != "exponential"
+            or "velocity_cos_clip" in expected_metadata
+    ):
         return False
     legacy_expected = dict(expected_metadata)
     legacy_expected.pop("velocity_distance_formula", None)

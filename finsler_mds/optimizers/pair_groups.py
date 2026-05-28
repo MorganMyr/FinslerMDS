@@ -24,9 +24,10 @@ class ActivePairs:
 class LocalGlobalPairs:
     """Local and global active-pair groups.
 
-    Local pairs are the nearest targets in the original dissimilarity matrix.
-    Global pairs are all targets from landmark source rows, or all allowed
-    pairs when no sparse local/global selection is requested.
+    Local pairs are the nearest targets in the symmetrized dissimilarity
+    matrix. Their directed target dissimilarities still come from the original
+    matrix. Global pairs are all targets from landmark source rows, or all
+    allowed pairs when no sparse local/global selection is requested.
     """
 
     global_pairs: ActivePairs
@@ -101,7 +102,13 @@ def build_local_global_pairs(
 
     if use_sparse_builder:
         if n_local_neighbors is not None and n_local_neighbors > 0:
-            _add_local_pairs(local_mask, allowed, D, int(n_local_neighbors))
+            local_selection_distances = symmetrized_local_selection_distances(D)
+            _add_local_pairs(
+                local_mask,
+                allowed,
+                local_selection_distances,
+                int(n_local_neighbors),
+            )
 
         landmarks = select_landmarks(
             D.shape[0],
@@ -313,6 +320,21 @@ def scale_active_pairs(active_pairs, factor):
         denom=active_pairs.denom * factor,
         n_pairs=active_pairs.n_pairs,
     )
+
+
+def symmetrized_local_selection_distances(D):
+    D = np.asarray(D, dtype=float)
+    reverse = D.T
+    finite_both = np.isfinite(D) & np.isfinite(reverse)
+    finite_forward = np.isfinite(D) & ~np.isfinite(reverse)
+    finite_reverse = ~np.isfinite(D) & np.isfinite(reverse)
+
+    selection = np.full_like(D, np.inf, dtype=float)
+    selection[finite_both] = 0.5 * (D[finite_both] + reverse[finite_both])
+    selection[finite_forward] = D[finite_forward]
+    selection[finite_reverse] = reverse[finite_reverse]
+    np.fill_diagonal(selection, np.inf)
+    return selection
 
 
 def group_reweighting_factors(global_pairs, local_pairs, *, mode, local_weight):

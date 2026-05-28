@@ -38,10 +38,11 @@ def main_sea_paths():
     dir_embeddings = dir_res / "embeddings"
 
     embedding_kind = os.environ.get("SEA_PATH_EMBEDDING", "path_frozen")
-    metric_name = os.environ.get("SEA_PATH_METRIC", "convexified_matsumoto")
+    metric_name = os.environ.get("SEA_PATH_METRIC", "matsumoto")
     embedding_variant = os.environ.get("SEA_PATH_VARIANT", "latest")
     if embedding_variant.lower() in {"", "none", "latest"}:
         embedding_variant = None
+    path_direction = normalize_path_direction(os.environ.get("SEA_PATH_DIRECTION", "top_left_to_bottom_right"))
     tobler = {"a": 7.0, "b": 0.04}
     alpha_current = 0.8
     embedding_neighbors = 12
@@ -67,8 +68,9 @@ def main_sea_paths():
     alpha_embedding = float(payload["alpha_embedding"]) if "alpha_embedding" in payload else None
     tobler = tobler_params_from_payload(payload, fallback=tobler)
 
-    source, target = corner_pair(X)
+    source, target = corner_pair(X, direction=path_direction)
     print(f"Loaded {embedding_kind} embedding: {embedding_path}")
+    print(f"Path direction: {path_direction}")
     print(f"Path source index={source}, target index={target}")
 
     current_path = current_map_shortest_path(
@@ -102,6 +104,7 @@ def main_sea_paths():
         embedding_kind,
         metric_name=metric_name,
         alpha_current=alpha_current,
+        direction=path_direction,
     )
     plot_current_path(
         X,
@@ -174,12 +177,18 @@ def load_embedding_payload(path):
         return {key: np.asarray(data[key]) for key in data.files}
 
 
-def corner_pair(X):
+def corner_pair(X, *, direction):
     X = np.asarray(X, dtype=float)
     x = normalize01(X[:, 0])
     y = normalize01(X[:, 1])
-    source = int(np.argmin(x + (1.0 - y)))
-    target = int(np.argmin((1.0 - x) + y))
+    top_left = int(np.argmin(x + (1.0 - y)))
+    bottom_right = int(np.argmin((1.0 - x) + y))
+    if direction == "top_left_to_bottom_right":
+        source, target = top_left, bottom_right
+    elif direction == "bottom_right_to_top_left":
+        source, target = bottom_right, top_left
+    else:  # pragma: no cover - guarded by normalize_path_direction
+        raise RuntimeError(f"Unhandled path direction {direction!r}.")
     if source == target:
         raise ValueError("Could not select distinct top-left and bottom-right points.")
     return source, target
@@ -437,14 +446,46 @@ def normalize_embedding_kind(embedding_kind):
     return aliases[kind]
 
 
-def path_figure_names(embedding_kind, *, metric_name, alpha_current):
+def normalize_path_direction(direction):
+    key = str(direction).lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "top_left_to_bottom_right": "top_left_to_bottom_right",
+        "tl_to_br": "top_left_to_bottom_right",
+        "tl_br": "top_left_to_bottom_right",
+        "forward": "top_left_to_bottom_right",
+        "normal": "top_left_to_bottom_right",
+        "bottom_right_to_top_left": "bottom_right_to_top_left",
+        "br_to_tl": "bottom_right_to_top_left",
+        "br_tl": "bottom_right_to_top_left",
+        "reverse": "bottom_right_to_top_left",
+        "reversed": "bottom_right_to_top_left",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "SEA_PATH_DIRECTION must be one of "
+            "{'top_left_to_bottom_right', 'bottom_right_to_top_left'}."
+        )
+    return aliases[key]
+
+
+def direction_abbrev(direction):
+    direction = normalize_path_direction(direction)
+    return {
+        "top_left_to_bottom_right": "tl_br",
+        "bottom_right_to_top_left": "br_tl",
+    }[direction]
+
+
+def path_figure_names(embedding_kind, *, metric_name, alpha_current, direction):
     kind = normalize_embedding_kind(embedding_kind)
     alpha = alpha_tag(alpha_current)
-    current_name = f"path_a{alpha}_current.pdf"
+    direction_tag = direction_abbrev(direction)
     if kind == "smacof":
-        return current_name, f"path_a{alpha}_smacof.pdf"
+        stem = f"path_a{alpha}_smacof_{direction_tag}"
+        return f"{stem}_current.pdf", f"{stem}.pdf"
     metric = normalize_metric_name(metric_name)
-    return current_name, f"path_a{alpha}_pf_{metric_abbrev(metric)}.pdf"
+    stem = f"path_a{alpha}_pf_{metric_abbrev(metric)}_{direction_tag}"
+    return f"{stem}_current.pdf", f"{stem}.pdf"
 
 
 def display_embedding_kind(embedding_kind):

@@ -28,7 +28,7 @@ def main_mountains():
     dir_fig = dir_res / "figures"
     dir_embeddings = dir_res / "embeddings"
 
-    optimizer = "smacof"  # one of {"smacof", "gd", "path_frozen"}
+    optimizer = "path_frozen"  # one of {"smacof", "gd", "path_frozen"}
     metric_name = "randers"  # one of {"randers", "matsumoto", "c_matsumoto"}; SMACOF always uses Randers
     init_source = "terrain"  # one of {"terrain", "latest_same"}
     n_components = 3
@@ -39,14 +39,14 @@ def main_mountains():
 
     grid = {
         "nx": 60,
-        "ny": 32,
+        "ny": 40,
         "xlim": (-15.0, 15.0),
-        "ylim": (-8.0, 8.0),
+        "ylim": (-10.0, 10.0),
         "xy_noise": 0.08,
     }
     mountains = {
         "left": {"center": (-10.0, 0.0), "height": 4.0, "sigma": (2.2, 2.2)},
-        "middle": {"center": (0.0, 0.0), "height": 3.5, "sigma": (0.8, 4.0)},
+        "middle": {"center": (0.0, 0.0), "height": 4.0, "sigma": (0.8, 6.0)},
         "right": {"center": (10.0, 0.0), "height": 4.0, "sigma": (2.2, 2.2)},
     }
     smacof = {
@@ -64,15 +64,15 @@ def main_mountains():
     }
     path_frozen = {
         "graph_neighbors": 12,
-        "max_iter": 10,
-        "inner_iter": 50,
+        "outer_iter": 20,
+        "inner_iter": 10,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-8, "maxls": 40},
-        "n_global_landmarks": 100,
-        "n_local_neighbors": 10,
+        "n_landmark": 150,
+        "n_local_pairs": 12,
         "local_pair_mode": "direct",
-        "max_global_targets_per_source": 200,
+        "targets_per_landmark": 300,
         "local_global_reweighting": "count",
         "local_weight": 1.0,
         "device": "auto",
@@ -113,7 +113,7 @@ def main_mountains():
     plot_surface_views(
         X,
         title=f"Three-mountain target surface, Convexified Matsumoto alpha={alpha_target:g}",
-        save_path=dir_fig / f"mountains_a{alpha_tag(alpha_target)}_surface.pdf",
+        save_path=dir_fig / f"a{alpha_tag(alpha_target)}_surface.pdf",
         paths=[("surface shortest path", surface_path, "crimson")],
         source=source,
         target=target,
@@ -341,7 +341,7 @@ def surface_colors(points):
 
 
 def latest_embedding_path(dir_embeddings, *, optimizer, alpha_target):
-    prefix = f"mount_a{alpha_tag(alpha_target)}_{optimizer_abbrev(normalize_optimizer(optimizer))}_"
+    prefix = f"a{alpha_tag(alpha_target)}_{optimizer_abbrev(normalize_optimizer(optimizer))}_"
     candidates = sorted(dir_embeddings.glob(f"{prefix}*.npz"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(f"No saved embedding matching {prefix}*.npz in {dir_embeddings}.")
@@ -350,8 +350,10 @@ def latest_embedding_path(dir_embeddings, *, optimizer, alpha_target):
 
 def mountains_run_key(optimizer, metric_name, alpha_target, alpha_embedding):
     optimizer = normalize_optimizer(optimizer)
+    if optimizer == "smacof":
+        return f"a{alpha_tag(alpha_target)}_smacof_a{alpha_tag(alpha_embedding)}"
     metric = metric_abbrev(normalize_metric_name(metric_name))
-    return f"mount_a{alpha_tag(alpha_target)}_{optimizer_abbrev(optimizer)}_{metric}_a{alpha_tag(alpha_embedding)}"
+    return f"a{alpha_tag(alpha_target)}_{optimizer_abbrev(optimizer)}_{metric}_a{alpha_tag(alpha_embedding)}"
 
 
 def normalize_optimizer(optimizer):

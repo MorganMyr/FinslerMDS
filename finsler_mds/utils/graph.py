@@ -29,6 +29,8 @@ def symmetric_knn_graph(
         metric="minkowski",
         p=2,
         metric_params=None,
+        ensure_connected=False,
+        warn_on_connect=False,
 ):
     nbrs = NearestNeighbors(
         n_neighbors=n_neighbors,
@@ -48,7 +50,23 @@ def symmetric_knn_graph(
         mode="distance",
         n_jobs=n_jobs,
     )
-    return graph.maximum(graph.T).tocsr()
+    graph = graph.maximum(graph.T).tocsr()
+    if ensure_connected:
+        n_components, labels = connected_components(graph, directed=False)
+        if n_components > 1:
+            if warn_on_connect:
+                print(f"Warning: reconnected embedding kNN graph ({n_components} components).")
+            graph = _fix_connected_components(
+                X=nbrs._fit_X,
+                graph=graph.tolil(),
+                n_connected_components=n_components,
+                component_labels=labels,
+                mode="distance",
+                metric=nbrs.effective_metric_,
+                **nbrs.effective_metric_params_,
+            )
+            graph = graph.maximum(graph.T).tocsr()
+    return graph
 
 
 def softmin_with_probs(values, beta, axis=-1, prob_dtype=None):
@@ -135,6 +153,7 @@ def velocity_directed_graph(
         velocity_neighbors=None,
         average_velocity=True,
         symmetrize_support=True,
+        cos_clip=None,
         neighbors_algorithm="auto",
         n_jobs=None,
 ):
@@ -146,6 +165,9 @@ def velocity_directed_graph(
     - ``"exponential"``: ``||X_j - X_i|| * exp(-alpha * cos(theta))``.
     - ``"randers"``: ``||X_j - X_i|| * (1 - alpha * cos(theta))``.
 
+    If ``cos_clip`` is not ``None``, cosines are clipped to
+    ``[-cos_clip, cos_clip]`` before applying either formula.
+
     Moving with the velocity is cheaper, moving against it is more expensive.
     """
     X = np.asarray(X, dtype=float)
@@ -153,8 +175,17 @@ def velocity_directed_graph(
     if X.shape != velocity.shape:
         raise ValueError("X and velocity must have the same shape.")
     distance_formula = _normalize_velocity_distance_formula(distance_formula)
-    if distance_formula == "randers" and not 0 <= alpha < 1:
-        raise ValueError("Randers velocity distances require 0 <= alpha < 1.")
+    if cos_clip is not None:
+        cos_clip = float(cos_clip)
+        if not 0 <= cos_clip <= 1:
+            raise ValueError("cos_clip must be None or a float in [0, 1].")
+    if distance_formula == "randers":
+        max_cos = 1.0 if cos_clip is None else cos_clip
+        if alpha < 0 or alpha * max_cos >= 1:
+            raise ValueError(
+                "Randers velocity distances require alpha >= 0 and "
+                "alpha * max(|cos|) < 1. Lower alpha or set a smaller cos_clip."
+            )
 
     support = symmetric_knn_graph(
         X,
@@ -194,6 +225,8 @@ def velocity_directed_graph(
         where=denom > 1e-12,
     )
     cosines = np.clip(cosines, -1.0, 1.0)
+    if cos_clip is not None:
+        cosines = np.clip(cosines, -cos_clip, cos_clip)
     if distance_formula == "exponential":
         edge_weights = edge_lengths * np.exp(-alpha * cosines)
     elif distance_formula == "randers":
@@ -239,6 +272,7 @@ def compute_velocity_dist_matrix(
         velocity_neighbors=None,
         average_velocity=True,
         symmetrize_support=True,
+        cos_clip=None,
         path_method="auto",
         neighbors_algorithm="auto",
         n_jobs=None,
@@ -253,6 +287,7 @@ def compute_velocity_dist_matrix(
         velocity_neighbors=velocity_neighbors,
         average_velocity=average_velocity,
         symmetrize_support=symmetrize_support,
+        cos_clip=cos_clip,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
     )

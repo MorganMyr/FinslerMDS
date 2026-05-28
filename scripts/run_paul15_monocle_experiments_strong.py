@@ -95,11 +95,11 @@ def main():
                     "procrustes_rmse",
                     "jump99",
                     "density_gamma",
-                    "max_iter",
+                    "outer_iter",
                     "inner_iter",
                     "local_weight",
-                    "n_global_landmarks",
-                    "n_local_neighbors",
+                    "n_landmark",
+                    "n_local_pairs",
                 ]
             ].to_string(index=False)
         )
@@ -111,11 +111,11 @@ def v(name, gamma, common, *, max_iter, inner_iter, landmarks, targets, local_ne
         "density_gamma": gamma,
         "path": {
             **common,
-            "max_iter": max_iter,
+            "outer_iter": max_iter,
             "inner_iter": inner_iter,
-            "n_global_landmarks": landmarks,
-            "max_global_targets_per_source": targets,
-            "n_local_neighbors": local_neighbors,
+            "n_landmark": landmarks,
+            "targets_per_landmark": targets,
+            "n_local_pairs": local_neighbors,
             "local_weight": float(local_weight),
         },
     }
