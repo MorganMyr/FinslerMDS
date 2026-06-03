@@ -63,6 +63,7 @@ def build_local_global_pairs(
         local_pair_mode="direct",
         landmark_indices=None,
         n_global_landmarks=0,
+        landmark_sampling="random",
         random_state=None,
         local_weight=1.0,
         local_global_reweighting="none",
@@ -111,9 +112,10 @@ def build_local_global_pairs(
             )
 
         landmarks = select_landmarks(
-            D.shape[0],
+            D,
             landmark_indices=landmark_indices,
             n_global_landmarks=n_global_landmarks,
+            landmark_sampling=landmark_sampling,
             random_state=random_state,
         )
         if len(landmarks) > 0:
@@ -183,7 +185,8 @@ def active_pairs_from_mask(D, W, active_mask, *, allow_empty=False):
     )
 
 
-def select_landmarks(n_samples, *, landmark_indices, n_global_landmarks, random_state):
+def select_landmarks(D, *, landmark_indices, n_global_landmarks, landmark_sampling, random_state):
+    n_samples = D.shape[0]
     if landmark_indices is not None:
         landmarks = np.asarray(landmark_indices, dtype=int)
         if landmarks.ndim != 1:
@@ -197,14 +200,17 @@ def select_landmarks(n_samples, *, landmark_indices, n_global_landmarks, random_
 
     rng = check_random_state(random_state)
     n_global_landmarks = min(int(n_global_landmarks), n_samples)
-    return np.sort(rng.choice(n_samples, size=n_global_landmarks, replace=False))
+    if landmark_sampling == "random":
+        return np.sort(rng.choice(n_samples, size=n_global_landmarks, replace=False))
+    if landmark_sampling == "farthest":
+        return _farthest_point_landmarks(D, n_global_landmarks, rng)
+    raise ValueError("landmark_sampling must be 'random' or 'farthest'.")
 
 
 def sample_active_pairs(
         active_pairs,
         *,
         max_targets_per_source,
-        target_sampling,
         random_state,
 ):
     """Sample targets within each source row with unbiased weight correction."""
@@ -214,8 +220,6 @@ def sample_active_pairs(
     max_targets_per_source = int(max_targets_per_source)
     if max_targets_per_source <= 0:
         raise ValueError("max_targets_per_source must be positive or None.")
-    if target_sampling not in {"random", "farthest", "mixed"}:
-        raise ValueError("target_sampling must be 'random', 'farthest', or 'mixed'.")
 
     rng = check_random_state(random_state)
     targets = []
@@ -231,12 +235,7 @@ def sample_active_pairs(
         n_available = len(source_targets)
 
         if n_available > max_targets_per_source:
-            chosen = _sample_target_indices(
-                source_dissimilarities,
-                max_targets_per_source,
-                target_sampling,
-                rng,
-            )
+            chosen = np.sort(rng.choice(n_available, size=max_targets_per_source, replace=False))
             sampled_targets = source_targets[chosen]
             sampled_weights = source_weights[chosen].copy()
             sampled_dissimilarities = source_dissimilarities[chosen]
@@ -365,26 +364,21 @@ def _add_local_pairs(active, allowed, D, n_local_neighbors):
         active[source, chosen] = True
 
 
-def _sample_target_indices(dissimilarities, n_keep, target_sampling, rng):
-    n_available = len(dissimilarities)
-    if target_sampling == "random":
-        chosen = rng.choice(n_available, size=n_keep, replace=False)
-    elif target_sampling == "farthest":
-        chosen = np.argpartition(dissimilarities, n_available - n_keep)[-n_keep:]
-    else:
-        n_far = n_keep // 2
-        far = (
-            np.argpartition(dissimilarities, n_available - n_far)[-n_far:]
-            if n_far > 0
-            else np.array([], dtype=int)
-        )
-        remaining_mask = np.ones(n_available, dtype=bool)
-        remaining_mask[far] = False
-        remaining = np.flatnonzero(remaining_mask)
-        n_random = n_keep - len(far)
-        random = rng.choice(remaining, size=n_random, replace=False)
-        chosen = np.concatenate([far, random])
-    return np.sort(chosen)
+def _farthest_point_landmarks(D, n_landmarks, rng):
+    distances = symmetrized_local_selection_distances(D)
+    n_samples = distances.shape[0]
+    first = int(rng.randint(n_samples))
+    selected = np.empty(n_landmarks, dtype=int)
+    selected[0] = first
+
+    min_dist = distances[first].copy()
+    min_dist[first] = -np.inf
+    for pos in range(1, n_landmarks):
+        next_point = int(np.argmax(min_dist))
+        selected[pos] = next_point
+        min_dist = np.minimum(min_dist, distances[next_point])
+        min_dist[selected[:pos + 1]] = -np.inf
+    return np.sort(selected)
 
 
 def _group_mass(active_pairs, mode):

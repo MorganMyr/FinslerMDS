@@ -488,7 +488,12 @@ def _smacof_randers_single(
         and uniform_offdiag_weight is not None
     )
     V = None if use_uniform_projected_update else _laplacian_from_weights(weight)
-    V_pinv = None if alpha > 0 else np.linalg.pinv(V)
+    use_uniform_euclidean_update = (
+        alpha == 0
+        and project_on_V
+        and uniform_offdiag_weight is not None
+    )
+    V_pinv = None if alpha > 0 or use_uniform_euclidean_update else np.linalg.pinv(V)
 
     diag_one_end = np.zeros((n_components, n_components))
     diag_one_end[-1, -1] = 1
@@ -534,7 +539,11 @@ def _smacof_randers_single(
         B[diag, diag] += -B.sum(axis=1)
 
         if alpha == 0:
-            X = V_pinv @ B @ X
+            if use_uniform_euclidean_update:
+                X = (B @ X) / (n_samples * uniform_offdiag_weight)
+                X -= X.mean(axis=0, keepdims=True)
+            else:
+                X = V_pinv @ B @ X
         else:
             total_right_mat = B @ X - C
             X = _solve_randers_update(

@@ -1,6 +1,7 @@
 import numpy as np
+from collections.abc import Mapping
 import matplotlib.pyplot as plt
-from matplotlib.colors import to_rgb
+from matplotlib.colors import to_rgb, to_rgba
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
@@ -223,17 +224,27 @@ def plot_categorical_embedding(
     if labels is None:
         ax.scatter(embedding[:, 0], embedding[:, 1], s=s, lw=0)
     else:
-        codes, categories = _categorical_codes(labels)
-
-        scatter = ax.scatter(
+        color_values, categories, color_map = _categorical_color_values(labels, cmap)
+        ax.scatter(
             embedding[:, 0],
             embedding[:, 1],
-            c=codes,
-            cmap=cmap,
+            c=color_values,
             s=s,
             lw=0,
         )
-        handles, _ = scatter.legend_elements()
+        handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="none",
+                markerfacecolor=color_map[cat],
+                markeredgecolor="none",
+                markersize=6,
+                label=str(cat),
+            )
+            for cat in categories
+        ]
         ax.legend(
             handles,
             categories,
@@ -493,12 +504,19 @@ def _categorical_color_values(labels, cmap):
 
     codes, categories = _categorical_codes(labels)
 
-    cmap_obj = plt.get_cmap(cmap)
-    n_colors = getattr(cmap_obj, "N", len(categories))
-    color_map = {
-        category: cmap_obj(code % n_colors)
-        for code, category in enumerate(categories)
-    }
+    if isinstance(cmap, Mapping):
+        fallback = plt.get_cmap("tab20")
+        color_map = {
+            category: to_rgba(cmap.get(category, fallback(code % fallback.N)))
+            for code, category in enumerate(categories)
+        }
+    else:
+        cmap_obj = plt.get_cmap(cmap)
+        n_colors = getattr(cmap_obj, "N", len(categories))
+        color_map = {
+            category: cmap_obj(code % n_colors)
+            for code, category in enumerate(categories)
+        }
     color_values = np.asarray([color_map[categories[code]] for code in codes])
     return color_values, categories, color_map
 

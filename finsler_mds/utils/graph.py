@@ -147,7 +147,9 @@ def compute_metric_dist_matrix(
 def velocity_directed_graph(
         X,
         velocity,
-        n_neighbors=30,
+        n_neighbors=None,
+        kNN_euclid=30,
+        kNN_finsler=0,
         alpha=1.0,
         distance_formula="exponential",
         velocity_neighbors=None,
@@ -170,6 +172,8 @@ def velocity_directed_graph(
 
     Moving with the velocity is cheaper, moving against it is more expensive.
     """
+    if n_neighbors is not None:
+        kNN_euclid = n_neighbors
     X = np.asarray(X, dtype=float)
     velocity = np.asarray(velocity, dtype=float)
     if X.shape != velocity.shape:
@@ -189,18 +193,18 @@ def velocity_directed_graph(
 
     support = symmetric_knn_graph(
         X,
-        n_neighbors=n_neighbors,
+        n_neighbors=kNN_euclid,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
     )
     if not symmetrize_support:
         nbrs = NearestNeighbors(
-            n_neighbors=n_neighbors,
+            n_neighbors=kNN_euclid,
             algorithm=neighbors_algorithm,
             n_jobs=n_jobs,
         )
         nbrs.fit(X)
-        support = kneighbors_graph(nbrs, n_neighbors, mode="distance", n_jobs=n_jobs).tocsr()
+        support = kneighbors_graph(nbrs, kNN_euclid, mode="distance", n_jobs=n_jobs).tocsr()
 
     velocity_used = velocity
     if average_velocity:
@@ -210,6 +214,19 @@ def velocity_directed_graph(
             include_self=True,
             n_neighbors=velocity_neighbors,
         )
+
+    if kNN_finsler:
+        finsler_support = _velocity_finsler_knn_support(
+            X,
+            velocity_used,
+            n_neighbors=kNN_finsler,
+            alpha=alpha,
+            distance_formula=distance_formula,
+            cos_clip=cos_clip,
+        )
+        support = support.maximum(finsler_support).tocsr()
+        if symmetrize_support:
+            support = support.maximum(support.T).tocsr()
 
     support_coo = support.tocoo()
     edge_vectors = X[support_coo.col] - X[support_coo.row]
@@ -241,6 +258,62 @@ def velocity_directed_graph(
     return graph, velocity_used
 
 
+def _velocity_finsler_knn_support(
+        X,
+        velocity,
+        *,
+        n_neighbors,
+        alpha,
+        distance_formula,
+        cos_clip,
+        batch_size=64,
+):
+    n_neighbors = int(n_neighbors)
+    if n_neighbors <= 0:
+        return scipy.sparse.csr_matrix((len(X), len(X)))
+    n_samples = len(X)
+    if n_neighbors >= n_samples:
+        raise ValueError("kNN_finsler must be smaller than the number of samples.")
+
+    rows = []
+    cols = []
+    data = []
+    for start in range(0, n_samples, batch_size):
+        stop = min(start + batch_size, n_samples)
+        vectors = X[None, :, :] - X[start:stop, None, :]
+        lengths = np.linalg.norm(vectors, axis=2)
+        source_velocity = velocity[start:stop]
+        velocity_norms = np.linalg.norm(source_velocity, axis=1)
+        denom = velocity_norms[:, None] * lengths
+        cosines = np.divide(
+            np.einsum("bd,bnd->bn", source_velocity, vectors),
+            denom,
+            out=np.zeros_like(lengths),
+            where=denom > 1e-12,
+        )
+        cosines = np.clip(cosines, -1.0, 1.0)
+        if cos_clip is not None:
+            cosines = np.clip(cosines, -cos_clip, cos_clip)
+        if distance_formula == "exponential":
+            weights = lengths * np.exp(-alpha * cosines)
+        elif distance_formula == "randers":
+            weights = lengths * (1 - alpha * cosines)
+        else:  # pragma: no cover - guarded by normalization
+            raise RuntimeError(f"Unhandled velocity distance formula {distance_formula!r}.")
+        weights[np.arange(stop - start), np.arange(start, stop)] = np.inf
+        selected = np.argpartition(weights, n_neighbors - 1, axis=1)[:, :n_neighbors]
+        batch_rows = np.repeat(np.arange(start, stop), n_neighbors)
+        batch_cols = selected.reshape(-1)
+        rows.append(batch_rows)
+        cols.append(batch_cols)
+        data.append(weights[np.arange(stop - start)[:, None], selected].reshape(-1))
+
+    return scipy.sparse.csr_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n_samples, n_samples),
+    )
+
+
 def average_vectors_on_graph(vectors, graph, include_self=True, n_neighbors=None):
     """Average vectors over graph outgoing neighborhoods."""
     vectors = np.asarray(vectors, dtype=float)
@@ -266,7 +339,9 @@ def average_vectors_on_graph(vectors, graph, include_self=True, n_neighbors=None
 def compute_velocity_dist_matrix(
         X,
         velocity,
-        n_neighbors=30,
+        n_neighbors=None,
+        kNN_euclid=30,
+        kNN_finsler=0,
         alpha=1.0,
         distance_formula="exponential",
         velocity_neighbors=None,
@@ -282,6 +357,8 @@ def compute_velocity_dist_matrix(
         X,
         velocity,
         n_neighbors=n_neighbors,
+        kNN_euclid=kNN_euclid,
+        kNN_finsler=kNN_finsler,
         alpha=alpha,
         distance_formula=distance_formula,
         velocity_neighbors=velocity_neighbors,

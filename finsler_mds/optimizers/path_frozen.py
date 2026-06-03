@@ -788,9 +788,9 @@ def path_frozen(
     local_pair_mode="geodesic",
     landmark_indices=None,
     n_landmark=0,
+    landmark_sampling="random",
     mask_random_state=None,
     targets_per_landmark=None,
-    global_target_sampling="random",
     target_random_state=None,
     local_weight=1.0,
     local_global_reweighting="none",
@@ -818,6 +818,8 @@ def path_frozen(
         direct Finsler distances for local pairs instead.
     ``n_landmark`` or ``landmark_indices``
         Keep all valid outgoing pairs from selected landmark sources.
+        ``landmark_sampling`` controls automatic landmark selection and is one
+        of ``"random"`` or ``"farthest"``.
     ``pair_mask``
         Restrict all active-pair choices to a user-provided boolean mask.
     ``targets_per_landmark``
@@ -861,6 +863,7 @@ def path_frozen(
         local_pair_mode=local_pair_mode,
         landmark_indices=landmark_indices,
         n_global_landmarks=n_landmark,
+        landmark_sampling=landmark_sampling,
         random_state=mask_random_state,
         local_weight=local_weight,
         local_global_reweighting=local_global_reweighting,
@@ -930,7 +933,7 @@ def path_frozen(
             print(
                 "path_frozen global target sampling: "
                 f"targets_per_landmark={targets_per_landmark}, "
-                f"global_target_sampling={global_target_sampling}, "
+                f"landmark_sampling={landmark_sampling}, "
                 f"global_sources={len(_sampled_sources(global_pairs, targets_per_landmark))}"
             )
         if log_frequency != 1:
@@ -940,7 +943,6 @@ def path_frozen(
         iteration_global_pairs = sample_active_pairs(
             global_pairs,
             max_targets_per_source=targets_per_landmark,
-            target_sampling=global_target_sampling,
             random_state=target_random_state,
         )
         iteration_pairs = merge_active_pairs(iteration_global_pairs, local_geodesic_pairs)

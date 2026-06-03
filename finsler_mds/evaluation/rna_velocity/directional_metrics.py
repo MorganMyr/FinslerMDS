@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse
@@ -24,6 +27,24 @@ class ClusterTransitionScore:
 class CBDirResult:
     score: float
     transitions: dict[tuple[object, object], ClusterTransitionScore]
+
+
+@dataclass(frozen=True)
+class BoundaryTransitionNeighbors:
+    source: object
+    target: object
+    cell_indices: np.ndarray
+    target_indptr: np.ndarray
+    target_indices: np.ndarray
+
+
+@dataclass(frozen=True)
+class BoundaryNeighborPlan:
+    n_neighbors: int
+    n_samples: int
+    labels: np.ndarray
+    transitions: dict[tuple[object, object], BoundaryTransitionNeighbors]
+    neighbor_indices_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +125,7 @@ def cross_boundary_direction_correctness(
         transition_graph=None,
         n_neighbors=30,
         neighbor_indices=None,
+        boundary_plan=None,
         eps=1e-12,
 ):
     """Compute cross-boundary direction correctness (CBDir).
@@ -120,22 +142,33 @@ def cross_boundary_direction_correctness(
         velocity_vectors=velocity_vectors,
         transition_graph=transition_graph,
     )
-    neighbors = _resolve_neighbors(
-        X,
-        n_neighbors=n_neighbors,
-        neighbor_indices=neighbor_indices,
-    )
+    if boundary_plan is None:
+        neighbors = _resolve_neighbors(
+            X,
+            n_neighbors=n_neighbors,
+            neighbor_indices=neighbor_indices,
+        )
+        boundary_plan = build_boundary_neighbor_plan(
+            labels,
+            cluster_edges,
+            neighbors,
+            n_neighbors=neighbors.shape[1],
+        )
+    else:
+        boundary_plan = _validate_boundary_plan(
+            boundary_plan,
+            labels=labels,
+            cluster_edges=cluster_edges,
+            n_neighbors=n_neighbors,
+        )
 
     transition_scores = {}
     all_cell_scores = []
     for source, target in cluster_edges:
-        score = _score_cross_boundary_transition(
+        score = _score_cross_boundary_transition_from_plan(
             X,
-            labels,
             velocities,
-            neighbors,
-            source=source,
-            target=target,
+            boundary_plan.transitions[(source, target)],
             eps=eps,
         )
         transition_scores[(source, target)] = score
@@ -193,24 +226,198 @@ def in_cluster_velocity_coherence(
     return ICVCohResult(score=score, clusters=cluster_scores)
 
 
-def _score_cross_boundary_transition(
-        X,
-        labels,
-        velocities,
-        neighbors,
+def build_boundary_neighbor_plan(labels, cluster_edges, neighbor_indices, *, n_neighbors=None):
+    """Precompute boundary cells and target-cluster neighbors for CBDir.
+
+    The result depends on ``n_neighbors``. If a smaller value than the number of
+    columns in ``neighbor_indices`` is supplied, only the first ``n_neighbors``
+    columns are used.
+    """
+    labels = np.asarray(labels)
+    neighbors = np.asarray(neighbor_indices, dtype=int)
+    if neighbors.ndim != 2 or neighbors.shape[0] != len(labels):
+        raise ValueError("neighbor_indices must have shape (n_samples, n_neighbors).")
+    if n_neighbors is None:
+        n_neighbors = neighbors.shape[1]
+    n_neighbors = int(n_neighbors)
+    if n_neighbors <= 0:
+        raise ValueError("n_neighbors must be positive.")
+    if n_neighbors > neighbors.shape[1]:
+        raise ValueError(
+            f"Requested n_neighbors={n_neighbors}, but neighbor_indices only "
+            f"has {neighbors.shape[1]} columns."
+        )
+    neighbors = neighbors[:, :n_neighbors]
+    neighbor_indices_hash = _neighbor_indices_hash(neighbors)
+
+    transitions = {}
+    for source, target in cluster_edges:
+        source_cells = np.flatnonzero(labels == source)
+        cell_indices = []
+        target_indptr = [0]
+        target_indices = []
+        for cell in source_cells:
+            cell_neighbors = _valid_neighbors(neighbors[cell])
+            target_neighbors = cell_neighbors[labels[cell_neighbors] == target]
+            if len(target_neighbors) == 0:
+                continue
+            cell_indices.append(cell)
+            target_indices.extend(target_neighbors.tolist())
+            target_indptr.append(len(target_indices))
+        transitions[(source, target)] = BoundaryTransitionNeighbors(
+            source=source,
+            target=target,
+            cell_indices=np.asarray(cell_indices, dtype=int),
+            target_indptr=np.asarray(target_indptr, dtype=int),
+            target_indices=np.asarray(target_indices, dtype=int),
+        )
+
+    return BoundaryNeighborPlan(
+        n_neighbors=n_neighbors,
+        n_samples=len(labels),
+        labels=np.asarray(labels, dtype=str),
+        transitions=transitions,
+        neighbor_indices_hash=neighbor_indices_hash,
+    )
+
+
+def save_boundary_neighbor_plan(path, plan):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    edges = list(plan.transitions)
+    arrays = {
+        "labels": np.asarray(plan.labels, dtype=str),
+        "transition_sources": np.asarray([source for source, _ in edges], dtype=str),
+        "transition_targets": np.asarray([target for _, target in edges], dtype=str),
+        "metadata_json": np.asarray(json.dumps({
+            "n_neighbors": int(plan.n_neighbors),
+            "n_samples": int(plan.n_samples),
+            "n_transitions": len(edges),
+            "neighbor_indices_hash": plan.neighbor_indices_hash,
+        }, sort_keys=True)),
+    }
+    for idx, edge in enumerate(edges):
+        transition = plan.transitions[edge]
+        prefix = f"transition_{idx}"
+        arrays[f"{prefix}_cell_indices"] = transition.cell_indices
+        arrays[f"{prefix}_target_indptr"] = transition.target_indptr
+        arrays[f"{prefix}_target_indices"] = transition.target_indices
+    np.savez(path, **arrays)
+
+
+def load_boundary_neighbor_plan(
+        path,
         *,
-        source,
-        target,
+        labels=None,
+        cluster_edges=None,
+        n_neighbors=None,
+        neighbor_indices=None,
+):
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as cache:
+        metadata = json.loads(str(cache["metadata_json"].item()))
+        cached_n_neighbors = int(metadata["n_neighbors"])
+        if n_neighbors is not None and cached_n_neighbors != int(n_neighbors):
+            raise ValueError(
+                f"Boundary-neighbor cache was built with n_neighbors={cached_n_neighbors}, "
+                f"but n_neighbors={int(n_neighbors)} was requested: {path}"
+            )
+        cached_neighbor_hash = metadata.get("neighbor_indices_hash")
+        if neighbor_indices is not None and cached_neighbor_hash is not None:
+            neighbors = np.asarray(neighbor_indices, dtype=int)
+            if int(n_neighbors or cached_n_neighbors) > neighbors.shape[1]:
+                raise ValueError(
+                    f"Requested n_neighbors={int(n_neighbors or cached_n_neighbors)}, but "
+                    f"neighbor_indices only has {neighbors.shape[1]} columns."
+                )
+            requested_hash = _neighbor_indices_hash(neighbors[:, :cached_n_neighbors])
+            if requested_hash != cached_neighbor_hash:
+                raise ValueError(f"Boundary-neighbor cache neighbor graph does not match: {path}")
+
+        cached_labels = np.asarray(cache["labels"], dtype=str)
+        if labels is not None and not np.array_equal(cached_labels, np.asarray(labels, dtype=str)):
+            raise ValueError(f"Boundary-neighbor cache labels do not match requested labels: {path}")
+
+        sources = np.asarray(cache["transition_sources"], dtype=str)
+        targets = np.asarray(cache["transition_targets"], dtype=str)
+        edges = [(source, target) for source, target in zip(sources, targets)]
+        if cluster_edges is not None:
+            requested_edges = [(str(source), str(target)) for source, target in cluster_edges]
+            if edges != requested_edges:
+                raise ValueError(
+                    f"Boundary-neighbor cache transitions do not match requested transitions: {path}"
+                )
+
+        transitions = {}
+        for idx, edge in enumerate(edges):
+            prefix = f"transition_{idx}"
+            source, target = edge
+            transitions[edge] = BoundaryTransitionNeighbors(
+                source=source,
+                target=target,
+                cell_indices=np.asarray(cache[f"{prefix}_cell_indices"], dtype=int),
+                target_indptr=np.asarray(cache[f"{prefix}_target_indptr"], dtype=int),
+                target_indices=np.asarray(cache[f"{prefix}_target_indices"], dtype=int),
+            )
+
+    return BoundaryNeighborPlan(
+        n_neighbors=cached_n_neighbors,
+        n_samples=len(cached_labels),
+        labels=cached_labels,
+        transitions=transitions,
+        neighbor_indices_hash=cached_neighbor_hash,
+    )
+
+
+def load_or_compute_boundary_neighbor_plan(
+        path,
+        labels,
+        *,
+        cluster_edges,
+        neighbor_indices,
+        n_neighbors,
+        on_mismatch="error",
+):
+    path = Path(path)
+    if path.exists():
+        try:
+            return load_boundary_neighbor_plan(
+                path,
+                labels=labels,
+                cluster_edges=cluster_edges,
+                n_neighbors=n_neighbors,
+                neighbor_indices=neighbor_indices,
+            )
+        except ValueError:
+            if on_mismatch != "recompute":
+                raise
+    elif on_mismatch not in {"error", "recompute"}:
+        raise ValueError("on_mismatch must be 'error' or 'recompute'.")
+
+    plan = build_boundary_neighbor_plan(
+        labels,
+        cluster_edges,
+        neighbor_indices,
+        n_neighbors=n_neighbors,
+    )
+    save_boundary_neighbor_plan(path, plan)
+    return plan
+
+
+def _score_cross_boundary_transition_from_plan(
+        X,
+        velocities,
+        transition,
+        *,
         eps,
 ):
-    source_cells = np.flatnonzero(labels == source)
     cell_indices = []
     cell_scores = []
     n_neighbor_pairs = 0
 
-    for cell in source_cells:
-        cell_neighbors = _valid_neighbors(neighbors[cell])
-        target_neighbors = cell_neighbors[labels[cell_neighbors] == target]
+    for pos, cell in enumerate(transition.cell_indices):
+        start, end = transition.target_indptr[pos], transition.target_indptr[pos + 1]
+        target_neighbors = transition.target_indices[start:end]
         if len(target_neighbors) == 0:
             continue
         displacements = X[target_neighbors] - X[cell]
@@ -225,14 +432,40 @@ def _score_cross_boundary_transition(
     cell_indices = np.asarray(cell_indices, dtype=int)
     cell_scores = np.asarray(cell_scores, dtype=float)
     return ClusterTransitionScore(
-        source=source,
-        target=target,
+        source=transition.source,
+        target=transition.target,
         score=float(np.mean(cell_scores)) if len(cell_scores) else np.nan,
         n_boundary_cells=len(cell_scores),
         n_neighbor_pairs=n_neighbor_pairs,
         cell_indices=cell_indices,
         cell_scores=cell_scores,
     )
+
+
+def _validate_boundary_plan(plan, *, labels, cluster_edges, n_neighbors):
+    if not isinstance(plan, BoundaryNeighborPlan):
+        raise TypeError("boundary_plan must be a BoundaryNeighborPlan.")
+    if plan.n_samples != len(labels):
+        raise ValueError(
+            f"boundary_plan has n_samples={plan.n_samples}, expected {len(labels)}."
+        )
+    if n_neighbors is not None and int(n_neighbors) != int(plan.n_neighbors):
+        raise ValueError(
+            f"boundary_plan was built with n_neighbors={plan.n_neighbors}, "
+            f"but n_neighbors={int(n_neighbors)} was requested."
+        )
+    if not np.array_equal(np.asarray(labels, dtype=str), np.asarray(plan.labels, dtype=str)):
+        raise ValueError("boundary_plan labels do not match labels.")
+    missing = [edge for edge in cluster_edges if edge not in plan.transitions]
+    if missing:
+        raise ValueError(f"boundary_plan is missing transitions: {missing!r}.")
+    return plan
+
+
+def _neighbor_indices_hash(neighbor_indices):
+    neighbors = np.asarray(neighbor_indices, dtype=np.int64)
+    contiguous = np.ascontiguousarray(neighbors)
+    return hashlib.sha256(contiguous.view(np.uint8)).hexdigest()
 
 
 def _score_cluster_coherence(labels, velocities, neighbors, *, cluster, eps):

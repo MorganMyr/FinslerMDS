@@ -89,6 +89,7 @@ def main_sea():
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-8, "maxls": 40},
         "n_landmark": 200,
+        "landmark_sampling": "random",
         "n_local_pairs": 12,
         "local_pair_mode": "direct",
         "targets_per_landmark": 400,

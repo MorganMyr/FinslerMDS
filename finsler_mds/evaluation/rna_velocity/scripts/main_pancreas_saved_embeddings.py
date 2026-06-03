@@ -18,6 +18,7 @@ if __package__ is None or __package__ == "":
 from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     cross_boundary_direction_correctness,
     in_cluster_velocity_coherence,
+    load_or_compute_boundary_neighbor_plan,
 )
 from finsler_mds.evaluation.rna_velocity.scripts.main_pancreas_scvelo_umap import (  # noqa: E402
     PANCREAS_TRANSITIONS,
@@ -73,6 +74,17 @@ def main_pancreas_saved_embeddings():
         adata.obsp["distances"],
         n_neighbors=n_eval_neighbors,
     )
+    boundary_plan = load_or_compute_boundary_neighbor_plan(
+        out_dir / "raw" / (
+            f"pancreas_cbdir_boundaries_hvg{preprocessing['n_top_genes']}_"
+            f"pca{preprocessing['n_pcs']}_k{n_eval_neighbors}_s{seed}.npz"
+        ),
+        labels,
+        cluster_edges=PANCREAS_TRANSITIONS,
+        neighbor_indices=expression_neighbors,
+        n_neighbors=n_eval_neighbors,
+        on_mismatch="error",
+    )
 
     rows = []
     for info in embeddings:
@@ -95,6 +107,7 @@ def main_pancreas_saved_embeddings():
             PANCREAS_TRANSITIONS,
             velocity_vectors=velocity_embedding,
             neighbor_indices=expression_neighbors,
+            boundary_plan=boundary_plan,
             n_neighbors=n_eval_neighbors,
         )
         icvcoh = in_cluster_velocity_coherence(
@@ -221,7 +234,13 @@ def _project_velocity_to_embedding(adata, embedding):
 
 def _saved_pancreas_embeddings(embedding_dir):
     paths = []
+    paths.extend(embedding_dir.glob("umap*.npy"))
+    paths.extend(embedding_dir.glob("isomap*.npy"))
+    paths.extend(embedding_dir.glob("smacof*.npz"))
+    paths.extend(embedding_dir.glob("pf*.npz"))
+    paths.extend(embedding_dir.glob("sbf*.npz"))
     paths.extend(embedding_dir.glob("pancreas_umap*.npy"))
+    paths.extend(embedding_dir.glob("pancreas_isomap*.npy"))
     paths.extend(embedding_dir.glob("pancreas_randers_smacof*.npz"))
     paths.extend(embedding_dir.glob("pancreas_path_frozen*.npz"))
     paths.extend(embedding_dir.glob("pancreas_soft_bf*.npz"))
@@ -263,13 +282,14 @@ def _load_embedding(path):
 
 
 def _embedding_family(name):
-    if name.startswith("pancreas_umap"):
+    name = name.removeprefix("pancreas_")
+    if name.startswith(("umap", "isomap")):
         return "umap"
-    if name.startswith("pancreas_randers_smacof"):
+    if name.startswith(("smacof", "randers_smacof")):
         return "randers_smacof"
-    if name.startswith("pancreas_path_frozen"):
+    if name.startswith(("pf", "path_frozen")):
         return "path_frozen"
-    if name.startswith("pancreas_soft_bf"):
+    if name.startswith(("sbf", "soft_bf")):
         return "soft_bf"
     return "other"
 
@@ -286,16 +306,19 @@ def _family_order(name):
 
 
 def _short_embedding_name(name):
-    if name == "pancreas_umap_dynamical_s42.npy":
+    if name in {"pancreas_umap_dynamical_s42.npy", "umap_dynamical_s42.npy"}:
         return "UMAP 2D"
-    if name == "pancreas_umap_3d_dynamical_s42.npy":
+    if name in {"pancreas_umap_3d_dynamical_s42.npy", "umap_3d_dynamical_s42.npy"}:
         return "UMAP 3D"
     name = name.removeprefix("pancreas_").removesuffix(".npz").removesuffix(".npy")
     name = name.replace("cmatsumoto", "cMats")
     name = name.replace("randers_smacof", "Randers-SMACOF")
+    name = re.sub(r"^smacof", "SMACOF", name)
+    name = re.sub(r"^pf", "path-frozen", name)
+    name = re.sub(r"^sbf", "soft-BF", name)
     name = name.replace("path_frozen", "path-frozen")
     name = name.replace("soft_bf", "soft-BF")
-    name = re.sub(r"_seed\\d+$", "", name)
+    name = re.sub(r"_(seed|s)\\d+$", "", name)
     return name
 
 

@@ -49,6 +49,7 @@ PATH_FROZEN_OPTIONS = {
     "outer_iter": 50,
     "inner_iter": 10,
     "n_landmark": int(N_SAMPLES * 0.2),
+    "landmark_sampling": "random",
     "targets_per_landmark": int(N_SAMPLES * 0.35),
     "n_local_pairs": 20,
     "local_pair_mode": "direct",
@@ -79,9 +80,9 @@ class BranchingDataset:
 
 
 def main_branching():
-    dir_res = SCRIPT_DIR / "res" / "branching_geodesic"
-    dir_raw = dir_res / "raw"
-    dir_fig = dir_res / "figures"
+    dir_res = SCRIPT_DIR / "res" / "path_frozen_benchmarks"
+    dir_raw = dir_res / "branching_raw"
+    dir_fig = dir_res / "branching_figures"
     dir_raw.mkdir(parents=True, exist_ok=True)
     dir_fig.mkdir(parents=True, exist_ok=True)
 

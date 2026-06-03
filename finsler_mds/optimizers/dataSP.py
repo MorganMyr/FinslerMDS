@@ -213,7 +213,6 @@ def datasp(
     n_global_landmarks=0,
     mask_random_state=None,
     max_global_targets_per_source=None,
-    global_target_sampling="random",
     target_random_state=None,
     local_weight=1.0,
     local_global_reweighting="none",
@@ -285,7 +284,6 @@ def datasp(
         iteration_global_pairs = sample_active_pairs(
             global_pairs,
             max_targets_per_source=max_global_targets_per_source,
-            target_sampling=global_target_sampling,
             random_state=target_random_state,
         )
         iteration_pairs = merge_active_pairs(iteration_global_pairs, local_geodesic_pairs)

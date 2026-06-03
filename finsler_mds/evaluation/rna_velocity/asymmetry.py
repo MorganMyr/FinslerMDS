@@ -25,6 +25,8 @@ def velocity_field_asymmetry_preservation_from_neighbors(
         neighbor_indices,
         *,
         alpha=1.0,
+        distance_formula="exponential",
+        cos_clip=None,
         tau=0.02,
         unique_pairs=True,
         eps=1e-12,
@@ -34,7 +36,8 @@ def velocity_field_asymmetry_preservation_from_neighbors(
     This is intended for baselines such as UMAP + scVelo projected velocities.
     The embedding-side directed cost on a pair ``i -> j`` is
 
-    ``||y_j - y_i|| * exp(-alpha * cos(v_i, y_j - y_i))``.
+    ``||y_j - y_i|| * exp(-alpha * cos(v_i, y_j - y_i))`` by default,
+    or the Randers-like cost ``||y_j - y_i|| * (1 - alpha * cos(...))``.
     """
     sources, targets = neighbor_pairs(neighbor_indices, unique_pairs=unique_pairs)
     return velocity_field_asymmetry_preservation_from_pairs(
@@ -44,6 +47,8 @@ def velocity_field_asymmetry_preservation_from_neighbors(
         sources,
         targets,
         alpha=alpha,
+        distance_formula=distance_formula,
+        cos_clip=cos_clip,
         tau=tau,
         eps=eps,
     )
@@ -57,6 +62,8 @@ def velocity_field_asymmetry_preservation_from_pairs(
         targets,
         *,
         alpha=1.0,
+        distance_formula="exponential",
+        cos_clip=None,
         tau=0.02,
         eps=1e-12,
 ):
@@ -71,6 +78,8 @@ def velocity_field_asymmetry_preservation_from_pairs(
         sources,
         targets,
         alpha=alpha,
+        distance_formula=distance_formula,
+        cos_clip=cos_clip,
         eps=eps,
     )
     embedding_asymmetry = asymmetry_score(forward, backward, eps=eps)
@@ -90,9 +99,21 @@ def velocity_field_pair_costs(
         targets,
         *,
         alpha=1.0,
+        distance_formula="exponential",
+        cos_clip=None,
         eps=1e-12,
 ):
     """Return forward and reverse velocity-biased costs on embedding pairs."""
+    distance_formula = _normalize_distance_formula(distance_formula)
+    cos_clip = _normalize_cos_clip(cos_clip)
+    if distance_formula == "randers":
+        max_cos = 1.0 if cos_clip is None else cos_clip
+        if alpha < 0 or alpha * max_cos >= 1:
+            raise ValueError(
+                "Randers projected-velocity costs require alpha >= 0 and "
+                "alpha * max(|cos|) < 1. Lower alpha or set a smaller cos_clip."
+            )
+
     X = np.asarray(embedding, dtype=float)
     V = np.asarray(velocity_vectors, dtype=float)
     sources = np.asarray(sources, dtype=int)
@@ -102,12 +123,30 @@ def velocity_field_pair_costs(
     if sources.shape != targets.shape:
         raise ValueError("sources and targets must have the same shape.")
 
-    forward = _velocity_cost(X, V, sources, targets, alpha=alpha, eps=eps)
-    backward = _velocity_cost(X, V, targets, sources, alpha=alpha, eps=eps)
+    forward = _velocity_cost(
+        X,
+        V,
+        sources,
+        targets,
+        alpha=alpha,
+        distance_formula=distance_formula,
+        cos_clip=cos_clip,
+        eps=eps,
+    )
+    backward = _velocity_cost(
+        X,
+        V,
+        targets,
+        sources,
+        alpha=alpha,
+        distance_formula=distance_formula,
+        cos_clip=cos_clip,
+        eps=eps,
+    )
     return forward, backward
 
 
-def _velocity_cost(X, V, sources, targets, *, alpha, eps):
+def _velocity_cost(X, V, sources, targets, *, alpha, distance_formula, cos_clip, eps):
     displacements = X[targets] - X[sources]
     distances = np.linalg.norm(displacements, axis=1)
     velocity_norms = np.linalg.norm(V[sources], axis=1)
@@ -118,4 +157,35 @@ def _velocity_cost(X, V, sources, targets, *, alpha, eps):
         out=np.zeros_like(distances, dtype=float),
         where=denom > eps,
     )
-    return distances * np.exp(-float(alpha) * np.clip(cosine, -1.0, 1.0))
+    cosine = np.clip(cosine, -1.0, 1.0)
+    if cos_clip is not None:
+        cosine = np.clip(cosine, -cos_clip, cos_clip)
+    if distance_formula == "exponential":
+        return distances * np.exp(-float(alpha) * cosine)
+    if distance_formula == "randers":
+        return distances * (1.0 - float(alpha) * cosine)
+    raise RuntimeError(f"Unhandled projected-velocity distance formula {distance_formula!r}.")
+
+
+def _normalize_distance_formula(distance_formula):
+    if not isinstance(distance_formula, str):
+        raise TypeError("distance_formula must be 'exponential' or 'randers'.")
+    formula = distance_formula.lower()
+    aliases = {
+        "exp": "exponential",
+        "exponential": "exponential",
+        "randers": "randers",
+        "r": "randers",
+    }
+    if formula not in aliases:
+        raise ValueError("distance_formula must be 'exponential' or 'randers'.")
+    return aliases[formula]
+
+
+def _normalize_cos_clip(cos_clip):
+    if cos_clip is None:
+        return None
+    cos_clip = float(cos_clip)
+    if not 0 <= cos_clip <= 1:
+        raise ValueError("cos_clip must be None or a float in [0, 1].")
+    return cos_clip

@@ -39,7 +39,6 @@ def main_swiss_roll_full():
     n_local_neighbors_path_frozen = 8      # 8
     local_pair_mode_path_frozen = "geodesic"  # "direct" | "geodesic"
     max_global_targets_per_source_path_frozen = int(0.2 * n)
-    global_target_sampling_path_frozen = "random"
     local_global_reweighting_path_frozen = "count"  # "none" | "count" | "energy"
     local_weight_path_frozen = 1.0
     path_frozen_device = "auto"         # "auto" uses CuPy/CUDA when available, CPU otherwise
@@ -52,7 +51,6 @@ def main_swiss_roll_full():
     n_local_neighbors_soft_bf = 10
     local_pair_mode_soft_bf = "direct"  # "direct" | "geodesic"
     max_global_targets_per_source_soft_bf = int(0.4 * n)
-    global_target_sampling_soft_bf = "random"
     local_global_reweighting_soft_bf = "count"  # "none" | "count" | "energy"
     local_weight_soft_bf = 1.0
     soft_bf_device = "auto"
@@ -213,11 +211,11 @@ def main_swiss_roll_full():
                 method="L-BFGS-B",
                 optimizer_options={"ftol": 1e-9, "maxls": 50},
                 n_landmark=n_global_landmarks_path_frozen,
+                landmark_sampling="random",
                 n_local_pairs=n_local_neighbors_path_frozen,
                 local_pair_mode=local_pair_mode_path_frozen,
                 mask_random_state=seed,
                 targets_per_landmark=max_global_targets_per_source_path_frozen,
-                global_target_sampling=global_target_sampling_path_frozen,
                 target_random_state=seed + 3,
                 local_global_reweighting=local_global_reweighting_path_frozen,
                 local_weight=local_weight_path_frozen,
@@ -247,7 +245,6 @@ def main_swiss_roll_full():
                 local_pair_mode=local_pair_mode_soft_bf,
                 mask_random_state=seed,
                 max_global_targets_per_source=max_global_targets_per_source_soft_bf,
-                global_target_sampling=global_target_sampling_soft_bf,
                 target_random_state=seed + 3,
                 local_global_reweighting=local_global_reweighting_soft_bf,
                 local_weight=local_weight_soft_bf,
