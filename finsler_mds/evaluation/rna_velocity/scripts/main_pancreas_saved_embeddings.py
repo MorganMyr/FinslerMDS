@@ -6,7 +6,6 @@ from pathlib import Path
 import json
 import re
 import sys
-import warnings
 
 import numpy as np
 
@@ -25,6 +24,14 @@ from finsler_mds.evaluation.rna_velocity.scripts.main_pancreas_scvelo_umap impor
     _csv_value,
     _neighbor_indices_from_sparse_distances,
     _slug,
+)
+from finsler_mds.utils.pancreas import (  # noqa: E402
+    PANCREAS_DATASET_SOURCE,
+    compute_pancreas_velocity,
+    compute_pancreas_velocity_graph,
+    load_pancreas_dataset,
+    preprocess_pancreas_for_velocity,
+    setup_scvelo_settings,
 )
 
 
@@ -154,52 +161,21 @@ def main_pancreas_saved_embeddings():
 
 def _compute_scvelo_state(*, mode, seed, preprocessing, umap, velocity_graph, dynamical):
     import scanpy as sc
-    import scvelo as scv
 
-    scv.settings.verbosity = 3
-    scv.settings.set_figure_params("scvelo")
+    setup_scvelo_settings()
 
     print(f"Computing shared scVelo {mode} state for embedding evaluation")
-    adata = scv.datasets.pancreas()
+    print(f"  Loading pancreas dataset from {PANCREAS_DATASET_SOURCE}")
+    adata = load_pancreas_dataset()
     print(f"  Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
-    scv.pp.filter_and_normalize(
+    preprocess_pancreas_for_velocity(adata, preprocessing, seed=seed)
+    compute_pancreas_velocity(
         adata,
-        min_shared_counts=preprocessing["min_shared_counts"],
+        mode=mode,
+        recover_dynamics_max_iter=dynamical["recover_dynamics_max_iter"],
+        recover_dynamics_n_jobs=dynamical["recover_dynamics_n_jobs"],
+        show_progress_bar=False,
     )
-    sc.pp.log1p(adata)
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=preprocessing["n_top_genes"],
-        flavor="seurat",
-        subset=True,
-    )
-    sc.tl.pca(adata, n_comps=preprocessing["n_pcs"], random_state=seed)
-    sc.pp.neighbors(
-        adata,
-        n_neighbors=preprocessing["n_neighbors"],
-        n_pcs=preprocessing["n_pcs"],
-        random_state=seed,
-    )
-    scv.pp.moments(
-        adata,
-        n_neighbors=preprocessing["n_neighbors"],
-        n_pcs=preprocessing["n_pcs"],
-    )
-    if mode == "dynamical":
-        scv.tl.recover_dynamics(
-            adata,
-            max_iter=dynamical["recover_dynamics_max_iter"],
-            n_jobs=dynamical["recover_dynamics_n_jobs"],
-            show_progress_bar=False,
-        )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Conversion of an array with ndim > 0 to a scalar is deprecated.*",
-            category=DeprecationWarning,
-            module="scvelo.tools.optimization",
-        )
-        scv.tl.velocity(adata, mode=mode)
     sc.tl.umap(
         adata,
         min_dist=umap["min_dist"],
@@ -207,18 +183,12 @@ def _compute_scvelo_state(*, mode, seed, preprocessing, umap, velocity_graph, dy
         init_pos=umap["init_pos"],
         random_state=seed,
     )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks.*",
-            category=DeprecationWarning,
-        )
-        scv.tl.velocity_graph(
-            adata,
-            n_neighbors=velocity_graph["n_neighbors"],
-            n_jobs=velocity_graph["n_jobs"],
-            show_progress_bar=False,
-        )
+    compute_pancreas_velocity_graph(
+        adata,
+        n_neighbors=velocity_graph["n_neighbors"],
+        n_jobs=velocity_graph["n_jobs"],
+        show_progress_bar=False,
+    )
     return adata
 
 

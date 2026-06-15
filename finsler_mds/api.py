@@ -28,6 +28,7 @@ _OPTIMIZERS = {
     "sbf": soft_bellman_ford,
     "relaxed_bellman_ford": relaxed_bellman_ford,
     "rbf": relaxed_bellman_ford,
+    "smacof": smacof_randers,
     "smacof_randers": smacof_randers,
     "randers_smacof": smacof_randers,
 }

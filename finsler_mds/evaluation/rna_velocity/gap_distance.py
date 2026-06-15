@@ -40,9 +40,16 @@ def normalized_gap_distance(
     if before.size == 0 or after.size == 0:
         raise ValueError("before_indices and after_indices must both be non-empty.")
 
-    before_rep = _representative_index(X, before, representative)
-    after_rep = _representative_index(X, after, representative)
-    distance = float(np.linalg.norm(X[before_rep] - X[after_rep]))
+    if representative in {"coordinate_median", "median_coordinate"}:
+        before_rep = -1
+        after_rep = -1
+        before_point = np.median(X[before], axis=0)
+        after_point = np.median(X[after], axis=0)
+        distance = float(np.linalg.norm(before_point - after_point))
+    else:
+        before_rep = _representative_index(X, before, representative)
+        after_rep = _representative_index(X, after, representative)
+        distance = float(np.linalg.norm(X[before_rep] - X[after_rep]))
     max_distance = _max_pairwise_distance(X)
     normalized = distance / max(max_distance, eps)
     return GapDistanceResult(
@@ -73,7 +80,7 @@ def _representative_index(X, indices, representative):
         centroid = np.mean(X[indices], axis=0, keepdims=True)
         distances = cdist(X[indices], centroid).ravel()
         return int(indices[np.argmin(distances)])
-    raise ValueError("representative must be one of {'medoid', 'centroid'}.")
+    raise ValueError("representative must be one of {'medoid', 'centroid', 'coordinate_median'}.")
 
 
 def _max_pairwise_distance(X):

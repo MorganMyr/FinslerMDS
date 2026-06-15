@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import sys
-import warnings
 
 import numpy as np
 import scipy.sparse
@@ -19,15 +18,15 @@ from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     cross_boundary_direction_correctness,
     in_cluster_velocity_coherence,
 )
-
-
-PANCREAS_TRANSITIONS = [
-    ("Ngn3 high EP", "Pre-endocrine"),
-    ("Pre-endocrine", "Alpha"),
-    ("Pre-endocrine", "Beta"),
-    ("Pre-endocrine", "Delta"),
-    ("Pre-endocrine", "Epsilon"),
-]
+from finsler_mds.utils.pancreas import (  # noqa: E402
+    PANCREAS_DATASET_SOURCE,
+    PANCREAS_TRANSITIONS,
+    compute_pancreas_velocity,
+    compute_pancreas_velocity_graph,
+    load_pancreas_dataset,
+    preprocess_pancreas_for_velocity,
+    setup_scvelo_settings,
+)
 
 
 def main_pancreas_scvelo_umap():
@@ -102,37 +101,14 @@ def _compute_scvelo_umap_cache(*, mode, seed, preprocessing, umap, velocity_grap
     import scanpy as sc
     import scvelo as scv
 
-    scv.settings.verbosity = 3
-    scv.settings.set_figure_params("scvelo")
+    setup_scvelo_settings()
 
-    print("  Loading scVelo pancreas dataset")
-    adata = scv.datasets.pancreas()
+    print(f"  Loading pancreas dataset from {PANCREAS_DATASET_SOURCE}")
+    adata = load_pancreas_dataset()
     print(f"  Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
 
     print("  Preprocessing with scVelo-style literature defaults")
-    scv.pp.filter_and_normalize(
-        adata,
-        min_shared_counts=preprocessing["min_shared_counts"],
-    )
-    sc.pp.log1p(adata)
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=preprocessing["n_top_genes"],
-        flavor="seurat",
-        subset=True,
-    )
-    sc.tl.pca(adata, n_comps=preprocessing["n_pcs"], random_state=seed)
-    sc.pp.neighbors(
-        adata,
-        n_neighbors=preprocessing["n_neighbors"],
-        n_pcs=preprocessing["n_pcs"],
-        random_state=seed,
-    )
-    scv.pp.moments(
-        adata,
-        n_neighbors=preprocessing["n_neighbors"],
-        n_pcs=preprocessing["n_pcs"],
-    )
+    preprocess_pancreas_for_velocity(adata, preprocessing, seed=seed)
     print(f"  Preprocessed pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
 
     if mode == "dynamical":
@@ -140,22 +116,15 @@ def _compute_scvelo_umap_cache(*, mode, seed, preprocessing, umap, velocity_grap
             "  Recovering scVelo dynamical model "
             f"(max_iter={dynamical['recover_dynamics_max_iter']})"
         )
-        scv.tl.recover_dynamics(
-            adata,
-            max_iter=dynamical["recover_dynamics_max_iter"],
-            n_jobs=dynamical["recover_dynamics_n_jobs"],
-            show_progress_bar=False,
-        )
 
     print(f"  Computing scVelo velocity mode={mode}")
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Conversion of an array with ndim > 0 to a scalar is deprecated.*",
-            category=DeprecationWarning,
-            module="scvelo.tools.optimization",
-        )
-        scv.tl.velocity(adata, mode=mode)
+    compute_pancreas_velocity(
+        adata,
+        mode=mode,
+        recover_dynamics_max_iter=dynamical["recover_dynamics_max_iter"],
+        recover_dynamics_n_jobs=dynamical["recover_dynamics_n_jobs"],
+        show_progress_bar=False,
+    )
 
     print("  Computing UMAP")
     sc.tl.umap(
@@ -167,18 +136,12 @@ def _compute_scvelo_umap_cache(*, mode, seed, preprocessing, umap, velocity_grap
     )
 
     print("  Computing velocity graph and projected velocity_umap")
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks.*",
-            category=DeprecationWarning,
-        )
-        scv.tl.velocity_graph(
-            adata,
-            n_neighbors=velocity_graph["n_neighbors"],
-            n_jobs=velocity_graph["n_jobs"],
-            show_progress_bar=False,
-        )
+    compute_pancreas_velocity_graph(
+        adata,
+        n_neighbors=velocity_graph["n_neighbors"],
+        n_jobs=velocity_graph["n_jobs"],
+        show_progress_bar=False,
+    )
     scv.tl.velocity_embedding(adata, basis="umap")
 
     labels = np.asarray(adata.obs["clusters"].to_numpy(), dtype=str)
@@ -190,6 +153,7 @@ def _compute_scvelo_umap_cache(*, mode, seed, preprocessing, umap, velocity_grap
     )
 
     metadata = {
+        "dataset_source": PANCREAS_DATASET_SOURCE,
         "mode": mode,
         "seed": seed,
         "preprocessing": preprocessing,

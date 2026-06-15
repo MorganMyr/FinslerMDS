@@ -124,6 +124,9 @@ def main_pancreas_asymmetry_embeddings():
 
 def _selected_embedding_paths(raw_dir):
     paths = []
+    paths.extend(raw_dir.glob("smacof*.npz"))
+    paths.extend(raw_dir.glob("pf*.npz"))
+    paths.extend(raw_dir.glob("sbf*.npz"))
     paths.extend(raw_dir.glob("pancreas_randers_smacof*.npz"))
     paths.extend(raw_dir.glob("pancreas_path_frozen*.npz"))
     paths.extend(raw_dir.glob("pancreas_soft_bf*.npz"))
@@ -248,6 +251,7 @@ def _velocity_cache_path(raw_dir, velocity_alpha, *, velocity_formula, velocity_
     token = _cache_token(velocity_alpha)
     legacy_token = str(float(velocity_alpha)).replace(".", "p")
     candidates = [
+        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_cclip0p4_ke30_kf0_s{seed}.npz",
         raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_s{seed}.npz",
         raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_valpha{token}_s{seed}.npz",
         raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{legacy_token}_s{seed}.npz",
@@ -258,7 +262,12 @@ def _velocity_cache_path(raw_dir, velocity_alpha, *, velocity_formula, velocity_
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    return candidates[0]
+    globbed = sorted(
+        raw_dir.glob(f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_*.npz"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return globbed[0] if globbed else candidates[0]
 
 
 def _cache_token(value):

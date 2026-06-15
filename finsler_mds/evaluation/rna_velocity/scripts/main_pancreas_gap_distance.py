@@ -73,20 +73,17 @@ def main_pancreas_gap_distance():
 
 def _gap_embedding_sources(raw_dir, gap_dir):
     sources = []
-    current_velocity = "dynamical_vrand_valpha2_cclip0p4_s42"
-    current_smacof = "vrand_r0p8_iter100_seed42"
-    gap_prefix = "gap_lt300"
-    for path in sorted(raw_dir.glob(f"pancreas_velocity_inputs_{current_velocity}.npz")):
+    for path in sorted(raw_dir.glob("pancreas_velocity_inputs_*.npz")):
         sources.append({"path": path, "kind": "umap", "scope": "full", "short_name": "UMAP 2D full"})
-    for path in sorted(gap_dir.glob(f"{gap_prefix}_velocity_inputs_{current_velocity}.npz")):
+    for path in sorted(gap_dir.glob("gap*_velocity_inputs_*.npz")):
         sources.append({"path": path, "kind": "umap", "scope": "gap", "short_name": "UMAP 2D gap"})
-    for path in sorted(raw_dir.glob(f"pancreas_randers_smacof_{current_smacof}.npz")):
+    for path in sorted(set(raw_dir.glob("smacof*.npz")) | set(raw_dir.glob("pancreas_randers_smacof*.npz"))):
         sources.append({"path": path, "kind": "smacof_randers", "scope": "full", "short_name": "SMACOF-Randers full"})
-    for path in sorted(gap_dir.glob(f"{gap_prefix}_randers_smacof_{current_smacof}.npz")):
+    for path in sorted(set(gap_dir.glob("gap*_smacof*.npz")) | set(gap_dir.glob("gap*_randers_smacof*.npz"))):
         sources.append({"path": path, "kind": "smacof_randers", "scope": "gap", "short_name": "SMACOF-Randers gap"})
-    for path in sorted(gap_dir.glob("gap*_path_frozen_*.npz")):
+    for path in sorted(set(gap_dir.glob("gap*_pf*.npz")) | set(gap_dir.glob("gap*_path_frozen_*.npz"))):
         sources.append({"path": path, "kind": "path_frozen", "scope": "gap", "short_name": "path-frozen gap"})
-    for path in sorted(gap_dir.glob("gap*_soft_bf_*.npz")):
+    for path in sorted(set(gap_dir.glob("gap*_sbf*.npz")) | set(gap_dir.glob("gap*_soft_bf_*.npz"))):
         sources.append({"path": path, "kind": "soft_bf", "scope": "gap", "short_name": "soft-BF gap"})
     return sources
 

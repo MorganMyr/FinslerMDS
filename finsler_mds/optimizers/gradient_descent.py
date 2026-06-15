@@ -13,6 +13,11 @@ from finsler_mds.optimizers.common import (
     prepare_weights_and_mask,
     validate_metric,
 )
+from finsler_mds.optimizers.path_frozen import (
+    _cupy_metric_length_and_grad,
+    _gpu_metric_supported,
+    _load_cupy,
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,131 @@ def _stress_and_grad(X_flat, *, shape, dissimilarities, weight, metric, normaliz
     return float(stress), grad.ravel()
 
 
+def _resolve_gpu_backend(device, metric, verbose):
+    if device not in {"cpu", "auto", "gpu", "cuda"}:
+        raise ValueError("device must be one of {'cpu', 'auto', 'gpu', 'cuda'}.")
+    if device == "cpu":
+        return None
+    if not _gpu_metric_supported(metric):
+        message = (
+            "gradient_descent GPU backend currently supports RandersMetric, "
+            "MatsumotoMetric, ConvexifiedMatsumotoMetric, and ConvexifiedToblerMetric only."
+        )
+        if device == "auto":
+            if verbose:
+                print(message + " Falling back to CPU.")
+            return None
+        raise ValueError(message)
+
+    cp, error = _load_cupy()
+    if cp is None:
+        message = f"gradient_descent GPU backend unavailable: {error}"
+        if device == "auto":
+            if verbose:
+                print(message + " Falling back to CPU.")
+            return None
+        raise RuntimeError(message) from error
+
+    if verbose:
+        device_id = cp.cuda.Device().id
+        device_name = cp.cuda.runtime.getDeviceProperties(device_id)["name"]
+        if hasattr(device_name, "decode"):
+            device_name = device_name.decode()
+        print(f"gradient_descent GPU backend enabled on CUDA device {device_id}: {device_name}")
+    return cp
+
+
+class _GpuDenseStressObjective:
+    def __init__(
+            self,
+            cp,
+            *,
+            shape,
+            dissimilarities,
+            weight,
+            metric,
+            normalized_stress,
+            block_size,
+    ):
+        self.cp = cp
+        self.shape = shape
+        self.metric = metric
+        self.normalized_stress = normalized_stress
+        self.block_size = int(block_size)
+        if self.block_size <= 0:
+            raise ValueError("gpu_block_size must be positive.")
+        self.D = cp.asarray(dissimilarities, dtype=cp.float64)
+        self.W = cp.asarray(weight, dtype=cp.float64)
+        if normalized_stress:
+            active = self.W != 0
+            self.denom = float(cp.asnumpy(cp.sum(self.W[active] * self.D[active] ** 2)))
+        else:
+            self.denom = None
+
+    def __call__(self, X_flat):
+        cp = self.cp
+        X = cp.asarray(X_flat.reshape(self.shape), dtype=cp.float64)
+        raw_stress = self._raw_stress(X)
+        if self.normalized_stress:
+            if self.denom is None or self.denom <= 0:
+                return np.inf, np.zeros_like(X_flat)
+            stress = np.sqrt(raw_stress / self.denom)
+            scale = 0.0 if raw_stress <= 0 else 1.0 / np.sqrt(raw_stress * self.denom)
+        else:
+            stress = raw_stress
+            scale = 2.0
+        grad = self._grad(X, scale)
+        return float(stress), cp.asnumpy(grad).ravel()
+
+    def _raw_stress(self, X):
+        cp = self.cp
+        stress = cp.asarray(0.0, dtype=cp.float64)
+        n_samples = X.shape[0]
+        for start in range(0, n_samples, self.block_size):
+            stop = min(start + self.block_size, n_samples)
+            vectors = X[None, :, :] - X[start:stop, None, :]
+            lengths, _ = _cupy_metric_length_and_grad(
+                cp,
+                vectors.reshape(-1, X.shape[1]),
+                self.metric,
+            )
+            lengths = lengths.reshape(stop - start, n_samples)
+            active_lengths = cp.where(self.W[start:stop] != 0, lengths, 0.0)
+            if not cp.all(cp.isfinite(active_lengths)).item():
+                raise ValueError(
+                    "The metric produced non-finite embedded distances on active pairs."
+                )
+            residual = lengths - self.D[start:stop]
+            stress += cp.sum(self.W[start:stop] * residual * residual)
+        return float(cp.asnumpy(stress))
+
+    def _grad(self, X, scale):
+        cp = self.cp
+        grad = cp.zeros_like(X)
+        n_samples, n_components = X.shape
+        for start in range(0, n_samples, self.block_size):
+            stop = min(start + self.block_size, n_samples)
+            vectors = X[None, :, :] - X[start:stop, None, :]
+            lengths, grad_u = _cupy_metric_length_and_grad(
+                cp,
+                vectors.reshape(-1, n_components),
+                self.metric,
+            )
+            block_shape = (stop - start, n_samples)
+            lengths = lengths.reshape(block_shape)
+            grad_u = grad_u.reshape(block_shape + (n_components,))
+            active_grad = cp.where(self.W[start:stop, :, None] != 0, grad_u, 0.0)
+            if not cp.all(cp.isfinite(active_grad)).item():
+                raise ValueError(
+                    "The metric produced non-finite gradients on active pairs."
+                )
+            residual = self.W[start:stop] * (lengths - self.D[start:stop])
+            pair_grad = scale * residual[:, :, None] * grad_u
+            grad += cp.sum(pair_grad, axis=0)
+            grad[start:stop] -= cp.sum(pair_grad, axis=1)
+        return grad
+
+
 def gradient_descent(
     dissimilarities,
     *,
@@ -76,6 +206,8 @@ def gradient_descent(
     weight=None,
     method="L-BFGS-B",
     optimizer_options=None,
+    device="cpu",
+    gpu_block_size=256,
     return_n_iter=False,
     return_result=False,
 ):
@@ -89,6 +221,7 @@ def gradient_descent(
     D, W = prepare_weights_and_mask(dissimilarities, weight)
     X0 = initial_embedding(D, n_components, init, random_state)
     shape = X0.shape
+    gpu_backend = _resolve_gpu_backend(device, metric, verbose)
 
     options = {"maxiter": max_iter, "gtol": eps}
     if verbose:
@@ -96,15 +229,26 @@ def gradient_descent(
     if optimizer_options is not None:
         options.update(optimizer_options)
 
-    def objective(x_flat):
-        return _stress_and_grad(
-            x_flat,
+    if gpu_backend is not None:
+        objective = _GpuDenseStressObjective(
+            gpu_backend,
             shape=shape,
             dissimilarities=D,
             weight=W,
             metric=metric,
             normalized_stress=normalized_stress,
+            block_size=gpu_block_size,
         )
+    else:
+        def objective(x_flat):
+            return _stress_and_grad(
+                x_flat,
+                shape=shape,
+                dissimilarities=D,
+                weight=W,
+                metric=metric,
+                normalized_stress=normalized_stress,
+            )
 
     result = scipy.optimize.minimize(
         objective,

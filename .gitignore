@@ -10,6 +10,6 @@ venv
 scripts/res/
 
 # Downloaded/generated datasets.
+datasets/
 data/**/*.h5ad
 scripts/data/**/*.h5ad
-

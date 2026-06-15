@@ -18,15 +18,7 @@ from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     in_cluster_velocity_coherence,
     project_velocity_graph_to_embedding,
 )
-
-
-PANCREAS_TRANSITIONS = [
-    ("Ngn3 high EP", "Pre-endocrine"),
-    ("Pre-endocrine", "Alpha"),
-    ("Pre-endocrine", "Beta"),
-    ("Pre-endocrine", "Delta"),
-    ("Pre-endocrine", "Epsilon"),
-]
+from finsler_mds.utils.pancreas import PANCREAS_TRANSITIONS  # noqa: E402
 
 
 def main_pancreas_umap():
@@ -42,7 +34,7 @@ def main_pancreas_umap():
         "Evaluating projected velocities reconstructed from cached directed "
         "distances, not from the original scVelo velocity graph."
     )
-    for embedding_path in sorted(raw_dir.glob("pancreas_umap*.npy")):
+    for embedding_path in sorted(set(raw_dir.glob("umap*.npy")) | set(raw_dir.glob("pancreas_umap*.npy"))):
         cache_path = _matching_velocity_cache(raw_dir, embedding_path)
         if cache_path is None:
             print(f"Skipping {embedding_path.name}: no matching velocity-input cache.")
@@ -189,9 +181,18 @@ def _pancreas_raw_dir(project_root):
 
 def _matching_velocity_cache(raw_dir, embedding_path):
     name = embedding_path.name
-    if not name.startswith("pancreas_umap_") or not name.endswith(".npy"):
+    if not name.endswith(".npy"):
         return None
-    tag = name[len("pancreas_umap_"):-len(".npy")]
+    if name.startswith("pancreas_umap_3d_"):
+        tag = name[len("pancreas_umap_3d_"):-len(".npy")]
+    elif name.startswith("pancreas_umap_"):
+        tag = name[len("pancreas_umap_"):-len(".npy")]
+    elif name.startswith("umap_3d_"):
+        tag = name[len("umap_3d_"):-len(".npy")]
+    elif name.startswith("umap_"):
+        tag = name[len("umap_"):-len(".npy")]
+    else:
+        return None
     direct = raw_dir / f"pancreas_velocity_inputs_{tag}.npz"
     if direct.exists():
         return direct

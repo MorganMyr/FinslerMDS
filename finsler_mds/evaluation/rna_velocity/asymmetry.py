@@ -1,191 +1,139 @@
-"""RNA-velocity adapters for generic asymmetry-preservation metrics."""
+"""Local RNA-velocity alignment preservation metrics."""
 
 from __future__ import annotations
 
-import numpy as np
+from dataclasses import dataclass
 
-from ..asymmetry import (
-    asymmetry_score,
-    neighbor_pairs,
-    summarize_asymmetry_preservation,
-)
+import numpy as np
+from scipy import stats
 
 
 __all__ = [
-    "velocity_field_asymmetry_preservation_from_neighbors",
-    "velocity_field_asymmetry_preservation_from_pairs",
-    "velocity_field_pair_costs",
+    "VelocityAlignmentPreservationResult",
+    "velocity_alignment_cosines_from_pairs",
+    "velocity_alignment_preservation_from_neighbors",
+    "velocity_alignment_preservation_from_pairs",
 ]
 
 
-def velocity_field_asymmetry_preservation_from_neighbors(
-        data_dissimilarities,
+@dataclass(frozen=True)
+class VelocityAlignmentPreservationResult:
+    """Preservation of local velocity/displacement cosine similarities."""
+
+    spearman: float
+    sign_accuracy: float
+    n_pairs: int
+    n_sign_pairs: int
+    data_cosines: np.ndarray
+    embedding_cosines: np.ndarray
+
+
+def velocity_alignment_preservation_from_neighbors(
+        data_embedding,
+        data_velocity,
         embedding,
-        velocity_vectors,
+        embedding_velocity,
         neighbor_indices,
         *,
-        alpha=1.0,
-        distance_formula="exponential",
-        cos_clip=None,
-        tau=0.02,
-        unique_pairs=True,
         eps=1e-12,
 ):
-    """Compare data asymmetry to an embedding plus projected velocity field.
+    """Compare local velocity/displacement cosines in data and embedding.
 
-    This is intended for baselines such as UMAP + scVelo projected velocities.
-    The embedding-side directed cost on a pair ``i -> j`` is
-
-    ``||y_j - y_i|| * exp(-alpha * cos(v_i, y_j - y_i))`` by default,
-    or the Randers-like cost ``||y_j - y_i|| * (1 - alpha * cos(...))``.
+    Pairs are oriented: for each cell ``i`` and each fixed neighbor ``j`` from
+    ``neighbor_indices``, compare ``cos(v_i, x_j - x_i)`` in the data space to
+    ``cos(v_i^emb, y_j - y_i)`` in the embedding.
     """
-    sources, targets = neighbor_pairs(neighbor_indices, unique_pairs=unique_pairs)
-    return velocity_field_asymmetry_preservation_from_pairs(
-        data_dissimilarities,
+    sources, targets = _oriented_neighbor_pairs(neighbor_indices)
+    return velocity_alignment_preservation_from_pairs(
+        data_embedding,
+        data_velocity,
         embedding,
-        velocity_vectors,
+        embedding_velocity,
         sources,
         targets,
-        alpha=alpha,
-        distance_formula=distance_formula,
-        cos_clip=cos_clip,
-        tau=tau,
         eps=eps,
     )
 
 
-def velocity_field_asymmetry_preservation_from_pairs(
-        data_dissimilarities,
+def velocity_alignment_preservation_from_pairs(
+        data_embedding,
+        data_velocity,
         embedding,
-        velocity_vectors,
+        embedding_velocity,
         sources,
         targets,
         *,
-        alpha=1.0,
-        distance_formula="exponential",
-        cos_clip=None,
-        tau=0.02,
         eps=1e-12,
 ):
-    """Compare data asymmetry to velocity-field costs on explicit pairs."""
-    D = np.asarray(data_dissimilarities, dtype=float)
     sources = np.asarray(sources, dtype=int)
     targets = np.asarray(targets, dtype=int)
-    data_asymmetry = asymmetry_score(D[sources, targets], D[targets, sources], eps=eps)
-    forward, backward = velocity_field_pair_costs(
-        embedding,
-        velocity_vectors,
-        sources,
-        targets,
-        alpha=alpha,
-        distance_formula=distance_formula,
-        cos_clip=cos_clip,
-        eps=eps,
-    )
-    embedding_asymmetry = asymmetry_score(forward, backward, eps=eps)
-    return summarize_asymmetry_preservation(
-        sources,
-        targets,
-        data_asymmetry,
-        embedding_asymmetry,
-        tau=tau,
-    )
-
-
-def velocity_field_pair_costs(
-        embedding,
-        velocity_vectors,
-        sources,
-        targets,
-        *,
-        alpha=1.0,
-        distance_formula="exponential",
-        cos_clip=None,
-        eps=1e-12,
-):
-    """Return forward and reverse velocity-biased costs on embedding pairs."""
-    distance_formula = _normalize_distance_formula(distance_formula)
-    cos_clip = _normalize_cos_clip(cos_clip)
-    if distance_formula == "randers":
-        max_cos = 1.0 if cos_clip is None else cos_clip
-        if alpha < 0 or alpha * max_cos >= 1:
-            raise ValueError(
-                "Randers projected-velocity costs require alpha >= 0 and "
-                "alpha * max(|cos|) < 1. Lower alpha or set a smaller cos_clip."
-            )
-
-    X = np.asarray(embedding, dtype=float)
-    V = np.asarray(velocity_vectors, dtype=float)
-    sources = np.asarray(sources, dtype=int)
-    targets = np.asarray(targets, dtype=int)
-    if X.shape != V.shape:
-        raise ValueError("embedding and velocity_vectors must have the same shape.")
     if sources.shape != targets.shape:
         raise ValueError("sources and targets must have the same shape.")
 
-    forward = _velocity_cost(
-        X,
-        V,
+    data_cosines = velocity_alignment_cosines_from_pairs(
+        data_embedding,
+        data_velocity,
         sources,
         targets,
-        alpha=alpha,
-        distance_formula=distance_formula,
-        cos_clip=cos_clip,
         eps=eps,
     )
-    backward = _velocity_cost(
-        X,
-        V,
-        targets,
+    embedding_cosines = velocity_alignment_cosines_from_pairs(
+        embedding,
+        embedding_velocity,
         sources,
-        alpha=alpha,
-        distance_formula=distance_formula,
-        cos_clip=cos_clip,
+        targets,
         eps=eps,
     )
-    return forward, backward
+    valid = np.isfinite(data_cosines) & np.isfinite(embedding_cosines)
+    data_cosines = data_cosines[valid]
+    embedding_cosines = embedding_cosines[valid]
 
+    spearman = _safe_spearman(data_cosines, embedding_cosines)
+    sign_mask = (np.abs(data_cosines) > eps) & (np.abs(embedding_cosines) > eps)
+    if np.any(sign_mask):
+        sign_accuracy = float(np.mean(np.sign(data_cosines[sign_mask]) == np.sign(embedding_cosines[sign_mask])))
+    else:
+        sign_accuracy = np.nan
 
-def _velocity_cost(X, V, sources, targets, *, alpha, distance_formula, cos_clip, eps):
-    displacements = X[targets] - X[sources]
-    distances = np.linalg.norm(displacements, axis=1)
-    velocity_norms = np.linalg.norm(V[sources], axis=1)
-    denom = distances * velocity_norms
-    cosine = np.divide(
-        np.sum(V[sources] * displacements, axis=1),
-        denom,
-        out=np.zeros_like(distances, dtype=float),
-        where=denom > eps,
+    return VelocityAlignmentPreservationResult(
+        spearman=spearman,
+        sign_accuracy=sign_accuracy,
+        n_pairs=int(len(data_cosines)),
+        n_sign_pairs=int(np.count_nonzero(sign_mask)),
+        data_cosines=data_cosines,
+        embedding_cosines=embedding_cosines,
     )
-    cosine = np.clip(cosine, -1.0, 1.0)
-    if cos_clip is not None:
-        cosine = np.clip(cosine, -cos_clip, cos_clip)
-    if distance_formula == "exponential":
-        return distances * np.exp(-float(alpha) * cosine)
-    if distance_formula == "randers":
-        return distances * (1.0 - float(alpha) * cosine)
-    raise RuntimeError(f"Unhandled projected-velocity distance formula {distance_formula!r}.")
 
 
-def _normalize_distance_formula(distance_formula):
-    if not isinstance(distance_formula, str):
-        raise TypeError("distance_formula must be 'exponential' or 'randers'.")
-    formula = distance_formula.lower()
-    aliases = {
-        "exp": "exponential",
-        "exponential": "exponential",
-        "randers": "randers",
-        "r": "randers",
-    }
-    if formula not in aliases:
-        raise ValueError("distance_formula must be 'exponential' or 'randers'.")
-    return aliases[formula]
+def velocity_alignment_cosines_from_pairs(points, velocity_vectors, sources, targets, *, eps=1e-12):
+    points = np.asarray(points, dtype=float)
+    velocity_vectors = np.asarray(velocity_vectors, dtype=float)
+    sources = np.asarray(sources, dtype=int)
+    targets = np.asarray(targets, dtype=int)
+    if points.shape != velocity_vectors.shape:
+        raise ValueError("points and velocity_vectors must have the same shape.")
+    displacements = points[targets] - points[sources]
+    velocities = velocity_vectors[sources]
+    displacement_norms = np.linalg.norm(displacements, axis=1)
+    velocity_norms = np.linalg.norm(velocities, axis=1)
+    denom = displacement_norms * velocity_norms
+    cosines = np.full(len(sources), np.nan, dtype=float)
+    valid = denom > eps
+    cosines[valid] = np.sum(velocities[valid] * displacements[valid], axis=1) / denom[valid]
+    return np.clip(cosines, -1.0, 1.0)
 
 
-def _normalize_cos_clip(cos_clip):
-    if cos_clip is None:
-        return None
-    cos_clip = float(cos_clip)
-    if not 0 <= cos_clip <= 1:
-        raise ValueError("cos_clip must be None or a float in [0, 1].")
-    return cos_clip
+def _oriented_neighbor_pairs(neighbor_indices):
+    neighbors = np.asarray(neighbor_indices, dtype=int)
+    if neighbors.ndim != 2:
+        raise ValueError("neighbor_indices must be a 2D array.")
+    sources = np.repeat(np.arange(neighbors.shape[0]), neighbors.shape[1])
+    targets = neighbors.reshape(-1)
+    valid = targets >= 0
+    return sources[valid], targets[valid]
+
+
+def _safe_spearman(x, y):
+    if len(x) < 2 or np.allclose(x, x[0]) or np.allclose(y, y[0]):
+        return np.nan
+    return float(stats.spearmanr(x, y).statistic)

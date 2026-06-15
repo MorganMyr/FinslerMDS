@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 
 import numpy as np
 import scipy.linalg
@@ -99,6 +101,11 @@ def _laplacian_from_weights(weight):
     return V
 
 
+def _check_symmetric_weight(weight):
+    if not np.allclose(weight, weight.T, rtol=1e-10, atol=1e-12):
+        raise ValueError("The corrected Randers-SMACOF MM update requires symmetric weights.")
+
+
 def _solve_randers_update(
     *,
     V,
@@ -108,7 +115,7 @@ def _solve_randers_update(
     solver,
     project_on_V,
     uniform_offdiag_weight=None,
-    metric_alpha=None,
+    uniform_right_scale=1.0,
 ):
     if not _is_diagonal(right_mat):
         return _solve_randers_update_kron(
@@ -121,13 +128,11 @@ def _solve_randers_update(
         )
 
     if uniform_offdiag_weight is not None and project_on_V:
-        if metric_alpha is None:
-            metric_alpha = A[0, 0] / V[0, 0]
         return _solve_uniform_projected_randers_update(
             total_right_mat,
-            alpha=metric_alpha,
             right_diag=np.diag(right_mat),
             offdiag_weight=uniform_offdiag_weight,
+            right_scale=uniform_right_scale,
         )
 
     left_mat = V
@@ -149,12 +154,12 @@ def _solve_randers_update(
 def _solve_uniform_projected_randers_update(
     total_right_mat,
     *,
-    alpha,
     right_diag,
     offdiag_weight,
+    right_scale=1.0,
 ):
     centered_rhs = total_right_mat - total_right_mat.mean(axis=0, keepdims=True)
-    denominators = len(total_right_mat) * offdiag_weight * (1 + alpha * right_diag)
+    denominators = len(total_right_mat) * offdiag_weight * (1 + right_scale * right_diag)
     return centered_rhs / denominators[None, :]
 
 
@@ -263,11 +268,15 @@ def _uniform_randers_C(dissimilarities, alpha, n_components, offdiag_weight):
 
 
 def _cupy_randers_pairwise(cp, X, alpha):
-    squared_norms = cp.sum(X * X, axis=1)
-    squared_distances = squared_norms[:, None] + squared_norms[None, :] - 2.0 * (X @ X.T)
-    euclidean = cp.sqrt(cp.maximum(squared_distances, 0.0))
+    euclidean = _cupy_euclidean_distances(cp, X)
     z = X[:, -1]
     return euclidean + alpha * (z[None, :] - z[:, None])
+
+
+def _cupy_euclidean_distances(cp, X):
+    squared_norms = cp.sum(X * X, axis=1)
+    squared_distances = squared_norms[:, None] + squared_norms[None, :] - 2.0 * (X @ X.T)
+    return cp.sqrt(cp.maximum(squared_distances, 0.0))
 
 
 def _cupy_stress(cp, embedded_dissimilarities, dissimilarities, weight, *, uniform_weight, normalized_stress, denom):
@@ -282,9 +291,9 @@ def _cupy_stress(cp, embedded_dissimilarities, dissimilarities, weight, *, unifo
     return stress
 
 
-def _cupy_uniform_projected_update(cp, total_right_mat, *, alpha, right_diag, offdiag_weight):
+def _cupy_uniform_projected_update(cp, total_right_mat, *, right_diag, offdiag_weight, right_scale=1.0):
     centered_rhs = total_right_mat - cp.mean(total_right_mat, axis=0, keepdims=True)
-    denominators = len(total_right_mat) * offdiag_weight * (1 + alpha * right_diag)
+    denominators = len(total_right_mat) * offdiag_weight * (1 + right_scale * right_diag)
     return centered_rhs / denominators[None, :]
 
 
@@ -302,15 +311,17 @@ def _smacof_randers_single_gpu(
     pseudo_inv_solver,
     project_on_V,
     check_monotony,
+    corrected=True,
 ):
     alpha = metric.alpha
     n_samples, n_components = X.shape
     uniform_offdiag_weight = _uniform_offdiag_weight(weight)
     use_uniform_projected_update = project_on_V and uniform_offdiag_weight is not None
 
-    diag_one_end = np.zeros((n_components, n_components))
-    diag_one_end[-1, -1] = 1
-    right_diag = np.diag(diag_one_end)
+    right_mat = np.zeros((n_components, n_components))
+    right_mat[-1, -1] = alpha * alpha if corrected else 1.0
+    right_diag = np.diag(right_mat)
+    D_major = 0.5 * (dissimilarities + dissimilarities.T) if corrected else dissimilarities
 
     if use_uniform_projected_update:
         V = None
@@ -323,14 +334,14 @@ def _smacof_randers_single_gpu(
         )
     else:
         V = _laplacian_from_weights(weight)
-        diag_sum_weights = np.diag(weight.sum(axis=1))
-        A = alpha * (diag_sum_weights - weight)
+        A = V if corrected else alpha * V
         mat_one_last_col = np.zeros((n_samples, n_components))
         mat_one_last_col[:, -1] = 1
         C = alpha * ((weight * dissimilarities - weight.T * dissimilarities.T) @ mat_one_last_col)
 
     X_gpu = cp.asarray(X)
     D_gpu = cp.asarray(dissimilarities)
+    D_major_gpu = cp.asarray(D_major)
     C_gpu = cp.asarray(C)
     right_diag_gpu = cp.asarray(right_diag)
     weight_gpu = None if uniform_offdiag_weight is not None else cp.asarray(weight)
@@ -356,32 +367,36 @@ def _smacof_randers_single_gpu(
     diag = cp.arange(n_samples)
 
     for it in range(max_iter):
-        embedded_dissimilarities = _cupy_randers_pairwise(cp, X_gpu, alpha)
-        dis = cp.where(embedded_dissimilarities == 0, 1e-5, embedded_dissimilarities)
-        ratio = D_gpu / dis
+        if corrected:
+            dis = _cupy_euclidean_distances(cp, X_gpu)
+        else:
+            dis = _cupy_randers_pairwise(cp, X_gpu, alpha)
+        dis = cp.where(dis == 0, 1e-5, dis)
+        ratio = D_major_gpu / dis
         B = -uniform_weight * ratio if weight_gpu is None else -ratio * weight_gpu
-        B[diag, diag] += -cp.sum(B, axis=1)
-        total_right_mat_gpu = B @ X_gpu - C_gpu
+        B[diag, diag] = 0.0
+        B[diag, diag] = -cp.sum(B, axis=1)
+        total_right_mat_gpu = B @ X_gpu - (0.5 if corrected else 1.0) * C_gpu
 
         if use_uniform_projected_update:
             X_gpu = _cupy_uniform_projected_update(
                 cp,
                 total_right_mat_gpu,
-                alpha=alpha,
                 right_diag=right_diag_gpu,
                 offdiag_weight=uniform_offdiag_weight,
+                right_scale=1.0 if corrected else alpha,
             )
         else:
             total_right_mat = cp.asnumpy(total_right_mat_gpu)
             X = _solve_randers_update(
                 V=V,
                 A=A,
-                right_mat=diag_one_end,
+                right_mat=right_mat,
                 total_right_mat=total_right_mat,
                 solver=pseudo_inv_solver,
                 project_on_V=project_on_V,
                 uniform_offdiag_weight=uniform_offdiag_weight,
-                metric_alpha=alpha,
+                uniform_right_scale=1.0 if corrected else alpha,
             )
             X_gpu = cp.asarray(X)
 
@@ -398,7 +413,8 @@ def _smacof_randers_single_gpu(
             print(f"it: {it}, stress {stress}")
 
         if check_monotony:
-            if stress > old_stress + 0.1:
+            tolerance = 1e-10 * max(1.0, abs(old_stress)) if corrected else 0.1
+            if stress > old_stress + tolerance:
                 X_gpu = old_X_gpu
                 stress = old_stress
                 it -= 1
@@ -436,6 +452,7 @@ def _smacof_randers_single(
     project_on_V=False,
     check_monotony=True,
     device="cpu",
+    corrected=True,
 ):
     """Run one Randers-SMACOF initialization."""
     metric = _validate_randers_metric(metric)
@@ -451,6 +468,8 @@ def _smacof_randers_single(
         weight = np.asarray(weight, dtype=float)
         if weight.shape != dissimilarities.shape:
             raise ValueError("weight must have the same shape as dissimilarities.")
+    if corrected:
+        _check_symmetric_weight(weight)
 
     if init is None:
         X = random_state.uniform(size=n_samples * n_components)
@@ -479,6 +498,7 @@ def _smacof_randers_single(
             pseudo_inv_solver=pseudo_inv_solver,
             project_on_V=project_on_V,
             check_monotony=check_monotony,
+            corrected=corrected,
         )
 
     uniform_offdiag_weight = _uniform_offdiag_weight(weight)
@@ -495,8 +515,9 @@ def _smacof_randers_single(
     )
     V_pinv = None if alpha > 0 or use_uniform_euclidean_update else np.linalg.pinv(V)
 
-    diag_one_end = np.zeros((n_components, n_components))
-    diag_one_end[-1, -1] = 1
+    right_mat = np.zeros((n_components, n_components))
+    right_mat[-1, -1] = alpha * alpha if corrected else 1.0
+    D_major = 0.5 * (dissimilarities + dissimilarities.T) if corrected else dissimilarities
     if use_uniform_projected_update:
         A = None
         C = _uniform_randers_C(
@@ -506,8 +527,7 @@ def _smacof_randers_single(
             uniform_offdiag_weight,
         )
     else:
-        diag_sum_weights = np.diag(weight.sum(axis=1))
-        A = alpha * (diag_sum_weights - weight)
+        A = V if corrected else alpha * V
         mat_one_last_col = np.zeros((n_samples, n_components))
         mat_one_last_col[:, -1] = 1
         C = alpha * ((weight * dissimilarities - weight.T * dissimilarities.T) @ mat_one_last_col)
@@ -526,17 +546,13 @@ def _smacof_randers_single(
     stress = old_stress
 
     for it in range(max_iter):
-        if alpha > 0:
-            embedded_dissimilarities = metric.pairwise(X)
-        else:
-            embedded_dissimilarities = euclidean_distances(X)
-
-        dis = embedded_dissimilarities.copy()
+        dis = euclidean_distances(X) if corrected else metric.pairwise(X)
         dis[dis == 0] = 1e-5
-        ratio = dissimilarities / dis
+        ratio = D_major / dis
         B = -ratio * weight
         diag = np.arange(len(B))
-        B[diag, diag] += -B.sum(axis=1)
+        B[diag, diag] = 0.0
+        B[diag, diag] = -B.sum(axis=1)
 
         if alpha == 0:
             if use_uniform_euclidean_update:
@@ -545,16 +561,16 @@ def _smacof_randers_single(
             else:
                 X = V_pinv @ B @ X
         else:
-            total_right_mat = B @ X - C
+            total_right_mat = B @ X - (0.5 if corrected else 1.0) * C
             X = _solve_randers_update(
                 V=V,
                 A=A,
-                right_mat=diag_one_end,
+                right_mat=right_mat,
                 total_right_mat=total_right_mat,
                 solver=pseudo_inv_solver,
                 project_on_V=project_on_V,
                 uniform_offdiag_weight=uniform_offdiag_weight,
-                metric_alpha=alpha,
+                uniform_right_scale=1.0 if corrected else alpha,
             )
 
         if alpha > 0:
@@ -568,7 +584,8 @@ def _smacof_randers_single(
             print(f"it: {it}, stress {stress}")
 
         if check_monotony:
-            if stress > old_stress + 0.1:
+            tolerance = 1e-10 * max(1.0, abs(old_stress)) if corrected else 0.1
+            if stress > old_stress + tolerance:
                 X = old_X
                 stress = old_stress
                 it -= 1
@@ -605,6 +622,7 @@ def smacof_randers(
     project_on_V=False,
     check_monotony=True,
     device="cpu",
+    version="corrected",
     return_result=False,
 ):
     """Compute a Randers-MDS embedding with the Randers-SMACOF update.
@@ -613,12 +631,21 @@ def smacof_randers(
     function, but the Randers strength now comes from ``metric.alpha``.
     ``device="auto"`` uses a CuPy/CUDA backend for the dense SMACOF iteration
     when available and falls back to CPU otherwise.
+
+    version : {"corrected", "legacy", "original"}, default="corrected"
+        Which SMACOF implementation to use. ``corrected`` uses the current
+        revised Randers-SMACOF implementation. ``legacy`` uses the previous
+        dense implementation from this module, including GPU support.
+        ``original`` uses the older `_mds_finsler.smacof` implementation.
     """
     metric = _validate_randers_metric(metric)
     dissimilarities = check_array(dissimilarities)
     if dissimilarities.shape[0] != dissimilarities.shape[1]:
         raise ValueError("dissimilarities must be a square matrix.")
     random_state = check_random_state(random_state)
+
+    use_legacy_update = version == "legacy"
+    use_original = version == "original"
 
     if normalized_stress == "auto":
         normalized_stress = False
@@ -641,6 +668,50 @@ def smacof_randers(
             )
             n_init = 1
 
+    if use_original:
+        if device != "cpu":
+            raise ValueError(
+                "Original smacof version only supports device='cpu'."
+            )
+        try:
+            legacy_dir = Path(__file__).resolve().parents[2] / "legacy"
+            if str(legacy_dir) not in sys.path:
+                sys.path.insert(0, str(legacy_dir))
+            from legacy._mds_finsler import smacof as legacy_smacof
+        except ImportError as exc:
+            raise RuntimeError(
+                "Legacy smacof implementation is unavailable."
+            ) from exc
+
+        legacy_return_n_iter = return_result or return_n_iter
+        legacy_result = legacy_smacof(
+            dissimilarities,
+            randers_w_alpha=metric.alpha,
+            metric=True,
+            n_components=n_components,
+            init=init,
+            n_init=n_init,
+            max_iter=max_iter,
+            verbose=verbose,
+            eps=eps,
+            random_state=random_state,
+            normalized_stress=normalized_stress,
+            weight=weight,
+            pseudo_inv_solver=pseudo_inv_solver,
+            project_on_V=project_on_V,
+            check_monotony=check_monotony,
+            return_n_iter=legacy_return_n_iter,
+        )
+
+        if return_result:
+            embedding, stress, n_iter = legacy_result
+            return SmacofRandersResult(
+                embedding=np.asarray(embedding),
+                stress=float(stress),
+                n_iter=int(n_iter),
+            )
+        return legacy_result
+
     if effective_n_jobs(n_jobs) == 1:
         best = None
         for _ in range(n_init):
@@ -659,6 +730,7 @@ def smacof_randers(
                 project_on_V=project_on_V,
                 check_monotony=check_monotony,
                 device=device,
+                corrected=not use_legacy_update,
             )
             if best is None or result.stress < best.stress:
                 best = result
@@ -680,6 +752,7 @@ def smacof_randers(
                 project_on_V=project_on_V,
                 check_monotony=check_monotony,
                 device=device,
+                corrected=not use_legacy_update,
             )
             for seed in seeds
         )

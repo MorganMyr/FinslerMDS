@@ -156,9 +156,11 @@ def main_pancreas_geometry_embeddings():
 
 def _saved_geometry_embeddings(embedding_dir):
     paths = []
+    paths.extend(embedding_dir.glob("pf*.npz"))
+    paths.extend(embedding_dir.glob("sbf*.npz"))
     paths.extend(embedding_dir.glob("pancreas_path_frozen*.npz"))
     paths.extend(embedding_dir.glob("pancreas_soft_bf*.npz"))
-    return [_embedding_info(path) for path in sorted(paths, key=lambda item: item.name)]
+    return [_embedding_info(path) for path in sorted(set(paths), key=lambda item: item.name)]
 
 
 def _load_eval_context(cache_path):

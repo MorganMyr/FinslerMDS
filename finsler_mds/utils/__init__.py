@@ -12,6 +12,10 @@ from .embedding_io import (
     latest_compatible_embedding_path,
     save_embedding_result,
 )
+from .orientation import (
+    rotate_embedding_to_mean_velocity_down,
+    rotation_to_down_axis,
+)
 from .dissimilarity_graphs import (
     density_scaled_knn_distances,
     temporally_asymmetric_knn_distances,
@@ -35,6 +39,30 @@ from .plotting import (
     set_axes_equal,
     set_window_title,
 )
+from .pancreas import (
+    PANCREAS_DATASET_SOURCE,
+    PANCREAS_TRANSITIONS,
+    compute_pancreas_velocity,
+    compute_pancreas_velocity_graph,
+    load_pancreas_dataset,
+    pancreas_preprocessing_neighbors,
+    preprocess_pancreas_for_velocity,
+)
+from .pancreas_campaign import (
+    PANCREAS_GD_OPTIONS,
+    PANCREAS_ISOMAP,
+    PANCREAS_N_EVAL_NEIGHBORS,
+    PANCREAS_PREPROCESSING,
+    PANCREAS_SEED,
+    PANCREAS_UMAP,
+    PANCREAS_VELOCITY,
+    latest_matching_embedding,
+    load_embedding,
+    parse_iter_from_name,
+    print_metric_row,
+    velocity_cos_clip,
+    write_csv,
+)
 from .wormhole import wormhole_mask
 
 __all__ = [
@@ -48,6 +76,8 @@ __all__ = [
     "load_saved_embedding",
     "latest_compatible_embedding_path",
     "save_embedding_result",
+    "rotate_embedding_to_mean_velocity_down",
+    "rotation_to_down_axis",
     "density_scaled_knn_distances",
     "temporally_asymmetric_knn_distances",
     "set_axes_equal",
@@ -67,5 +97,25 @@ __all__ = [
     "plot_proj_points",
     "get_extrema",
     "plot_randers_w_arrow",
+    "PANCREAS_DATASET_SOURCE",
+    "PANCREAS_TRANSITIONS",
+    "load_pancreas_dataset",
+    "pancreas_preprocessing_neighbors",
+    "preprocess_pancreas_for_velocity",
+    "compute_pancreas_velocity",
+    "compute_pancreas_velocity_graph",
+    "PANCREAS_SEED",
+    "PANCREAS_N_EVAL_NEIGHBORS",
+    "PANCREAS_PREPROCESSING",
+    "PANCREAS_VELOCITY",
+    "PANCREAS_UMAP",
+    "PANCREAS_ISOMAP",
+    "PANCREAS_GD_OPTIONS",
+    "load_embedding",
+    "latest_matching_embedding",
+    "parse_iter_from_name",
+    "write_csv",
+    "print_metric_row",
+    "velocity_cos_clip",
     "wormhole_mask",
 ]

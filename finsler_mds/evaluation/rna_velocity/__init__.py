@@ -33,9 +33,10 @@ from .pancreas_gap import (
     select_pancreas_gap,
 )
 from .asymmetry import (
-    velocity_field_asymmetry_preservation_from_neighbors,
-    velocity_field_asymmetry_preservation_from_pairs,
-    velocity_field_pair_costs,
+    VelocityAlignmentPreservationResult,
+    velocity_alignment_cosines_from_pairs,
+    velocity_alignment_preservation_from_neighbors,
+    velocity_alignment_preservation_from_pairs,
 )
 
 __all__ = [
@@ -63,7 +64,8 @@ __all__ = [
     "project_velocity_graph_to_embedding",
     "save_boundary_neighbor_plan",
     "select_pancreas_gap",
-    "velocity_field_asymmetry_preservation_from_neighbors",
-    "velocity_field_asymmetry_preservation_from_pairs",
-    "velocity_field_pair_costs",
+    "VelocityAlignmentPreservationResult",
+    "velocity_alignment_cosines_from_pairs",
+    "velocity_alignment_preservation_from_neighbors",
+    "velocity_alignment_preservation_from_pairs",
 ]
