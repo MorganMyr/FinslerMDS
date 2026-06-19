@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from scipy import sparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,6 +37,7 @@ DEFAULT_OUTPUT = (
 from finsler_mds import RandersMetric  # noqa: E402
 from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     cross_boundary_direction_correctness,
+    global_velocity_coherence,
     in_cluster_velocity_coherence,
     load_or_compute_boundary_neighbor_plan,
     velocity_alignment_preservation_from_neighbors,
@@ -48,7 +50,6 @@ from finsler_mds.utils.pancreas import (  # noqa: E402
     cluster_balanced_pair_weights,
     normalize_pair_weights,
     neighbor_indices_from_sparse_distances,
-    project_velocity_to_embedding,
     project_velocity_to_pca,
 )
 
@@ -73,11 +74,12 @@ VELOCITY = {
 
 @dataclass(frozen=True)
 class PancreasEvaluationContext:
-    adata: object
+    adata: object | None
     labels: np.ndarray
     expression_neighbors: np.ndarray
     x_pca: np.ndarray
     velocity_pca: np.ndarray
+    velocity_transition: sparse.csr_matrix
     cbdir_plan: object
     n_eval_neighbors: int
 
@@ -153,27 +155,57 @@ def load_pancreas_evaluation_context(
         eval_dir: Path,
         *,
         n_eval_neighbors=N_EVAL_NEIGHBORS,
+        load_adata=False,
 ) -> PancreasEvaluationContext:
-    """Load cached pancreas state and CBDir plan without touching distance caches."""
+    """Load a lightweight pancreas evaluation context.
+
+    The heavy AnnData is only loaded when the lightweight cache is missing, or
+    when callers explicitly need ``context.adata``.
+    """
     raw_dir = Path(raw_dir)
     eval_raw_dir = Path(eval_dir) / "raw"
+    eval_raw_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = evaluation_context_path(eval_raw_dir, n_eval_neighbors)
     state_path = pancreas_state_path(raw_dir)
-    if not state_path.exists():
-        raise FileNotFoundError(
-            "Pancreas evaluation state cache is missing. Run main_pancreas.py or a "
-            f"pancreas campaign once to create it: {state_path}"
+    adata = None
+    if cache_path.exists():
+        labels, expression_neighbors, x_pca, velocity_pca, velocity_transition = load_evaluation_context_cache(cache_path)
+    else:
+        if not state_path.exists():
+            raise FileNotFoundError(
+                "Pancreas evaluation state cache is missing. Run main_pancreas.py or a "
+                f"pancreas campaign once to create it: {state_path}"
+            )
+
+        import scanpy as sc
+
+        adata = sc.read_h5ad(state_path)
+        labels = np.asarray(adata.obs["clusters"].astype(str), dtype=str)
+        expression_neighbors = neighbor_indices_from_sparse_distances(
+            adata.obsp["distances"],
+            n_neighbors=n_eval_neighbors,
+        )
+        x_pca = np.asarray(adata.obsm["X_pca"][:, :PREPROCESSING["n_pcs"]], dtype=float)
+        velocity_pca = project_velocity_to_pca(adata, PREPROCESSING["n_pcs"])
+        velocity_transition = scvelo_velocity_transition_matrix(adata)
+        save_evaluation_context_cache(
+            cache_path,
+            labels=labels,
+            expression_neighbors=expression_neighbors,
+            x_pca=x_pca,
+            velocity_pca=velocity_pca,
+            velocity_transition=velocity_transition,
         )
 
-    import scanpy as sc
+    if load_adata and adata is None:
+        if not state_path.exists():
+            raise FileNotFoundError(
+                "Pancreas evaluation state cache is missing. Run main_pancreas.py or a "
+                f"pancreas campaign once to create it: {state_path}"
+            )
+        import scanpy as sc
+        adata = sc.read_h5ad(state_path)
 
-    adata = sc.read_h5ad(state_path)
-    labels = np.asarray(adata.obs["clusters"].astype(str), dtype=str)
-    expression_neighbors = neighbor_indices_from_sparse_distances(
-        adata.obsp["distances"],
-        n_neighbors=n_eval_neighbors,
-    )
-    x_pca = np.asarray(adata.obsm["X_pca"][:, :PREPROCESSING["n_pcs"]], dtype=float)
-    velocity_pca = project_velocity_to_pca(adata, PREPROCESSING["n_pcs"])
     cbdir_plan = load_cbdir_plan(
         eval_raw_dir,
         labels,
@@ -186,6 +218,7 @@ def load_pancreas_evaluation_context(
         expression_neighbors=expression_neighbors,
         x_pca=x_pca,
         velocity_pca=velocity_pca,
+        velocity_transition=velocity_transition,
         cbdir_plan=cbdir_plan,
         n_eval_neighbors=int(n_eval_neighbors),
     )
@@ -203,7 +236,10 @@ def evaluate_embedding(
 ) -> dict[str, object]:
     """Evaluate one embedding with CBDir, ICVCoh, Spearman-cos, sign correctness."""
     embedding = np.asarray(embedding, dtype=float)
-    velocity_embedding = project_velocity_to_embedding(context.adata, embedding)
+    velocity_embedding = project_velocity_to_embedding_from_transition(
+        context.velocity_transition,
+        embedding,
+    )
     cbdir = cross_boundary_direction_correctness(
         embedding,
         context.labels,
@@ -220,6 +256,10 @@ def evaluate_embedding(
         neighbor_indices=context.expression_neighbors,
         n_neighbors=context.n_eval_neighbors,
     )
+    gvcoh = global_velocity_coherence(
+        embedding,
+        velocity_vectors=velocity_embedding,
+    )
     alignment = velocity_alignment_preservation_from_neighbors(
         context.x_pca,
         context.velocity_pca,
@@ -235,15 +275,110 @@ def evaluate_embedding(
         "n_eval_neighbors": int(context.n_eval_neighbors),
         "cbdir": float(cbdir.score),
         "icvcoh": float(icvcoh.score),
+        "gvcoh": float(gvcoh.score),
         "spearman_cos": float(alignment.spearman),
         "sign_correctness": float(alignment.sign_accuracy),
     }
     if weight is not None or dissimilarities is not None:
-        if weight is None or dissimilarities is None or metric is None:
+        if dissimilarities is None or metric is None:
             raise ValueError("metric, dissimilarities, and weight must be passed together.")
+        if weight is None:
+            weight = np.ones_like(dissimilarities, dtype=float)
+            np.fill_diagonal(weight, 0.0)
         residual = metric.pairwise(embedding) - dissimilarities
         row["direct_weighted_stress"] = float(np.sum(weight * residual * residual))
     return row
+
+
+def evaluation_context_path(eval_raw_dir: Path, n_neighbors: int) -> Path:
+    return Path(eval_raw_dir) / (
+        f"pancreas_eval_context_{PANCREAS_DATASET_SOURCE.replace('.', '_')}_"
+        f"hvg{PREPROCESSING['n_top_genes']}_pca{PREPROCESSING['n_pcs']}_"
+        f"k{int(n_neighbors)}_s{SEED}.npz"
+    )
+
+
+def save_evaluation_context_cache(
+        path,
+        *,
+        labels,
+        expression_neighbors,
+        x_pca,
+        velocity_pca,
+        velocity_transition,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    T = sparse.csr_matrix(velocity_transition)
+    np.savez_compressed(
+        path,
+        labels=np.asarray(labels, dtype=str),
+        expression_neighbors=np.asarray(expression_neighbors, dtype=np.int32),
+        x_pca=np.asarray(x_pca, dtype=np.float32),
+        velocity_pca=np.asarray(velocity_pca, dtype=np.float32),
+        transition_data=np.asarray(T.data, dtype=np.float32),
+        transition_indices=np.asarray(T.indices, dtype=np.int32),
+        transition_indptr=np.asarray(T.indptr, dtype=np.int32),
+        transition_shape=np.asarray(T.shape, dtype=np.int32),
+    )
+
+
+def load_evaluation_context_cache(path):
+    with np.load(path, allow_pickle=False) as cache:
+        labels = cached_string_array(cache, "labels")
+        expression_neighbors = np.asarray(cache["expression_neighbors"], dtype=int)
+        x_pca = np.asarray(cache["x_pca"], dtype=float)
+        velocity_pca = np.asarray(cache["velocity_pca"], dtype=float)
+        shape = tuple(np.asarray(cache["transition_shape"], dtype=int))
+        transition = sparse.csr_matrix(
+            (
+                np.asarray(cache["transition_data"], dtype=float),
+                np.asarray(cache["transition_indices"], dtype=int),
+                np.asarray(cache["transition_indptr"], dtype=int),
+            ),
+            shape=shape,
+        )
+    return labels, expression_neighbors, x_pca, velocity_pca, transition
+
+
+def scvelo_velocity_transition_matrix(adata):
+    """Return the scVelo transition matrix used by velocity_embedding."""
+    try:
+        from scvelo.tools.transition_matrix import transition_matrix
+    except ImportError as exc:
+        raise ImportError("scVelo is required to create the pancreas evaluation cache.") from exc
+
+    transition = transition_matrix(
+        adata,
+        vkey="velocity",
+        scale=10,
+        self_transitions=True,
+        use_negative_cosines=True,
+    )
+    transition = sparse.csr_matrix(transition)
+    transition.setdiag(0.0)
+    transition.eliminate_zeros()
+    return transition
+
+
+def project_velocity_to_embedding_from_transition(transition, embedding):
+    """Project fixed scVelo transitions into an embedding without loading gene layers."""
+    T = sparse.csr_matrix(transition)
+    embedding = np.asarray(embedding, dtype=float)
+    velocity_embedding = np.zeros_like(embedding, dtype=float)
+    for row_idx in range(T.shape[0]):
+        start, end = T.indptr[row_idx], T.indptr[row_idx + 1]
+        indices = T.indices[start:end]
+        if len(indices) == 0:
+            continue
+        dX = embedding[indices] - embedding[row_idx]
+        norms = np.linalg.norm(dX, axis=1)
+        nonzero = norms > 0
+        dX[nonzero] /= norms[nonzero, None]
+        dX[~nonzero] = 0.0
+        probs = T.data[start:end]
+        velocity_embedding[row_idx] = probs @ dX - probs.mean() * dX.sum(axis=0)
+    return velocity_embedding
 
 
 def pancreas_state_path(raw_dir: Path) -> Path:
@@ -473,9 +608,11 @@ def velocity_formula_tag(distance_formula: str) -> str:
     distance_formula = str(distance_formula).lower()
     if distance_formula == "randers":
         return "vrand"
+    if distance_formula in {"mats", "matsumoto"}:
+        return "vmats"
     if distance_formula == "exponential":
         return "vexp"
-    raise ValueError("distance_formula must be 'randers' or 'exponential'.")
+    raise ValueError("distance_formula must be 'randers', 'matsumoto', or 'exponential'.")
 
 
 def cache_token(value):
@@ -496,6 +633,7 @@ def print_row(row: dict[str, object]) -> None:
         str(row.get("name", "")),
         f"CBDir={float(row['cbdir']):.6f}",
         f"ICVCoh={float(row['icvcoh']):.6f}",
+        f"GVCoh={float(row['gvcoh']):.6f}",
         f"SpearmanCos={float(row['spearman_cos']):.6f}",
         f"Sign={float(row['sign_correctness']):.6f}",
     ]
@@ -545,7 +683,7 @@ def parse_args() -> argparse.Namespace:
         help="Also compute direct weighted stress with cached pancreas velocity dissimilarities.",
     )
     parser.add_argument("--velocity-alpha", type=float, default=0.0)
-    parser.add_argument("--velocity-formula", choices=("randers", "exponential"), default="randers")
+    parser.add_argument("--velocity-formula", choices=("randers", "matsumoto", "exponential"), default="randers")
     parser.add_argument("--velocity-cos-clip", type=float, default=VELOCITY["cos_clip"])
     parser.add_argument("--velocity-knn-euclid", type=int, default=VELOCITY["kNN_euclid"])
     parser.add_argument("--velocity-knn-finsler", type=int, default=VELOCITY["kNN_finsler"])

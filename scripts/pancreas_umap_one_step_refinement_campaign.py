@@ -42,10 +42,14 @@ from scripts.main_pancreas import (  # noqa: E402
     cache_token,
     compute_umap_from_neighbors,
     labels_to_cache,
+    normalize_velocity_distance_formula,
+    velocity_distance_formula_tag,
 )
 
 
-SEEDS = (42, 43, 44, 45, 46)
+SEEDS = (42,)
+EMBEDDING_DIM = 3
+UMAP_INIT_DIM = 3
 ITERATIONS = (1, 2, 3, 10, 100)
 INTERPOLATION_T = (0.25, 0.5, 0.75)
 V_ALPHA_COS_CLIP = {
@@ -58,11 +62,10 @@ EMB_ALPHA_GRID = (0.2, 0.4, 0.6, 0.8, 0.9)
 BASELINE_CASE = (0.0, 1.0, 0.0)  # v_alpha, cos_clip, emb_alpha
 
 CLUSTER_REWEIGHT_RHO = 0.0
-# 1.0 means no frontier-pair reweighting.  Do not use 0.0 here: it would
-# downweight frontier pairs to zero rather than disabling the mechanism.
 FRONTIER_PAIRS_WEIGHTS = (1.0,)
 SELECTED_FRONTIERS = "all"
 DISTANCE_REWEIGHT_POWER = 0.0
+VELOCITY_DISTANCE_FORMULA = "randers"  # one of {"randers", "matsumoto"}
 EMBEDDING_METRIC = "matsumoto"  # one of {"randers", "matsumoto"}
 N_KNN_OVERLAP = 30
 OVERWRITE = False
@@ -75,6 +78,8 @@ OUT_DIR = EVAL_DIR / "umap_one_step_refinement"
 
 
 def main() -> None:
+    if EMBEDDING_DIM not in (2, 3):
+        raise ValueError("EMBEDDING_DIM must be 2 or 3.")
     suppress_pancreas_noise_warnings()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -82,6 +87,7 @@ def main() -> None:
         RAW_DIR,
         EVAL_DIR,
         n_eval_neighbors=PANCREAS_N_EVAL_NEIGHBORS,
+        load_adata=True,
     )
     for frontier_pairs_weight in FRONTIER_PAIRS_WEIGHTS:
         raw_csv, summary_csv = output_paths(frontier_pairs_weight)
@@ -198,7 +204,9 @@ def run_campaign(context, frontier_pairs_weight, raw_csv, summary_csv) -> None:
 
 
 def output_paths(frontier_pairs_weight):
-    tag = f"_{metric_short_name()}"
+    init_tag = f"_iu{UMAP_INIT_DIM}" if EMBEDDING_DIM != UMAP_INIT_DIM else ""
+    velocity_tag = velocity_distance_formula_tag(VELOCITY_DISTANCE_FORMULA)
+    tag = f"_{EMBEDDING_DIM}d{init_tag}_{velocity_tag}_{metric_short_name()}"
     if float(frontier_pairs_weight) != 1.0:
         tag += f"_afpw{cache_token(frontier_pairs_weight)}"
     return (
@@ -221,7 +229,7 @@ def load_or_compute_umap(context, seed):
     if seed == 42:
         path = RAW_DIR / "umap_dynamical_s42.npy"
         if path.exists():
-            return np.asarray(np.load(path), dtype=float)
+            return as_embedding_dim(np.load(path))
 
     import scanpy as sc
 
@@ -243,14 +251,24 @@ def load_or_compute_umap(context, seed):
         embedding,
         velocity_embedding,
     )
-    return np.asarray(oriented, dtype=float)
+    return as_embedding_dim(oriented)
+
+
+def as_embedding_dim(embedding):
+    embedding = np.asarray(embedding, dtype=float)
+    if embedding.shape[1] == EMBEDDING_DIM:
+        return embedding
+    if embedding.shape[1] == 2 and EMBEDDING_DIM == 3:
+        return np.column_stack([embedding, np.zeros(len(embedding))])
+    raise ValueError(f"Cannot use a {embedding.shape[1]}D UMAP init for EMBEDDING_DIM={EMBEDDING_DIM}.")
 
 
 def load_or_compute_dissimilarities(context, v_alpha, cos_clip):
+    distance_formula = normalize_velocity_distance_formula(VELOCITY_DISTANCE_FORMULA)
     path = velocity_inputs_path(
         RAW_DIR,
         velocity_alpha=v_alpha,
-        distance_formula="randers",
+        distance_formula=distance_formula,
         cos_clip=cos_clip,
         kNN_euclid=PANCREAS_VELOCITY["kNN_euclid"],
         kNN_finsler=PANCREAS_VELOCITY["kNN_finsler"],
@@ -266,7 +284,7 @@ def load_or_compute_dissimilarities(context, v_alpha, cos_clip):
         kNN_euclid=PANCREAS_VELOCITY["kNN_euclid"],
         kNN_finsler=PANCREAS_VELOCITY["kNN_finsler"],
         alpha=v_alpha,
-        distance_formula=PANCREAS_VELOCITY["distance_formula"],
+        distance_formula=distance_formula,
         cos_clip=cos_clip,
         velocity_neighbors=PANCREAS_VELOCITY["velocity_neighbors"],
         average_velocity=PANCREAS_VELOCITY["average_velocity"],
@@ -359,7 +377,10 @@ def evaluate_run(
         {
             "seed": int(seed),
             "method": method,
+            "velocity_distance_formula": normalize_velocity_distance_formula(VELOCITY_DISTANCE_FORMULA),
             "embedding_metric": EMBEDDING_METRIC.lower(),
+            "embedding_dim": int(embedding.shape[1]),
+            "init_embedding_dim": UMAP_INIT_DIM,
             "v_alpha": v_alpha,
             "cos_clip": cos_clip,
             "emb_alpha": emb_alpha,
@@ -426,17 +447,36 @@ def existing_keys(path):
             parse_float(row.get("emb_alpha", np.nan)),
             int(float(row.get("max_iter", 0))),
             parse_float(row.get("interp_t", np.nan)),
+            velocity_distance_formula=row_velocity_distance_formula(row),
             embedding_metric=row.get("embedding_metric", EMBEDDING_METRIC),
+            embedding_dim=int(float(row.get("embedding_dim", EMBEDDING_DIM))),
+            init_embedding_dim=int(float(row.get("init_embedding_dim", UMAP_INIT_DIM))),
         )
         for row in read_csv_rows(path)
     }
 
 
-def row_key(seed, method, v_alpha, cos_clip, emb_alpha, max_iter, interp_t, *, embedding_metric=None):
+def row_key(
+        seed,
+        method,
+        v_alpha,
+        cos_clip,
+        emb_alpha,
+        max_iter,
+        interp_t,
+        *,
+        velocity_distance_formula=None,
+        embedding_metric=None,
+        embedding_dim=None,
+        init_embedding_dim=None,
+):
     return (
         int(seed),
         str(method),
+        normalize_velocity_distance_formula(velocity_distance_formula or VELOCITY_DISTANCE_FORMULA),
         str(embedding_metric or EMBEDDING_METRIC).lower(),
+        int(embedding_dim or EMBEDDING_DIM),
+        int(init_embedding_dim or UMAP_INIT_DIM),
         token_or_nan(v_alpha),
         token_or_nan(cos_clip),
         token_or_nan(emb_alpha),
@@ -453,9 +493,14 @@ def add_row_if_needed(raw_csv, done, key, row_factory):
     done.add(key)
     print(
         f"{row['name']}: CBDir={row['cbdir']:.4f}, ICVCoh={row['icvcoh']:.4f}, "
-        f"Orient={row['spearman_cos']:.4f}, Sign={row['sign_correctness']:.4f}",
+        f"GVCoh={row['gvcoh']:.4f}, Orient={row['spearman_cos']:.4f}, "
+        f"Sign={row['sign_correctness']:.4f}",
         flush=True,
     )
+
+
+def row_velocity_distance_formula(row):
+    return normalize_velocity_distance_formula(row.get("velocity_distance_formula") or "randers")
 
 
 def needs_interpolation(done, seed, v_alpha, cos_clip, emb_alpha):
@@ -469,6 +514,7 @@ def write_summary(raw_csv, summary_csv):
     metric_keys = [
         "cbdir",
         "icvcoh",
+        "gvcoh",
         "spearman_cos",
         "sign_correctness",
         "direct_weighted_stress",
@@ -482,7 +528,10 @@ def write_summary(raw_csv, summary_csv):
         summary_csv,
         group_keys=[
             "method",
+            "velocity_distance_formula",
             "embedding_metric",
+            "embedding_dim",
+            "init_embedding_dim",
             "v_alpha",
             "cos_clip",
             "emb_alpha",
@@ -496,8 +545,9 @@ def write_summary(raw_csv, summary_csv):
 
 
 def run_name(prefix, seed, v_alpha, emb_alpha, max_iter, *, t=np.nan):
+    velocity_tag = velocity_distance_formula_tag(VELOCITY_DISTANCE_FORMULA, alpha=v_alpha)
     name = (
-        f"{prefix}_2d_vrand{cache_token(v_alpha)}_{metric_short_name()}{cache_token(emb_alpha)}"
+        f"{prefix}_{EMBEDDING_DIM}d_{velocity_tag}_{metric_short_name()}{cache_token(emb_alpha)}"
         f"_i{max_iter}_s{seed}"
     )
     if not np.isnan(t):

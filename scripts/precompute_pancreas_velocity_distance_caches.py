@@ -238,6 +238,7 @@ def velocity_formula_tag():
     return {
         "exponential": "vexp",
         "randers": "vrand",
+        "matsumoto": "vmats",
     }[normalize_velocity_distance_formula(VELOCITY["distance_formula"])]
 
 

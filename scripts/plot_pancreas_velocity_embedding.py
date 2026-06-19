@@ -70,6 +70,7 @@ def main() -> None:
         raw_dir,
         pancreas_dir / "rna_velocity_evaluation",
         n_eval_neighbors=args.n_neighbors,
+        load_adata=True,
     )
     if len(embedding) != len(context.labels):
         raise ValueError(

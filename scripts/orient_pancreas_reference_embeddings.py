@@ -35,7 +35,7 @@ def main():
     raw_dir = pancreas_dir / "raw"
     eval_dir = pancreas_dir / "rna_velocity_evaluation"
 
-    context = load_pancreas_evaluation_context(raw_dir, eval_dir)
+    context = load_pancreas_evaluation_context(raw_dir, eval_dir, load_adata=True)
     labels = context.labels
 
     # Ensure Isomap files exist before orientation.

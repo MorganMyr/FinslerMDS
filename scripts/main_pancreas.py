@@ -56,9 +56,9 @@ def main_pancreas(config_overrides=None):
     }
     velocity = {
         "mode": "dynamical",
-        "distance_formula": "randers",  # one of {"exponential", "randers"}
-        "alpha": 2, # should be positive; randers needs alpha*cos_clip<1
-        "cos_clip": 0.4,
+        "distance_formula": "randers",  # one of {"exponential", "randers", "matsumoto"}
+        "alpha": 1, # should be positive; randers needs alpha*cos_clip<1
+        "cos_clip": 0.99,
         "velocity_neighbors": 30, # to average the velocity locally (if "average_velocity" is True)
         "kNN_euclid": 30,  # Euclidean kNN support before adding Finsler-nearest outgoing edges.
         "kNN_finsler": 0,  # Additional outgoing neighbors selected by local asymmetric distance.
@@ -91,17 +91,17 @@ def main_pancreas(config_overrides=None):
     }
     #MDS 2D:
     #gd_2d_vrand0_r0_s42.npz
-    finsler_optimizer = "gradient_descent"  # one of {"smacof", "gradient_descent", "path_frozen", "soft_bf"}
-    init_finsler_mds = "umap_2D"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "path_frozen", "soft_bf"}
-    embedding_dim = 3  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
+    finsler_optimizer = "finsler_umap"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    init_finsler_mds = "umap_2D"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    embedding_dim = 2  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
     cluster_reweight_rho = 0
     frontier_pairs_weight = 1
     selected_frontiers = "all"  # one of {"cbdir", "all"}
-    distance_reweighting = {"power": 0.0, "epsilon": 1e-6}
+    distance_reweighting = {"power": 0, "epsilon": 1e-6}
 
     # SMACOF always uses Randers regardless of finsler_metric
-    finsler_metric = "matsumoto"  # one of {"randers", "matsumoto", "convexified_matsumoto"}
-    alpha_embedding = 0.6
+    finsler_metric = "randers"  # one of {"randers", "matsumoto", "convexified_matsumoto"}
+    alpha_embedding = 0.8
     smacof = {
         "max_iter": 1000,
         "eps": 1e-6,
@@ -111,7 +111,7 @@ def main_pancreas(config_overrides=None):
         "version": "corrected",
     }
     gradient_descent = {
-        "max_iter": 100,
+        "max_iter": 10,
         "eps": 1e-8,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-10, "maxls": 80, "maxcor": 30},
@@ -119,10 +119,28 @@ def main_pancreas(config_overrides=None):
         "gpu_block_size": 256,
         "verbose": 1,
     }
+    finsler_umap = {
+        "n_neighbors": 50,
+        "symmetrize_support": True,
+        "symmetrize_rho": False,
+        "symmetrize_sigma": True,
+        "min_dist": 0.5,
+        "spread": 1.0,
+        "max_iter": 1500,
+        "learning_rate": 1,
+        "batch_size": 512,
+        "negative_sample_rate": 10,
+        "negative_sample_weight": 1.0,
+        "negative_metric": "euclidean",
+        "gradient_clip": 4.0,
+        "verbose": 1,
+        "log_frequency": 500,
+        "backend": "numba",
+    }
     path_frozen = {
         "graph_neighbors": 30,
-        "outer_iter": 25,
-        "inner_iter": 30,
+        "outer_iter": 10,
+        "inner_iter": 3,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-9, "maxls": 50},
@@ -178,6 +196,7 @@ def main_pancreas(config_overrides=None):
             isomap=isomap,
             smacof=smacof,
             gradient_descent=gradient_descent,
+            finsler_umap=finsler_umap,
             path_frozen=path_frozen,
             soft_bf=soft_bf,
         )
@@ -320,6 +339,11 @@ def main_pancreas(config_overrides=None):
     gradient_descent_cache_path = os.path.join(
         dir_res_raw,
         f"{file_prefix}gd_{embedding_dim_tag}"
+        f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
+    )
+    finsler_umap_cache_path = os.path.join(
+        dir_res_raw,
+        f"{file_prefix}fumap_{embedding_dim_tag}"
         f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
     )
 
@@ -634,6 +658,7 @@ def main_pancreas(config_overrides=None):
             distance_reweighting=distance_reweighting,
             boundary_plan=frontier_plan,
         )
+        optimizer_kind = normalize_finsler_optimizer(finsler_optimizer)
         init_finsler, init_description = resolve_finsler_init(
             init_finsler_mds,
             embedding_sources={
@@ -649,6 +674,9 @@ def main_pancreas(config_overrides=None):
                 "gradient_descent": latest_finsler_embedding_path(
                     dir_res_raw, dataset_prefix, "gd", embedding_dim
                 ),
+                "finsler_umap": latest_finsler_embedding_path(
+                    dir_res_raw, dataset_prefix, "fumap", embedding_dim
+                ),
                 "path_frozen": latest_finsler_embedding_path(
                     dir_res_raw, dataset_prefix, "pf", embedding_dim
                 ),
@@ -659,11 +687,11 @@ def main_pancreas(config_overrides=None):
             raw_dir=dir_res_raw,
             n_samples=len(x_umap),
             n_components=embedding_dim,
+            allow_internal_spectral=optimizer_kind == "finsler_umap",
         )
-        if adata is not None and init_finsler is not None:
+        if adata is not None and isinstance(init_finsler, np.ndarray):
             adata.obsm["X_finsler_init"] = init_finsler
 
-        optimizer_kind = normalize_finsler_optimizer(finsler_optimizer)
         if optimizer_kind == "smacof":
             print(
                 f"Running {embedding_dim}D Randers SMACOF alpha={alpha_embedding} "
@@ -735,6 +763,7 @@ def main_pancreas(config_overrides=None):
                         "n_iter": int(smacof_n_iter),
                         "smacof": smacof,
                         "gradient_descent": gradient_descent,
+                        "finsler_umap": finsler_umap,
                         "path_frozen": path_frozen,
                         "soft_bf": soft_bf,
                     },
@@ -761,87 +790,49 @@ def main_pancreas(config_overrides=None):
             print(f"{optimizer_kind} optimizer stress: {stress_finsler}")
             plt.close("all")
             return adata, dists_velocity
-        elif optimizer_kind == "gradient_descent":
-            print(f"Running {embedding_dim}D gradient descent {metric_display_name(embedding_metric_obj)} from {init_description}")
-            proj_finsler, stress_finsler, gd_n_iter = fit_finsler_mds(
+        elif optimizer_kind in {"gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}:
+            specs = {
+                "gradient_descent": ("gradient_descent", "gradient descent", "gd", gradient_descent_cache_path, gradient_descent, True),
+                "finsler_umap": ("finsler_umap", "Finsler-UMAP", "fumap", finsler_umap_cache_path, finsler_umap, True),
+                "path_frozen": ("path_frozen", "path-frozen", "pf", path_frozen_cache_path, path_frozen, False),
+                "soft_bf": ("soft_bellman_ford", "soft-BF", "sbf", soft_bf_cache_path, soft_bf, False),
+            }
+            optimizer_name, display_name, file_tag, output_cache_path, options, has_n_iter = specs[optimizer_kind]
+            print(f"Running {embedding_dim}D {display_name} {metric_display_name(embedding_metric_obj)} from {init_description}")
+            optimizer_kwargs = dict(options)
+            if has_n_iter:
+                optimizer_kwargs.update(return_n_iter=True, random_state=seed)
+            else:
+                optimizer_kwargs.update(mask_random_state=seed, target_random_state=seed + 3)
+            optimizer_result = fit_finsler_mds(
                 dists_velocity,
                 metric=embedding_metric_obj,
-                optimizer="gradient_descent",
+                optimizer=optimizer_name,
                 init=init_finsler,
                 n_components=embedding_dim,
                 weight=pair_weight,
-                return_n_iter=True,
                 print_time=True,
-                random_state=seed,
-                **gradient_descent,
+                **optimizer_kwargs,
             )
-            output_cache_path = gradient_descent_cache_path
+            if has_n_iter:
+                proj_finsler, stress_finsler, n_iter = optimizer_result
+                n_iter = int(n_iter)
+            else:
+                proj_finsler, stress_finsler = optimizer_result
+                n_iter = ""
             full_geodesic_stress = None
             plot_title = (
-                f"Pancreas {embedding_dim}D gradient descent "
+                f"Pancreas {embedding_dim}D {display_name} "
                 f"({velocity_formula_tag}, {metric_display_name(embedding_metric_obj)})"
             )
             plot_path = os.path.join(
                 dir_res,
-                f"{file_prefix}gd_{embedding_dim_tag}{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}.pdf",
+                f"{file_prefix}{file_tag}_{embedding_dim_tag}{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}.pdf",
             )
-            adata_key = "X_finsler_gradient_descent"
-            n_iter = int(gd_n_iter)
-        elif optimizer_kind == "path_frozen":
-            print(f"Running {embedding_dim}D path-frozen {metric_display_name(embedding_metric_obj)} from {init_description}")
-            proj_finsler, stress_finsler = fit_finsler_mds(
-                dists_velocity,
-                metric=embedding_metric_obj,
-                optimizer="path_frozen",
-                init=init_finsler,
-                n_components=embedding_dim,
-                weight=pair_weight,
-                **path_frozen,
-                mask_random_state=seed,
-                target_random_state=seed + 3,
-                print_time=True,
-            )
-            output_cache_path = path_frozen_cache_path
-            full_geodesic_stress = None
-            plot_title = (
-                f"Pancreas {embedding_dim}D path-frozen "
-                f"({velocity_formula_tag}, {metric_display_name(embedding_metric_obj)})"
-            )
-            plot_path = os.path.join(
-                dir_res,
-                f"{file_prefix}pf_{embedding_dim_tag}{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}.pdf",
-            )
-            adata_key = "X_finsler_path_frozen"
-            n_iter = ""
-        elif optimizer_kind == "soft_bf":
-            print(f"Running {embedding_dim}D soft-BF {metric_display_name(embedding_metric_obj)} from {init_description}")
-            proj_finsler, stress_finsler = fit_finsler_mds(
-                dists_velocity,
-                metric=embedding_metric_obj,
-                optimizer="soft_bellman_ford",
-                init=init_finsler,
-                n_components=embedding_dim,
-                weight=pair_weight,
-                **soft_bf,
-                mask_random_state=seed,
-                target_random_state=seed + 3,
-                print_time=True,
-            )
-            output_cache_path = soft_bf_cache_path
-            full_geodesic_stress = None
-            plot_title = (
-                f"Pancreas {embedding_dim}D soft-BF "
-                f"({velocity_formula_tag}, {metric_display_name(embedding_metric_obj)})"
-            )
-            plot_path = os.path.join(
-                dir_res,
-                f"{file_prefix}sbf_{embedding_dim_tag}{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}.pdf",
-            )
-            adata_key = "X_finsler_soft_bf"
-            n_iter = ""
+            adata_key = f"X_finsler_{optimizer_kind}"
         else:
             raise ValueError(
-                "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'path_frozen', 'soft_bf', None}."
+                "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'finsler_umap', 'path_frozen', 'soft_bf', None}."
             )
 
         cache_payload = dict(
@@ -869,6 +860,7 @@ def main_pancreas(config_overrides=None):
                     "n_iter": n_iter,
                     "smacof": smacof,
                     "gradient_descent": gradient_descent,
+                    "finsler_umap": finsler_umap,
                     "path_frozen": path_frozen,
                     "soft_bf": soft_bf,
                 },
@@ -968,7 +960,7 @@ def load_or_compute_pancreas_gap_ordering(
 
 def normalize_velocity_distance_formula(distance_formula):
     if not isinstance(distance_formula, str):
-        raise TypeError("velocity['distance_formula'] must be 'exponential' or 'randers'.")
+        raise TypeError("velocity['distance_formula'] must be 'exponential', 'randers', or 'matsumoto'.")
     formula = distance_formula.lower()
     aliases = {
         "exp": "exponential",
@@ -976,9 +968,12 @@ def normalize_velocity_distance_formula(distance_formula):
         "randers": "randers",
         "local_randers": "randers",
         "linear_randers": "randers",
+        "mats": "matsumoto",
+        "matsumoto": "matsumoto",
+        "local_matsumoto": "matsumoto",
     }
     if formula not in aliases:
-        raise ValueError("velocity['distance_formula'] must be 'exponential' or 'randers'.")
+        raise ValueError("velocity['distance_formula'] must be 'exponential', 'randers', or 'matsumoto'.")
     return aliases[formula]
 
 
@@ -988,6 +983,8 @@ def velocity_distance_formula_tag(distance_formula, alpha=None):
         prefix = "vexp"
     elif formula == "randers":
         prefix = "vrand"
+    elif formula == "matsumoto":
+        prefix = "vmats"
     else:
         raise RuntimeError(f"Unhandled velocity distance formula {formula!r}.")
     if alpha is None:
@@ -1371,10 +1368,25 @@ def requested_embedding_init_dimension(init_finsler_mds, method):
     return None
 
 
-def resolve_finsler_init(init_finsler_mds, *, embedding_sources, raw_dir, n_samples, n_components=3):
+def resolve_finsler_init(
+        init_finsler_mds,
+        *,
+        embedding_sources,
+        raw_dir,
+        n_samples,
+        n_components=3,
+        allow_internal_spectral=False,
+):
     """Load the initial embedding used by the selected Finsler-MDS optimizer."""
     if init_finsler_mds is None:
+        if allow_internal_spectral:
+            return "spectral", "internal spectral initialization"
         return None, "random initialization"
+
+    if isinstance(init_finsler_mds, str) and init_finsler_mds.lower() in {"spectral", "spec"}:
+        if allow_internal_spectral:
+            return "spectral", "internal spectral initialization"
+        raise ValueError("init_finsler_mds='spectral' is only supported for finsler_optimizer='finsler_umap'.")
 
     try:
         init_kind = normalize_finsler_init_kind(init_finsler_mds)
@@ -1428,7 +1440,7 @@ def normalize_finsler_init_kind(init_finsler_mds):
         raise TypeError(
             "init_finsler_mds must be one of "
             "{'umap', 'umap_2D', 'umap_3D', 'isomap', 'isomap_2D', 'isomap_3D', "
-            "'smacof', 'gradient_descent', 'path_frozen', 'soft_bf', None}."
+            "'smacof', 'gradient_descent', 'finsler_umap', 'path_frozen', 'soft_bf', None}."
         )
 
     init_kind = init_finsler_mds.lower()
@@ -1444,12 +1456,14 @@ def normalize_finsler_init_kind(init_finsler_mds):
         return "soft_bf"
     if init_kind in {"gradient_descent", "gd"}:
         return "gradient_descent"
+    if init_kind in {"finsler_umap", "fumap"}:
+        return "finsler_umap"
     if init_kind in {"smacof", "path_frozen", "soft_bf"}:
         return init_kind
     raise ValueError(
         "init_finsler_mds must be one of "
         "{'umap', 'umap_2D', 'umap_3D', 'isomap', 'isomap_2D', 'isomap_3D', "
-        "'smacof', 'gradient_descent', 'path_frozen', 'soft_bf', None}."
+        "'smacof', 'gradient_descent', 'finsler_umap', 'path_frozen', 'soft_bf', None}."
     )
 
 
@@ -1524,19 +1538,21 @@ def latest_finsler_embedding_path(cache_dir, dataset_prefix, family, embedding_d
 def normalize_finsler_optimizer(finsler_optimizer):
     if not isinstance(finsler_optimizer, str):
         raise TypeError(
-            "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'path_frozen', 'soft_bf', None}."
+            "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'finsler_umap', 'path_frozen', 'soft_bf', None}."
         )
     optimizer = finsler_optimizer.lower()
     if optimizer in {"smacof", "randers_smacof", "smacof_randers"}:
         return "smacof"
     if optimizer in {"gradient_descent", "gd"}:
         return "gradient_descent"
+    if optimizer in {"finsler_umap", "fumap"}:
+        return "finsler_umap"
     if optimizer in {"path_frozen", "frozen_paths"}:
         return "path_frozen"
     if optimizer in {"soft_bf", "soft_bellman_ford", "sbf"}:
         return "soft_bf"
     raise ValueError(
-        "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'path_frozen', 'soft_bf', None}."
+        "finsler_optimizer must be one of {'smacof', 'gradient_descent', 'finsler_umap', 'path_frozen', 'soft_bf', None}."
     )
 
 

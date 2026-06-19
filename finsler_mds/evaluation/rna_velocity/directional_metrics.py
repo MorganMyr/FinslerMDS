@@ -63,6 +63,13 @@ class ICVCohResult:
     clusters: dict[object, ClusterCoherenceScore]
 
 
+@dataclass(frozen=True)
+class GVCohResult:
+    score: float
+    mean_direction: np.ndarray
+    n_vectors: int
+
+
 def project_velocity_graph_to_embedding(
         embedding,
         transition_graph,
@@ -224,6 +231,38 @@ def in_cluster_velocity_coherence(
 
     score = _nanmean_concatenated(all_cell_scores)
     return ICVCohResult(score=score, clusters=cluster_scores)
+
+
+def global_velocity_coherence(
+        embedding,
+        *,
+        velocity_vectors=None,
+        transition_graph=None,
+        eps=1e-12,
+):
+    """Compute global velocity coherence as a mean resultant length.
+
+    Each nonzero projected velocity is normalized to unit length, then the
+    score is the norm of their mean vector. It is close to 1 when projected
+    velocities share a common direction and close to 0 when they cancel out.
+    """
+    X = _validate_embedding(embedding)
+    velocities = _resolve_embedding_velocities(
+        X,
+        velocity_vectors=velocity_vectors,
+        transition_graph=transition_graph,
+    )
+    norms = np.linalg.norm(velocities, axis=1)
+    valid = np.isfinite(norms) & (norms > eps)
+    if not np.any(valid):
+        return GVCohResult(score=np.nan, mean_direction=np.full(X.shape[1], np.nan), n_vectors=0)
+    unit_velocities = velocities[valid] / norms[valid, None]
+    mean_direction = np.mean(unit_velocities, axis=0)
+    return GVCohResult(
+        score=float(np.linalg.norm(mean_direction)),
+        mean_direction=mean_direction,
+        n_vectors=int(np.count_nonzero(valid)),
+    )
 
 
 def build_boundary_neighbor_plan(labels, cluster_edges, neighbor_indices, *, n_neighbors=None):

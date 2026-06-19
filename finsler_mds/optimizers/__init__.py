@@ -9,6 +9,11 @@ from .gradient_descent import (
     gradient_descent,
     optimize_gradient_descent,
 )
+from .finsler_umap import (
+    FinslerUmapResult,
+    finsler_umap,
+    optimize_finsler_umap,
+)
 from .path_frozen import (
     PathFrozenResult,
     optimize_path_frozen,
@@ -36,6 +41,9 @@ __all__ = [
     "GradientDescentResult",
     "gradient_descent",
     "optimize_gradient_descent",
+    "FinslerUmapResult",
+    "finsler_umap",
+    "optimize_finsler_umap",
     "PathFrozenResult",
     "path_frozen",
     "optimize_path_frozen",

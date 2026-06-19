@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from finsler_mds.evaluation.rna_velocity import cross_boundary_direction_correctness
-from finsler_mds.utils.pancreas import PANCREAS_TRANSITIONS, project_velocity_to_embedding
+from finsler_mds.utils.pancreas import PANCREAS_TRANSITIONS
 from scripts.evaluate_pancreas_embedding import (
     N_EVAL_NEIGHBORS,
     append_csv,
@@ -25,6 +25,7 @@ from scripts.evaluate_pancreas_embedding import (
     load_pancreas_evaluation_context,
     load_velocity_dissimilarities,
     make_pair_weights,
+    project_velocity_to_embedding_from_transition,
 )
 from scripts.main_pancreas import (
     cache_token,
@@ -38,25 +39,28 @@ from scripts.main_pancreas import (
 
 SEED = 42
 DISTANCE_REWEIGHTING = {"power": 0.0, "epsilon": 1e-6}
+VELOCITY_COS_CLIP = 1
 SELECTED_FRONTIERS = "all"
 CRW_VALUES = [0.0, 0.5, 1.0]
-AFPW_VALUES = [1.0, 20.0, 100.0]
-SKIP_BASE_WEIGHT = True
+AFPW_VALUES = [1.0, 20.0, 50.0, 100.0, 200.0]
+SKIP_BASE_WEIGHT = False
 OVERWRITE_CSV = False
 
 TESTS = [
-    {"label": "v2_a0p6_3d_mats", "v_alpha": 2.0, "alpha": 0.6, "dim": 3, "metric": "matsumoto"},
+    {"label": "v0p5_a0p9_2d_r", "v_alpha": 0.5, "alpha": 0.9, "dim": 2, "metric": "randers"},
+    
 ]
 
 GD_OPTIONS = {"max_iter": 100}
 PF_STAGE1 = {"outer_iter": 25, "inner_iter": 30}
 PF_FINISHER = {"outer_iter": 15, "inner_iter": 3}
+SKIP_PF = True
 
 PANCREAS_DIR = SCRIPT_DIR / "res" / "pancreas"
 RAW_DIR = PANCREAS_DIR / "raw"
 FIG_DIR = PANCREAS_DIR
 EVAL_DIR = PANCREAS_DIR / "rna_velocity_evaluation"
-CSV_PATH = EVAL_DIR / "pancreas_v1_a0p8_2d_crw_afpw_gd_pf_drw0_campaign.csv"
+CSV_PATH = EVAL_DIR / "pancreas_crw_afpw_gd_pf_drw0_campaign.csv"
 
 
 def main():
@@ -78,15 +82,17 @@ def main():
                     context = load_pancreas_evaluation_context(RAW_DIR, EVAL_DIR, n_eval_neighbors=N_EVAL_NEIGHBORS)
                 append_stage_row("gd", gd_npz, test, crw, afpw, context)
 
-                run_main(test, crw, afpw, optimizer="path_frozen", init=gd_npz.name, extra={"path_frozen": PF_STAGE1})
-                require_file(pf_npz)
-                stage1_npz = copy_with_suffix(pf_npz, "stage1")
-                stage1_fig = copy_with_suffix(pf_fig, "stage1") if pf_fig.exists() else None
-                append_stage_row("pf_stage1", stage1_npz, test, crw, afpw, context, figure_path=stage1_fig)
+                if not SKIP_PF:
+                    run_main(test, crw, afpw, optimizer="path_frozen", init=gd_npz.name, extra={"path_frozen": PF_STAGE1})
+                    require_file(pf_npz)
+                    stage1_npz = copy_with_suffix(pf_npz, "stage1")
+                    stage1_fig = copy_with_suffix(pf_fig, "stage1") if pf_fig.exists() else None
+                    append_stage_row("pf_stage1", stage1_npz, test, crw, afpw, context, figure_path=stage1_fig)
 
-                run_main(test, crw, afpw, optimizer="path_frozen", init=stage1_npz.name, extra={"path_frozen": PF_FINISHER})
-                require_file(pf_npz)
-                append_stage_row("pf_final", pf_npz, test, crw, afpw, context)
+                    run_main(test, crw, afpw, optimizer="path_frozen", init=stage1_npz.name, extra={"path_frozen": PF_FINISHER})
+                    require_file(pf_npz)
+                    append_stage_row("pf_final", pf_npz, test, crw, afpw, context)
+                
                 plt.close("all")
 
     print(f"\nSaved campaign CSV: {CSV_PATH}")
@@ -103,7 +109,7 @@ def run_main(test, crw, afpw, *, optimizer, init, extra):
         "frontier_pairs_weight": afpw,
         "selected_frontiers": SELECTED_FRONTIERS,
         "distance_reweighting": DISTANCE_REWEIGHTING,
-        "velocity": {"alpha": test["v_alpha"]},
+        "velocity": {"alpha": test["v_alpha"], "cos_clip": VELOCITY_COS_CLIP},
     }
     overrides.update(extra)
     main_pancreas(overrides)
@@ -143,7 +149,7 @@ def append_stage_row(stage, embedding_path, test, crw, afpw, context, figure_pat
         RAW_DIR,
         velocity_alpha=test["v_alpha"],
         distance_formula="randers",
-        cos_clip=0.4,
+        cos_clip=VELOCITY_COS_CLIP,
         kNN_euclid=30,
         kNN_finsler=0,
     )
@@ -160,6 +166,9 @@ def append_stage_row(stage, embedding_path, test, crw, afpw, context, figure_pat
         neighbor_indices=context.expression_neighbors,
         n_neighbors=context.n_eval_neighbors,
     )
+    if weight is None:
+        weight = np.ones_like(dists, dtype=float)
+        np.fill_diagonal(weight, 0.0)
     metric = make_embedding_metric({"kind": test["metric"], "alpha": test["alpha"]})
     row = evaluate_embedding(
         name=embedding_path.stem,
@@ -213,7 +222,10 @@ def stage_row_exists(stage, test, crw, afpw, embedding_path):
 
 
 def cbdir_breakdown(embedding, context):
-    velocity_embedding = project_velocity_to_embedding(context.adata, embedding)
+    velocity_embedding = project_velocity_to_embedding_from_transition(
+        context.velocity_transition,
+        embedding,
+    )
     result = cross_boundary_direction_correctness(
         embedding,
         context.labels,

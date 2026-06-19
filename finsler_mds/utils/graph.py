@@ -166,6 +166,7 @@ def velocity_directed_graph(
 
     - ``"exponential"``: ``||X_j - X_i|| * exp(-alpha * cos(theta))``.
     - ``"randers"``: ``||X_j - X_i|| * (1 - alpha * cos(theta))``.
+    - ``"matsumoto"``: ``||X_j - X_i|| / (1 + alpha * cos(theta))``.
 
     If ``cos_clip`` is not ``None``, cosines are clipped to
     ``[-cos_clip, cos_clip]`` before applying either formula.
@@ -183,11 +184,11 @@ def velocity_directed_graph(
         cos_clip = float(cos_clip)
         if not 0 <= cos_clip <= 1:
             raise ValueError("cos_clip must be None or a float in [0, 1].")
-    if distance_formula == "randers":
+    if distance_formula in {"randers", "matsumoto"}:
         max_cos = 1.0 if cos_clip is None else cos_clip
         if alpha < 0 or alpha * max_cos >= 1:
             raise ValueError(
-                "Randers velocity distances require alpha >= 0 and "
+                f"{distance_formula.title()} velocity distances require alpha >= 0 and "
                 "alpha * max(|cos|) < 1. Lower alpha or set a smaller cos_clip."
             )
 
@@ -248,6 +249,8 @@ def velocity_directed_graph(
         edge_weights = edge_lengths * np.exp(-alpha * cosines)
     elif distance_formula == "randers":
         edge_weights = edge_lengths * (1 - alpha * cosines)
+    elif distance_formula == "matsumoto":
+        edge_weights = edge_lengths / (1 + alpha * cosines)
     else:  # pragma: no cover - guarded by normalization
         raise RuntimeError(f"Unhandled velocity distance formula {distance_formula!r}.")
 
@@ -298,6 +301,8 @@ def _velocity_finsler_knn_support(
             weights = lengths * np.exp(-alpha * cosines)
         elif distance_formula == "randers":
             weights = lengths * (1 - alpha * cosines)
+        elif distance_formula == "matsumoto":
+            weights = lengths / (1 + alpha * cosines)
         else:  # pragma: no cover - guarded by normalization
             raise RuntimeError(f"Unhandled velocity distance formula {distance_formula!r}.")
         weights[np.arange(stop - start), np.arange(start, stop)] = np.inf
@@ -379,7 +384,7 @@ def compute_velocity_dist_matrix(
 
 def _normalize_velocity_distance_formula(distance_formula):
     if not isinstance(distance_formula, str):
-        raise TypeError("distance_formula must be 'exponential' or 'randers'.")
+        raise TypeError("distance_formula must be 'exponential', 'randers', or 'matsumoto'.")
     formula = distance_formula.lower()
     aliases = {
         "exp": "exponential",
@@ -388,9 +393,12 @@ def _normalize_velocity_distance_formula(distance_formula):
         "randers": "randers",
         "local_randers": "randers",
         "linear_randers": "randers",
+        "mats": "matsumoto",
+        "matsumoto": "matsumoto",
+        "local_matsumoto": "matsumoto",
     }
     if formula not in aliases:
-        raise ValueError("distance_formula must be 'exponential' or 'randers'.")
+        raise ValueError("distance_formula must be 'exponential', 'randers', or 'matsumoto'.")
     return aliases[formula]
 
 

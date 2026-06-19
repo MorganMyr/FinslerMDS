@@ -1,4 +1,5 @@
 from .api import fit_finsler_mds
+from .optimizers import FinslerUmapResult, finsler_umap, optimize_finsler_umap
 from .evaluation import (
     AsymmetryPreservationResult,
     DistanceEmbeddingEvaluation,
@@ -18,6 +19,7 @@ from .evaluation import (
 )
 from .evaluation.rna_velocity import (
     cross_boundary_direction_correctness,
+    global_velocity_coherence,
     in_cluster_velocity_coherence,
     project_velocity_graph_to_embedding,
 )
@@ -36,6 +38,9 @@ from .metrics import (
 
 __all__ = [
     "fit_finsler_mds",
+    "FinslerUmapResult",
+    "finsler_umap",
+    "optimize_finsler_umap",
     "geodesic_embedding_stress",
     "evaluate_geodesic_stress",
     "AsymmetryPreservationResult",
@@ -52,6 +57,7 @@ __all__ = [
     "summarize_asymmetry_preservation",
     "stretch_summary",
     "cross_boundary_direction_correctness",
+    "global_velocity_coherence",
     "in_cluster_velocity_coherence",
     "project_velocity_graph_to_embedding",
     "AlphaBetaMetric",

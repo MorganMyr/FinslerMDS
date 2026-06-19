@@ -8,6 +8,7 @@ from time import perf_counter
 from finsler_mds.metrics import RandersMetric
 from finsler_mds.optimizers import (
     datasp,
+    finsler_umap,
     gradient_descent,
     path_frozen,
     relaxed_bellman_ford,
@@ -19,6 +20,8 @@ from finsler_mds.optimizers import (
 _OPTIMIZERS = {
     "gradient_descent": gradient_descent,
     "gd": gradient_descent,
+    "finsler_umap": finsler_umap,
+    "fumap": finsler_umap,
     "path_frozen": path_frozen,
     "frozen_paths": path_frozen,
     "datasp": datasp,
