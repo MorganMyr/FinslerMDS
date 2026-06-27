@@ -124,22 +124,23 @@ def dataset_dirs(dataset_name):
     )
 
 
-def load_benchmark_dataset(dataset_name, raw_dir):
+def load_benchmark_dataset(dataset_name, raw_dir, *, n_samples=None):
+    n_samples = N_SAMPLES if n_samples is None else int(n_samples)
     if dataset_name == "branching":
-        return load_branching_dataset(raw_dir)
+        return load_branching_dataset(raw_dir, n_samples=n_samples)
     if dataset_name == "swiss_roll":
-        return load_swiss_roll_dataset(raw_dir)
+        return load_swiss_roll_dataset(raw_dir, n_samples=n_samples)
     raise RuntimeError(f"Unhandled dataset {dataset_name!r}.")
 
 
-def load_branching_dataset(raw_dir):
+def load_branching_dataset(raw_dir, *, n_samples):
     stem = (
-        f"branching_n{N_SAMPLES}_k{branching.GRAPH_NEIGHBORS}_"
+        f"branching_n{n_samples}_k{branching.GRAPH_NEIGHBORS}_"
         f"w{branching.format_float(branching.CORRIDOR_WIDTH)}_s{branching.SEED}"
     )
     dataset = branching.load_or_create_dataset(
         raw_dir / f"{stem}_dataset.npz",
-        n_samples=N_SAMPLES,
+        n_samples=n_samples,
         graph_neighbors=branching.GRAPH_NEIGHBORS,
         corridor_width=branching.CORRIDOR_WIDTH,
         seed=branching.SEED,
@@ -161,9 +162,9 @@ def load_branching_dataset(raw_dir):
     )
 
 
-def load_swiss_roll_dataset(raw_dir):
+def load_swiss_roll_dataset(raw_dir, *, n_samples):
     stem = (
-        f"swiss_n{N_SAMPLES}_k{SWISS_ROLL_K}_"
+        f"swiss_n{n_samples}_k{SWISS_ROLL_K}_"
         f"ma{branching.format_float(SWISS_ROLL_ALPHA_MANIFOLD)}_"
         f"ea{branching.format_float(SWISS_ROLL_ALPHA_EMBEDDING)}_s{branching.SEED}"
     )
@@ -173,10 +174,10 @@ def load_swiss_roll_dataset(raw_dir):
         data = np.load(path)
         return swiss_roll_benchmark_dataset(data["D"], data["init"])
 
-    print(f"Creating Swiss roll benchmark data: n={N_SAMPLES}, k={SWISS_ROLL_K}")
+    print(f"Creating Swiss roll benchmark data: n={n_samples}, k={SWISS_ROLL_K}")
     rng = np.random.default_rng(branching.SEED)
-    params = rng.random((N_SAMPLES, 2))
-    x = np.empty((N_SAMPLES, 2), dtype=float)
+    params = rng.random((n_samples, 2))
+    x = np.empty((n_samples, 2), dtype=float)
     x[:, 0] = params[:, 0] * 3 * np.pi + 1.5 * np.pi
     x[:, 1] = params[:, 1] * 20
 
@@ -190,7 +191,7 @@ def load_swiss_roll_dataset(raw_dir):
     init = isomap.fit_transform(X)
 
     tangent_x = np.cos(x[:, 0]) - x[:, 0] * np.sin(x[:, 0])
-    tangent_y = np.zeros(N_SAMPLES)
+    tangent_y = np.zeros(n_samples)
     tangent_z = np.sin(x[:, 0]) + x[:, 0] * np.cos(x[:, 0])
     randers_field = np.stack([tangent_x, tangent_y, tangent_z], axis=1)
     randers_field /= np.linalg.norm(randers_field, axis=1)[:, None]

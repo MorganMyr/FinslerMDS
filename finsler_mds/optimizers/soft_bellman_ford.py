@@ -8,13 +8,13 @@ explicitly through the relaxation trace.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 import warnings
 
 import numpy as np
 import scipy.optimize
 from sklearn.utils import check_random_state
 
-from finsler_mds.evaluation import geodesic_embedding_stress
 from finsler_mds.optimizers.common import (
     initial_embedding,
     prepare_weights_and_mask,
@@ -25,6 +25,8 @@ from finsler_mds.optimizers.path_frozen import (
     _add_raw_objective,
     _cupy_metric_length_and_grad,
     _GpuDirectPairsObjective,
+    _full_geodesic_stress,
+    _full_stress_active_mask_and_denominator,
     _gpu_metric_supported,
     _load_cupy,
     _geodesic_source_count,
@@ -48,6 +50,9 @@ class SoftBellmanFordResult:
     n_iter: int
     n_graph_updates: int
     optimizer_results: list
+    history: list
+    final_full_geodesic_stress: float | None = None
+    final_normalized_full_geodesic_stress: float | None = None
 
 
 @dataclass(frozen=True)
@@ -112,12 +117,21 @@ def _resolve_gpu_backend(device, metric, verbose):
     return cp
 
 
-def _support_from_embedding(X, *, graph_neighbors, neighbors_algorithm, n_jobs):
+def _support_from_embedding(
+        X,
+        *,
+        graph_neighbors,
+        neighbors_algorithm,
+        n_jobs,
+        warn_on_connect=False,
+):
     support = symmetric_knn_graph(
         X,
         n_neighbors=graph_neighbors,
         neighbors_algorithm=neighbors_algorithm,
         n_jobs=n_jobs,
+        ensure_connected=True,
+        warn_on_connect=warn_on_connect,
     ).tocoo()
     return _GraphSupport(
         rows=support.row.astype(int, copy=False),
@@ -621,6 +635,7 @@ def soft_bellman_ford(
     local_pair_mode="direct",
     landmark_indices=None,
     n_global_landmarks=0,
+    landmark_sampling="random",
     mask_random_state=None,
     max_global_targets_per_source=None,
     target_random_state=None,
@@ -633,6 +648,7 @@ def soft_bellman_ford(
     method="L-BFGS-B",
     optimizer_options=None,
     log_frequency=None,
+    record_history=False,
     neighbors_algorithm="auto",
     n_jobs=None,
     prob_dtype=np.float32,
@@ -646,8 +662,11 @@ def soft_bellman_ford(
     local Finsler constraints instead of launching soft Bellman-Ford from every
     point. Pass ``local_pair_mode="geodesic"`` to run soft Bellman-Ford from
     local sources too. ``device="auto"`` uses a CuPy backend when available.
+    ``landmark_sampling`` is one of ``"random"`` or ``"farthest"``.
     ``log_frequency`` controls progress-line frequency across graph updates,
-    with the same adaptive default as ``path_frozen``.
+    with the same adaptive default as ``path_frozen``. With ``verbose >= 2``
+    or ``record_history=True``, logged updates also record the all-pairs hard
+    geodesic stress. Its evaluation time is excluded from ``elapsed``.
     """
     metric = validate_metric(metric)
     if beta <= 0:
@@ -657,6 +676,7 @@ def soft_bellman_ford(
     _validate_on_unreachable(on_unreachable)
 
     D, W = prepare_weights_and_mask(dissimilarities, weight)
+    full_active_mask, full_denominator = _full_stress_active_mask_and_denominator(D, W)
     if n_relaxations is None:
         n_relaxations = D.shape[0] - 1
     if n_relaxations < 0:
@@ -676,6 +696,7 @@ def soft_bellman_ford(
         local_pair_mode=local_pair_mode,
         landmark_indices=landmark_indices,
         n_global_landmarks=n_global_landmarks,
+        landmark_sampling=landmark_sampling,
         random_state=mask_random_state,
         local_weight=local_weight,
         local_global_reweighting=local_global_reweighting,
@@ -709,9 +730,15 @@ def soft_bellman_ford(
         options.update(optimizer_options)
 
     optimizer_results = []
+    history = []
+    last_logged_graph_update = None
+    last_full_stress = None
+    last_normalized_full_stress = None
     total_iter = 0
     stress = np.inf
     log_frequency = _resolve_log_frequency(log_frequency, n_graph_updates)
+    optimization_start = perf_counter()
+    logging_elapsed = 0.0
 
     if verbose:
         sampled_global_n_pairs = _sampled_pair_count(global_pairs, max_global_targets_per_source)
@@ -753,6 +780,7 @@ def soft_bellman_ford(
                 graph_neighbors=graph_neighbors,
                 neighbors_algorithm=neighbors_algorithm,
                 n_jobs=n_jobs,
+                warn_on_connect=verbose >= 1,
             )
 
             if gpu_backend is not None:
@@ -836,27 +864,81 @@ def soft_bellman_ford(
                 stacklevel=2,
             )
 
-        if verbose and _should_log_iteration(graph_update, n_graph_updates, log_frequency):
+        should_log = _should_log_iteration(graph_update, n_graph_updates, log_frequency)
+        should_record_full = (record_history or verbose >= 2) and should_log
+        should_print = verbose and should_log
+        if should_record_full or should_print:
             nit = getattr(result, "nit", "?")
             nfev = getattr(result, "nfev", "?")
-            print(
-                f"soft_bellman_ford graph update {graph_update}: stress {stress} "
-                f"(nit={nit}, nfev={nfev})"
-            )
+            elapsed = perf_counter() - optimization_start - logging_elapsed
+            if should_record_full:
+                log_start = perf_counter()
+                full_stress, normalized_full_stress = _full_geodesic_stress(
+                    X,
+                    D,
+                    W,
+                    metric=metric,
+                    active_mask=full_active_mask,
+                    denominator=full_denominator,
+                    graph_neighbors=graph_neighbors,
+                    neighbors_algorithm=neighbors_algorithm,
+                    n_jobs=n_jobs,
+                    ensure_connected_graph=True,
+                    warn_on_connect=verbose >= 1,
+                )
+                logging_elapsed += perf_counter() - log_start
+                history.append(
+                    {
+                        "graph_update": graph_update,
+                        "elapsed": elapsed,
+                        "masked_stress": stress,
+                        "full_geodesic_stress": full_stress,
+                        "normalized_full_geodesic_stress": normalized_full_stress,
+                        "nit": nit,
+                        "nfev": nfev,
+                    }
+                )
+                last_logged_graph_update = graph_update
+                last_full_stress = full_stress
+                last_normalized_full_stress = normalized_full_stress
+            if verbose >= 2:
+                print(
+                    f"soft_bellman_ford graph update {graph_update}: "
+                    f"masked stress {stress}, full geodesic stress {full_stress}, "
+                    f"normalized {normalized_full_stress} "
+                    f"(elapsed={elapsed:.3f}s, nit={nit}, nfev={nfev})"
+                )
+            elif should_print:
+                print(
+                    f"soft_bellman_ford graph update {graph_update}: stress {stress} "
+                    f"(nit={nit}, nfev={nfev})"
+                )
 
-    if verbose:
-        full_stress = geodesic_embedding_stress(
-            X,
-            D,
-            metric=metric,
-            n_neighbors=graph_neighbors,
-            weight=W,
-            normalized_stress=normalized_stress,
-            neighbors_algorithm=neighbors_algorithm,
-            n_jobs=n_jobs,
-            on_unreachable="inf",
-        )
-        print(f"soft_bellman_ford final full geodesic stress: {full_stress}")
+    final_full_stress = None
+    final_normalized_full_stress = None
+    if verbose or record_history:
+        if last_logged_graph_update == graph_update:
+            final_full_stress = last_full_stress
+            final_normalized_full_stress = last_normalized_full_stress
+        else:
+            final_full_stress, final_normalized_full_stress = _full_geodesic_stress(
+                X,
+                D,
+                W,
+                metric=metric,
+                active_mask=full_active_mask,
+                denominator=full_denominator,
+                graph_neighbors=graph_neighbors,
+                neighbors_algorithm=neighbors_algorithm,
+                n_jobs=n_jobs,
+                ensure_connected_graph=True,
+                warn_on_connect=verbose >= 1,
+            )
+        if verbose:
+            displayed_full_stress = (
+                final_normalized_full_stress if normalized_stress else final_full_stress
+            )
+            print(f"soft_bellman_ford final full geodesic stress: {displayed_full_stress}")
 
     sbf_result = SoftBellmanFordResult(
         embedding=X,
@@ -864,6 +946,9 @@ def soft_bellman_ford(
         n_iter=total_iter,
         n_graph_updates=n_graph_updates,
         optimizer_results=optimizer_results,
+        history=history,
+        final_full_geodesic_stress=final_full_stress,
+        final_normalized_full_geodesic_stress=final_normalized_full_stress,
     )
 
     if return_result:

@@ -91,10 +91,10 @@ def main_pancreas(config_overrides=None):
     }
     #MDS 2D:
     #gd_2d_vrand0_r0_s42.npz
-    finsler_optimizer = "finsler_umap"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    finsler_optimizer = "gradient_descent"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
     init_finsler_mds = "umap_2D"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
     embedding_dim = 2  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
-    cluster_reweight_rho = 0
+    cluster_reweight_rho = 1
     frontier_pairs_weight = 1
     selected_frontiers = "all"  # one of {"cbdir", "all"}
     distance_reweighting = {"power": 0, "epsilon": 1e-6}
@@ -111,7 +111,7 @@ def main_pancreas(config_overrides=None):
         "version": "corrected",
     }
     gradient_descent = {
-        "max_iter": 10,
+        "max_iter": 100,
         "eps": 1e-8,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-10, "maxls": 80, "maxcor": 30},
@@ -697,7 +697,6 @@ def main_pancreas(config_overrides=None):
                 f"Running {embedding_dim}D Randers SMACOF alpha={alpha_embedding} "
                 f"from {init_description}"
             )
-            smacof_device = "cpu" if alpha_embedding <= 0 else smacof["device"]
             proj_finsler, stress_finsler, smacof_n_iter = fit_finsler_mds(
                 dists_velocity,
                 metric=smacof_metric_obj,
@@ -711,7 +710,7 @@ def main_pancreas(config_overrides=None):
                 pseudo_inv_solver="gmres",
                 project_on_V=smacof["project_on_V"],
                 check_monotony=smacof["check_monotony"],
-                device=smacof_device,
+                device=smacof["device"],
                 weight=pair_weight,
                 version=smacof["version"],
                 return_n_iter=True,

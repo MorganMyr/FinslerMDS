@@ -62,13 +62,16 @@ def _load_cupy():
     return cp, None
 
 
-def _resolve_gpu_backend(device, alpha, verbose):
+def _resolve_gpu_backend(device, alpha, verbose, *, allow_zero_alpha=False):
     if device not in {"cpu", "auto", "gpu", "cuda"}:
         raise ValueError("device must be one of 'cpu', 'auto', 'gpu', or 'cuda'.")
     if device == "cpu":
         return None
-    if alpha <= 0:
-        message = "smacof_randers GPU backend currently requires metric.alpha > 0."
+    if alpha < 0 or (alpha == 0 and not allow_zero_alpha):
+        message = (
+            "smacof_randers GPU backend requires metric.alpha > 0, "
+            "except for alpha=0 with uniform weights and project_on_V=True."
+        )
         if device == "auto":
             if verbose:
                 print(message + " Falling back to CPU.")
@@ -483,7 +486,19 @@ def _smacof_randers_single(
                 f"got {X.shape}."
             )
 
-    gpu_backend = _resolve_gpu_backend(device, alpha, verbose)
+    uniform_offdiag_weight = _uniform_offdiag_weight(weight)
+    use_uniform_euclidean_update = (
+        alpha == 0
+        and project_on_V
+        and uniform_offdiag_weight is not None
+    )
+
+    gpu_backend = _resolve_gpu_backend(
+        device,
+        alpha,
+        verbose,
+        allow_zero_alpha=use_uniform_euclidean_update,
+    )
     if gpu_backend is not None:
         return _smacof_randers_single_gpu(
             dissimilarities,
@@ -501,18 +516,12 @@ def _smacof_randers_single(
             corrected=corrected,
         )
 
-    uniform_offdiag_weight = _uniform_offdiag_weight(weight)
     use_uniform_projected_update = (
         alpha > 0
         and project_on_V
         and uniform_offdiag_weight is not None
     )
     V = None if use_uniform_projected_update else _laplacian_from_weights(weight)
-    use_uniform_euclidean_update = (
-        alpha == 0
-        and project_on_V
-        and uniform_offdiag_weight is not None
-    )
     V_pinv = None if alpha > 0 or use_uniform_euclidean_update else np.linalg.pinv(V)
 
     right_mat = np.zeros((n_components, n_components))
