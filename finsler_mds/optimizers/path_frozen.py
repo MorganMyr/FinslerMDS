@@ -18,24 +18,27 @@ import scipy.optimize
 from scipy.sparse.csgraph import dijkstra
 from sklearn.utils import check_random_state
 
-from finsler_mds.metrics import (
-    ConvexifiedMatsumotoMetric,
-    ConvexifiedToblerMetric,
-    MatsumotoMetric,
-    RandersMetric,
-)
 from finsler_mds.evaluation.distance_embedding import compute_embedding_distances
 from finsler_mds.optimizers.common import (
     initial_embedding,
     prepare_weights_and_mask,
     validate_metric,
 )
+from finsler_mds.optimizers.direct_stress import build_direct_stress_objective
+from finsler_mds.optimizers.metric_kernels import (
+    cupy_metric_length_and_grad,
+    gpu_metric_supported,
+)
 from finsler_mds.optimizers.pair_groups import (
-    ActivePairs as _ActivePairs,
-    build_local_global_pairs,
+    active_pairs_from_landmarks,
+    active_pairs_from_mask,
+    allowed_pair_mask,
+    build_local_pair_mask,
     empty_active_pairs,
     merge_active_pairs,
+    reweight_local_global_pairs,
     sample_active_pairs,
+    select_landmarks,
 )
 from finsler_mds.utils.graph import (
     metric_graph_from_support,
@@ -119,6 +122,18 @@ def _should_log_iteration(iteration, max_iter, log_frequency):
     return iteration == 0 or iteration == max_iter - 1 or iteration % log_frequency == 0
 
 
+def _validate_path_frozen_local_pair_mode(local_pair_mode):
+    if local_pair_mode not in {"direct", "geodesic"}:
+        raise ValueError("local_pair_mode must be 'direct' or 'geodesic'.")
+    return local_pair_mode
+
+
+def _validate_path_frozen_reweighting(mode):
+    if mode not in {"none", "count", "energy"}:
+        raise ValueError("local_global_reweighting must be 'none', 'count', or 'energy'.")
+    return mode
+
+
 def _sampled_pair_count(active_pairs, max_targets_per_source):
     if max_targets_per_source is None:
         return active_pairs.n_pairs
@@ -186,26 +201,12 @@ def _full_geodesic_stress(
     return raw_stress, float(normalized)
 
 
-def _gpu_metric_supported(metric):
-    if isinstance(metric, MatsumotoMetric) and metric.forbidden_grad_norm is not None:
-        return False
-    return isinstance(
-        metric,
-        (
-            RandersMetric,
-            MatsumotoMetric,
-            ConvexifiedMatsumotoMetric,
-            ConvexifiedToblerMetric,
-        ),
-    )
-
-
 def _resolve_gpu_backend(device, metric, verbose):
     if device not in {"cpu", "auto", "gpu", "cuda"}:
         raise ValueError("device must be one of 'cpu', 'auto', 'gpu', or 'cuda'.")
     if device == "cpu":
         return None
-    if not _gpu_metric_supported(metric):
+    if not gpu_metric_supported(metric):
         message = (
             "path_frozen GPU backend currently supports RandersMetric, "
             "MatsumotoMetric, ConvexifiedMatsumotoMetric, and "
@@ -235,70 +236,6 @@ def _resolve_gpu_backend(device, metric, verbose):
     return cp
 
 
-def _cupy_metric_length_and_grad(cp, edge_vectors, metric):
-    r = cp.linalg.norm(edge_vectors, axis=1)
-    z = edge_vectors[:, -1]
-    nonzero = r > 1e-12
-    safe_r = cp.where(nonzero, r, 1.0)
-    s = cp.where(nonzero, z / safe_r, 0.0)
-
-    if isinstance(metric, RandersMetric):
-        length = r + metric.alpha * z
-        grad = cp.where(nonzero[:, None], edge_vectors / safe_r[:, None], 0.0)
-        grad[:, -1] += metric.alpha
-        grad = cp.where(nonzero[:, None], grad, 0.0)
-        return length, grad
-
-    if isinstance(metric, MatsumotoMetric):
-        denominator = 1 - metric.alpha * s
-        allowed = denominator > 0
-        phi = cp.where(allowed, 1.0 / denominator, cp.inf)
-        dphi = cp.where(allowed, metric.alpha / denominator**2, cp.nan)
-        if metric.max_phi is not None:
-            clipped = phi >= metric.max_phi
-            phi = cp.minimum(phi, metric.max_phi)
-            dphi = cp.where(clipped, 0.0, dphi)
-        if metric.forbidden_grad_norm is not None and cp.any(~allowed & nonzero).item():
-            raise ValueError(
-                "The path_frozen GPU backend does not support MatsumotoMetric "
-                "with forbidden_grad_norm. Use device='cpu' for this metric."
-            )
-    elif isinstance(metric, ConvexifiedMatsumotoMetric):
-        if metric.alpha == 0:
-            phi = cp.ones_like(s)
-            dphi = cp.zeros_like(s)
-        else:
-            linear = s > 1 / (2 * metric.alpha)
-            denominator = 1 - metric.alpha * s
-            phi = cp.where(linear, 4 * metric.alpha * s, 1 / denominator)
-            dphi = cp.where(linear, 4 * metric.alpha, metric.alpha / denominator**2)
-    elif isinstance(metric, ConvexifiedToblerMetric):
-        slope_denominator = cp.sqrt(cp.maximum(1 - s**2, 0.0))
-        finite_slope = slope_denominator > 1e-12
-        slope = cp.where(finite_slope, s / slope_denominator, cp.sign(s) * cp.inf)
-        dslope = cp.where(finite_slope, 1.0 / slope_denominator**3, cp.inf)
-        shifted = slope + metric.b
-        base_phi = cp.exp(metric.a * cp.abs(shifted)) / metric.speed
-        base_dphi = base_phi * metric.a * cp.sign(shifted) * dslope
-
-        uphill = s > metric.s_uphill
-        downhill = s < metric.s_downhill
-        phi = cp.where(uphill, s / metric.z_max, base_phi)
-        phi = cp.where(downhill, s / metric.z_min, phi)
-        dphi = cp.where(uphill, 1.0 / metric.z_max, base_dphi)
-        dphi = cp.where(downhill, 1.0 / metric.z_min, dphi)
-    else:
-        raise TypeError(f"Unsupported GPU metric {type(metric).__name__}.")
-
-    length = r * phi
-    coeff = phi - s * dphi
-    direction = cp.where(nonzero[:, None], edge_vectors / safe_r[:, None], 0.0)
-    grad = coeff[:, None] * direction
-    grad[:, -1] += dphi
-    grad = cp.where(nonzero[:, None], grad, 0.0)
-    return length, grad
-
-
 class _GpuPathFrozenObjective:
     def __init__(
             self,
@@ -310,14 +247,12 @@ class _GpuPathFrozenObjective:
             metric,
             normalized_stress,
             max_path_edges,
-            direct_pairs=None,
     ):
         self.cp = cp
         self.shape = shape
         self.metric = metric
         self.normalized_stress = normalized_stress
-        direct_pairs = empty_active_pairs() if direct_pairs is None else direct_pairs
-        self.denom = active_pairs.denom + direct_pairs.denom
+        self.denom = active_pairs.denom
 
         path_offsets, path_edge_ids, weights, dissimilarities = _flatten_active_paths(
             forest,
@@ -326,27 +261,6 @@ class _GpuPathFrozenObjective:
         )
         edge_tails = forest.edge_tails
         edge_heads = forest.edge_heads
-        flat_direct = _flatten_pairs(direct_pairs)
-        if flat_direct.n_pairs > 0:
-            direct_edge_ids = np.arange(
-                len(edge_tails),
-                len(edge_tails) + flat_direct.n_pairs,
-                dtype=np.int32,
-            )
-            path_offsets = np.concatenate([
-                path_offsets,
-                path_offsets[-1] + np.arange(1, flat_direct.n_pairs + 1, dtype=np.int64),
-            ])
-            path_edge_ids = np.concatenate([path_edge_ids, direct_edge_ids])
-            weights = np.concatenate([weights, flat_direct.weights])
-            dissimilarities = np.concatenate([dissimilarities, flat_direct.dissimilarities])
-            edge_tails = np.concatenate([edge_tails, flat_direct.sources])
-            edge_heads = np.concatenate([edge_heads, flat_direct.targets])
-            if max_path_edges is not None and len(path_edge_ids) > max_path_edges:
-                raise MemoryError(
-                    "Flattened frozen paths exceed gpu_max_path_edges="
-                    f"{max_path_edges}. Increase the limit or use device='cpu'."
-                )
         path_counts = np.diff(path_offsets)
         path_ids = np.repeat(np.arange(len(path_counts), dtype=np.int32), path_counts)
 
@@ -365,7 +279,7 @@ class _GpuPathFrozenObjective:
         grad = cp.zeros_like(X)
 
         edge_vectors = X[self.edge_heads] - X[self.edge_tails]
-        edge_lengths, edge_grads = _cupy_metric_length_and_grad(cp, edge_vectors, self.metric)
+        edge_lengths, edge_grads = cupy_metric_length_and_grad(cp, edge_vectors, self.metric)
         if (
             not cp.all(cp.isfinite(edge_lengths)).item()
             or not cp.all(cp.isfinite(edge_grads)).item()
@@ -455,7 +369,7 @@ class _GpuDirectPairsObjective:
             return 0.0, cp.asnumpy(grad).ravel()
 
         vectors = X[self.targets] - X[self.sources]
-        lengths, edge_grads = _cupy_metric_length_and_grad(cp, vectors, self.metric)
+        lengths, edge_grads = cupy_metric_length_and_grad(cp, vectors, self.metric)
         if (
             not cp.all(cp.isfinite(lengths)).item()
             or not cp.all(cp.isfinite(edge_grads)).item()
@@ -607,14 +521,6 @@ def _path_frozen_stress_and_grad(
     return float(stress), grad.ravel()
 
 
-def _direct_pairs_stress_and_grad(X_flat, *, shape, direct_pairs, metric):
-    return _DirectPairsObjective(
-        shape=shape,
-        direct_pairs=direct_pairs,
-        metric=metric,
-    )(X_flat)
-
-
 def _normalize_stress_and_grad(raw_stress, grad_flat, denom, *, normalized_stress):
     if not normalized_stress:
         return float(raw_stress), grad_flat
@@ -631,9 +537,8 @@ def _add_raw_objective(
         raw_objective,
         *,
         shape,
-        direct_pairs=None,
         direct_objective=None,
-        metric=None,
+        direct_regularizer=None,
         denom,
         normalized_stress,
 ):
@@ -649,17 +554,11 @@ def _add_raw_objective(
         direct_stress, direct_grad = direct_objective(X_flat)
         raw_stress += direct_stress
         grad += direct_grad
-    elif direct_pairs is not None and direct_pairs.n_pairs > 0:
-        if metric is None:
-            raise ValueError("metric is required when direct_objective is not provided.")
-        direct_stress, direct_grad = _direct_pairs_stress_and_grad(
-            X_flat,
-            shape=shape,
-            direct_pairs=direct_pairs,
-            metric=metric,
-        )
-        raw_stress += direct_stress
-        grad += direct_grad
+
+    if direct_regularizer is not None:
+        regularizer_stress, regularizer_grad = direct_regularizer(X_flat)
+        raw_stress += regularizer_stress
+        grad += regularizer_grad
 
     denom_value = denom() if callable(denom) else denom
     return _normalize_stress_and_grad(
@@ -788,16 +687,22 @@ def path_frozen(
     local_pair_mode="geodesic",
     landmark_indices=None,
     n_landmark=0,
-    landmark_sampling="random",
+    random_landmark_fraction=1.0,
+    fps_init="diameter_pair",
+    resample_random_landmarks=False,
     mask_random_state=None,
     targets_per_landmark=None,
     target_random_state=None,
     local_weight=1.0,
     local_global_reweighting="none",
+    direct_stress_weight=0.0,
+    direct_stress_mode="hinge",
+    direct_stress_margin=0.5,
     device="cpu",
     gpu_max_path_edges=100_000_000,
     method="L-BFGS-B",
     optimizer_options=None,
+    outer_step_size=1.0,
     log_frequency=None,
     record_history=False,
     neighbors_algorithm="auto",
@@ -817,9 +722,17 @@ def path_frozen(
         graph-geodesic objective. Pass ``local_pair_mode="direct"`` to use
         direct Finsler distances for local pairs instead.
     ``n_landmark`` or ``landmark_indices``
-        Keep all valid outgoing pairs from selected landmark sources.
-        ``landmark_sampling`` controls automatic landmark selection and is one
-        of ``"random"`` or ``"farthest"``.
+        Keep all valid outgoing pairs from selected landmark sources. Automatic
+        landmarks are a mix of fixed farthest-point landmarks and random
+        landmarks. ``random_landmark_fraction=1`` gives fully random landmarks;
+        ``0`` gives fully farthest-point landmarks.
+    ``fps_init``
+        Initialization for farthest-point sampling: ``"diameter_pair"`` or
+        ``"random"``.
+    ``resample_random_landmarks``
+        If True, re-select only the random landmark subset at each outer
+        iteration. Farthest-point landmarks and explicit ``landmark_indices``
+        remain fixed.
     ``pair_mask``
         Restrict all active-pair choices to a user-provided boolean mask.
     ``targets_per_landmark``
@@ -845,8 +758,24 @@ def path_frozen(
     ``record_history``
         If True, record full-stress history at the same frequency as
         ``log_frequency`` without requiring terminal logs.
+    ``outer_step_size``
+        Damping factor applied after each frozen-path inner optimization:
+        ``X <- X_old + outer_step_size * (X_optimized - X_old)``. The default
+        ``1`` keeps the historical behavior.
+    ``direct_stress_weight``
+        Weight of an optional all-pairs direct-distance regularizer. With
+        ``direct_stress_mode="mds"``, this is an ordinary direct Finsler-MDS
+        stress. With ``"hinge"``, only pairs whose direct embedding distance is
+        below ``direct_stress_margin * dissimilarity`` are penalized. The
+        default weight ``0`` disables the term entirely.
     """
     metric = validate_metric(metric)
+    outer_step_size = float(outer_step_size)
+    if not 0.0 <= outer_step_size <= 1.0:
+        raise ValueError("outer_step_size must be between 0 and 1.")
+    random_landmark_fraction = float(random_landmark_fraction)
+    if not 0.0 <= random_landmark_fraction <= 1.0:
+        raise ValueError("random_landmark_fraction must be between 0 and 1.")
     gpu_backend = _resolve_gpu_backend(device, metric, verbose)
     D, W = prepare_weights_and_mask(dissimilarities, weight)
     full_active_mask, full_denominator = _full_stress_active_mask_and_denominator(D, W)
@@ -854,41 +783,104 @@ def path_frozen(
         mask_random_state = random_state
     if target_random_state is None:
         target_random_state = random_state
+    mask_random_state = check_random_state(mask_random_state)
     target_random_state = check_random_state(target_random_state)
-    pair_groups = build_local_global_pairs(
-        D,
-        W,
-        pair_mask=pair_mask,
-        n_local_neighbors=n_local_pairs,
-        local_pair_mode=local_pair_mode,
-        landmark_indices=landmark_indices,
-        n_global_landmarks=n_landmark,
-        landmark_sampling=landmark_sampling,
-        random_state=mask_random_state,
-        local_weight=local_weight,
-        local_global_reweighting=local_global_reweighting,
+
+    allowed = allowed_pair_mask(D, W, pair_mask=pair_mask)
+    use_sparse_builder = (
+        n_local_pairs is not None
+        or landmark_indices is not None
+        or n_landmark > 0
     )
-    global_pairs = pair_groups.global_pairs
-    local_pairs = pair_groups.local_pairs
-    local_geodesic_pairs = local_pairs if local_pair_mode == "geodesic" else empty_active_pairs()
-    direct_pairs = local_pairs if local_pair_mode == "direct" else empty_active_pairs()
+    local_pair_mode = _validate_path_frozen_local_pair_mode(local_pair_mode)
+    local_global_reweighting = _validate_path_frozen_reweighting(local_global_reweighting)
+    local_mask = build_local_pair_mask(D, allowed, n_local_pairs)
+    local_pairs_base = active_pairs_from_mask(D, W, local_mask, allow_empty=True)
+
+    fixed_farthest_landmarks = None
+    if landmark_indices is None and n_landmark > 0 and random_landmark_fraction < 1.0:
+        n_total_landmarks = min(int(n_landmark), D.shape[0])
+        n_random = int(round(random_landmark_fraction * n_total_landmarks))
+        n_farthest = n_total_landmarks - min(max(n_random, 0), n_total_landmarks)
+        fixed_farthest_landmarks = select_landmarks(
+            D,
+            landmark_indices=None,
+            n_global_landmarks=n_farthest,
+            random_landmark_fraction=0.0,
+            fps_init=fps_init,
+            random_state=mask_random_state,
+        )
+
+    def make_pair_groups():
+        if use_sparse_builder:
+            landmarks = select_landmarks(
+                D,
+                landmark_indices=landmark_indices,
+                n_global_landmarks=n_landmark,
+                random_landmark_fraction=random_landmark_fraction,
+                fps_init=fps_init,
+                random_state=mask_random_state,
+                fixed_farthest_landmarks=fixed_farthest_landmarks,
+            )
+            global_pairs_base = active_pairs_from_landmarks(D, W, allowed, local_mask, landmarks)
+        else:
+            global_mask = allowed.copy()
+            global_pairs_base = active_pairs_from_mask(D, W, global_mask, allow_empty=True)
+        return reweight_local_global_pairs(
+            global_pairs_base,
+            local_pairs_base,
+            local_pair_mode=local_pair_mode,
+            mode=local_global_reweighting,
+            local_weight=local_weight,
+        )
+
+    resample_landmarks = (
+        bool(resample_random_landmarks)
+        and landmark_indices is None
+        and n_landmark > 0
+        and random_landmark_fraction > 0.0
+    )
+    first_pair_groups = make_pair_groups()
+    static_pair_groups = None if resample_landmarks else first_pair_groups
     X = initial_embedding(D, n_components, init, random_state)
     shape = X.shape
-    direct_objective = None
-    if direct_pairs.n_pairs > 0:
+    direct_regularizer = build_direct_stress_objective(
+        D=D,
+        W=W,
+        shape=shape,
+        metric=metric,
+        mode=direct_stress_mode,
+        weight=direct_stress_weight,
+        margin=direct_stress_margin,
+        gpu_backend=gpu_backend,
+    )
+
+    def make_direct_objective(direct_pairs):
+        if direct_pairs.n_pairs <= 0:
+            return None
         if gpu_backend is not None:
-            direct_objective = _GpuDirectPairsObjective(
+            return _GpuDirectPairsObjective(
                 gpu_backend,
                 shape=shape,
                 direct_pairs=direct_pairs,
                 metric=metric,
             )
-        else:
-            direct_objective = _DirectPairsObjective(
-                shape=shape,
-                direct_pairs=direct_pairs,
-                metric=metric,
-            )
+        return _DirectPairsObjective(
+            shape=shape,
+            direct_pairs=direct_pairs,
+            metric=metric,
+        )
+
+    initial_direct_pairs = (
+        first_pair_groups.local_pairs
+        if local_pair_mode == "direct"
+        else empty_active_pairs()
+    )
+    static_direct_objective = (
+        None
+        if resample_landmarks
+        else make_direct_objective(initial_direct_pairs)
+    )
 
     options = {"maxiter": inner_iter, "gtol": eps}
     if verbose:
@@ -908,6 +900,10 @@ def path_frozen(
     logging_elapsed = 0.0
 
     if verbose:
+        pair_groups = first_pair_groups
+        global_pairs = pair_groups.global_pairs
+        local_pairs = pair_groups.local_pairs
+        local_geodesic_pairs = local_pairs if local_pair_mode == "geodesic" else empty_active_pairs()
         sampled_global_n_pairs = _sampled_pair_count(global_pairs, targets_per_landmark)
         n_geodesic_sources = _geodesic_source_count(
             global_pairs,
@@ -933,13 +929,42 @@ def path_frozen(
             print(
                 "path_frozen global target sampling: "
                 f"targets_per_landmark={targets_per_landmark}, "
-                f"landmark_sampling={landmark_sampling}, "
+                f"random_landmark_fraction={random_landmark_fraction:.6g}, "
+                f"resample_random_landmarks={resample_landmarks}, "
                 f"global_sources={len(_sampled_sources(global_pairs, targets_per_landmark))}"
+            )
+        elif n_landmark > 0:
+            print(
+                "path_frozen landmark sampling: "
+                f"random_landmark_fraction={random_landmark_fraction:.6g}, "
+                f"resample_random_landmarks={resample_landmarks}, "
+                f"global_sources={len(global_pairs.sources)}"
+            )
+        if direct_regularizer is not None:
+            print(
+                "path_frozen direct stress regularizer: "
+                f"mode={direct_stress_mode}, weight={direct_stress_weight:.6g}, "
+                f"margin={direct_stress_margin:.6g}"
             )
         if log_frequency != 1:
             print(f"path_frozen logging every {log_frequency} outer iterations")
 
     for outer_it in range(outer_iter):
+        if outer_it == 0:
+            pair_groups = first_pair_groups
+        elif static_pair_groups is None:
+            pair_groups = make_pair_groups()
+        else:
+            pair_groups = static_pair_groups
+        global_pairs = pair_groups.global_pairs
+        local_pairs = pair_groups.local_pairs
+        local_geodesic_pairs = local_pairs if local_pair_mode == "geodesic" else empty_active_pairs()
+        direct_pairs = local_pairs if local_pair_mode == "direct" else empty_active_pairs()
+        direct_objective = (
+            make_direct_objective(direct_pairs)
+            if static_pair_groups is None
+            else static_direct_objective
+        )
         iteration_global_pairs = sample_active_pairs(
             global_pairs,
             max_targets_per_source=targets_per_landmark,
@@ -948,7 +973,6 @@ def path_frozen(
         iteration_pairs = merge_active_pairs(iteration_global_pairs, local_geodesic_pairs)
 
         raw_objective = None
-        direct_in_raw_objective = False
         if iteration_pairs.n_pairs > 0:
             forest, _ = _frozen_forest_from_embedding(
                 X,
@@ -981,11 +1005,8 @@ def path_frozen(
                         stacklevel=2,
                     )
                     raw_objective = None
-            else:
-                direct_in_raw_objective = False
 
             if raw_objective is None:
-                direct_in_raw_objective = False
                 def raw_objective(x_flat):
                     return _path_frozen_stress_and_grad(
                         x_flat,
@@ -1001,13 +1022,17 @@ def path_frozen(
                 x_flat,
                 raw_objective,
                 shape=shape,
-                direct_pairs=direct_pairs,
-                direct_objective=None if direct_in_raw_objective else direct_objective,
-                metric=metric,
-                denom=iteration_pairs.denom + direct_pairs.denom,
+                direct_objective=direct_objective,
+                direct_regularizer=direct_regularizer,
+                denom=(
+                    iteration_pairs.denom
+                    + direct_pairs.denom
+                    + (direct_regularizer.denom if direct_regularizer is not None else 0.0)
+                ),
                 normalized_stress=normalized_stress,
             )
 
+        X_start = X.copy()
         result = scipy.optimize.minimize(
             objective,
             X.ravel(),
@@ -1016,8 +1041,13 @@ def path_frozen(
             options=options,
         )
         optimizer_results.append(result)
-        X = result.x.reshape(shape)
-        stress = float(result.fun)
+        X_optimized = result.x.reshape(shape)
+        if outer_step_size == 1.0:
+            X = X_optimized
+            stress = float(result.fun)
+        else:
+            X = X_start + outer_step_size * (X_optimized - X_start)
+            stress = float(objective(X.ravel())[0])
         total_inner_iter += int(getattr(result, "nit", inner_iter))
 
         should_log = _should_log_iteration(outer_it, outer_iter, log_frequency)
@@ -1070,7 +1100,12 @@ def path_frozen(
                     f"(nit={nit}, nfev={nfev})"
                 )
 
-        if targets_per_landmark is None and old_stress is not None and old_stress != 0:
+        if (
+                targets_per_landmark is None
+                and not resample_landmarks
+                and old_stress is not None
+                and old_stress != 0
+        ):
             if np.abs(1 - stress / old_stress) < eps:
                 break
         old_stress = stress

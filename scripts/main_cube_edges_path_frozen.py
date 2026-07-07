@@ -24,13 +24,14 @@ from finsler_mds.utils.graph import metric_graph_from_support, symmetric_knn_gra
 
 SEED = 42
 POINTS_PER_EDGE = 10
-INIT_RADIAL_Z_OFFSET = 1
+INIT_RADIAL_Z_OFFSET = 1.5
 
-TARGET_GRAPH_NEIGHBORS = 4
-EMBEDDING_GRAPH_NEIGHBORS = 4
-PATH_FROZEN_INIT = "smacof"  # one of {"flattened", "smacof"}
+TARGET_GRAPH_NEIGHBORS = 6
+EMBEDDING_GRAPH_NEIGHBORS = 6
+PATH_FROZEN_INIT = "flattened"  # one of {"flattened", "smacof"}
+OUTER_STEP_SIZE = 0.1
 
-PF_STAGE1 = {"outer_iter": 1, "inner_iter": 1, "log_frequency": 1}
+PF_STAGE1 = {"outer_iter": 100, "inner_iter": 1, "log_frequency": 5}
 NO_STAGE_2 = True
 PF_STAGE2 = {"outer_iter": 10, "inner_iter": 1, "log_frequency": 1}
 SMACOF_MAX_ITER = 300
@@ -163,6 +164,7 @@ def run_path_frozen(D, init):
         random_state=SEED,
         target_random_state=SEED,
         method="L-BFGS-B",
+        outer_step_size=OUTER_STEP_SIZE,
         device="auto",
         verbose=1,
         record_history=True,

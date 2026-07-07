@@ -190,7 +190,7 @@ def benchmark_options(dataset, *, seed, landmark_sampling, landmark_fraction, co
         "mask_random_state": seed,
         "target_random_state": seed + 10_000,
         "n_global_landmarks": shared.count_from_fraction(N_SAMPLES, landmark_fraction),
-        "landmark_sampling": landmark_sampling,
+        "random_landmark_fraction": shared.landmark_random_fraction(landmark_sampling),
         "max_global_targets_per_source": shared.count_from_fraction(
             N_SAMPLES,
             TARGETS_PER_LANDMARK_FRACTION,

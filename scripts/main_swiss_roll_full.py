@@ -211,7 +211,7 @@ def main_swiss_roll_full():
                 method="L-BFGS-B",
                 optimizer_options={"ftol": 1e-9, "maxls": 50},
                 n_landmark=n_global_landmarks_path_frozen,
-                landmark_sampling="random",
+                random_landmark_fraction=1.0,
                 n_local_pairs=n_local_neighbors_path_frozen,
                 local_pair_mode=local_pair_mode_path_frozen,
                 mask_random_state=seed,

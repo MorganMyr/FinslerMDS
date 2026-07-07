@@ -105,7 +105,7 @@ def run_path_frozen(D, init):
         n_components=2,
         graph_neighbors=EMBEDDING_GRAPH_NEIGHBORS,
         n_landmark=PATH_FROZEN_LANDMARKS,
-        landmark_sampling="farthest",
+        random_landmark_fraction=0.0,
         targets_per_landmark=PATH_FROZEN_TARGETS,
         n_local_pairs=PATH_FROZEN_LOCAL_PAIRS,
         local_pair_mode="direct",

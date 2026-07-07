@@ -122,7 +122,7 @@ def main_paul15_finsler_mds():
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-8, "maxls": 30},
         "n_landmark": 200,
-        "landmark_sampling": "random",
+        "random_landmark_fraction": 1.0,
         "n_local_pairs": 20,
         "local_pair_mode": "direct",
         "targets_per_landmark": 200,

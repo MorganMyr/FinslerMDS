@@ -13,9 +13,11 @@ from finsler_mds.optimizers.common import (
     prepare_weights_and_mask,
     validate_metric,
 )
+from finsler_mds.optimizers.metric_kernels import (
+    cupy_metric_length_and_grad,
+    gpu_metric_supported,
+)
 from finsler_mds.optimizers.path_frozen import (
-    _cupy_metric_length_and_grad,
-    _gpu_metric_supported,
     _load_cupy,
 )
 
@@ -72,7 +74,7 @@ def _resolve_gpu_backend(device, metric, verbose):
         raise ValueError("device must be one of {'cpu', 'auto', 'gpu', 'cuda'}.")
     if device == "cpu":
         return None
-    if not _gpu_metric_supported(metric):
+    if not gpu_metric_supported(metric):
         message = (
             "gradient_descent GPU backend currently supports RandersMetric, "
             "MatsumotoMetric, ConvexifiedMatsumotoMetric, and ConvexifiedToblerMetric only."
@@ -150,7 +152,7 @@ class _GpuDenseStressObjective:
         for start in range(0, n_samples, self.block_size):
             stop = min(start + self.block_size, n_samples)
             vectors = X[None, :, :] - X[start:stop, None, :]
-            lengths, _ = _cupy_metric_length_and_grad(
+            lengths, _ = cupy_metric_length_and_grad(
                 cp,
                 vectors.reshape(-1, X.shape[1]),
                 self.metric,
@@ -172,7 +174,7 @@ class _GpuDenseStressObjective:
         for start in range(0, n_samples, self.block_size):
             stop = min(start + self.block_size, n_samples)
             vectors = X[None, :, :] - X[start:stop, None, :]
-            lengths, grad_u = _cupy_metric_length_and_grad(
+            lengths, grad_u = cupy_metric_length_and_grad(
                 cp,
                 vectors.reshape(-1, n_components),
                 self.metric,

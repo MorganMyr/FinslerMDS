@@ -63,7 +63,8 @@ def build_local_global_pairs(
         local_pair_mode="direct",
         landmark_indices=None,
         n_global_landmarks=0,
-        landmark_sampling="random",
+        random_landmark_fraction=1.0,
+        fps_init="diameter_pair",
         random_state=None,
         local_weight=1.0,
         local_global_reweighting="none",
@@ -83,14 +84,7 @@ def build_local_global_pairs(
     if local_weight < 0:
         raise ValueError("local_weight must be non-negative.")
 
-    allowed = (W != 0) & np.isfinite(D)
-    np.fill_diagonal(allowed, False)
-
-    if pair_mask is not None:
-        pair_mask = np.asarray(pair_mask, dtype=bool)
-        if pair_mask.shape != D.shape:
-            raise ValueError("pair_mask must have the same shape as dissimilarities.")
-        allowed &= pair_mask
+    allowed = allowed_pair_mask(D, W, pair_mask=pair_mask)
 
     use_sparse_builder = (
         n_local_neighbors is not None
@@ -103,40 +97,108 @@ def build_local_global_pairs(
 
     if use_sparse_builder:
         if n_local_neighbors is not None and n_local_neighbors > 0:
-            local_selection_distances = symmetrized_local_selection_distances(D)
-            _add_local_pairs(
-                local_mask,
-                allowed,
-                local_selection_distances,
-                int(n_local_neighbors),
-            )
+            local_mask = build_local_pair_mask(D, allowed, int(n_local_neighbors))
 
         landmarks = select_landmarks(
             D,
             landmark_indices=landmark_indices,
             n_global_landmarks=n_global_landmarks,
-            landmark_sampling=landmark_sampling,
+            random_landmark_fraction=random_landmark_fraction,
+            fps_init=fps_init,
             random_state=random_state,
         )
-        if len(landmarks) > 0:
-            global_mask[landmarks, :] = allowed[landmarks, :]
+        global_pairs = active_pairs_from_landmarks(D, W, allowed, local_mask, landmarks)
     else:
         global_mask = allowed.copy()
+        global_pairs = active_pairs_from_mask(D, W, global_mask, allow_empty=True)
 
-    # A local pair should contribute to the local group only. This makes the
-    # local/global weights interpretable and prevents accidental double counts
-    # when a landmark source also has local-neighbor constraints.
-    global_mask &= ~local_mask
-
-    global_pairs = active_pairs_from_mask(D, W, global_mask, allow_empty=True)
     local_pairs = active_pairs_from_mask(D, W, local_mask, allow_empty=True)
+    return reweight_local_global_pairs(
+        global_pairs,
+        local_pairs,
+        local_pair_mode=local_pair_mode,
+        mode=local_global_reweighting,
+        local_weight=local_weight,
+    )
+
+
+def allowed_pair_mask(D, W, *, pair_mask=None):
+    allowed = (W != 0) & np.isfinite(D)
+    np.fill_diagonal(allowed, False)
+
+    if pair_mask is not None:
+        pair_mask = np.asarray(pair_mask, dtype=bool)
+        if pair_mask.shape != D.shape:
+            raise ValueError("pair_mask must have the same shape as dissimilarities.")
+        allowed &= pair_mask
+    return allowed
+
+
+def build_local_pair_mask(D, allowed, n_local_neighbors):
+    local_mask = np.zeros_like(allowed, dtype=bool)
+    if n_local_neighbors is not None and n_local_neighbors > 0:
+        local_selection_distances = symmetrized_local_selection_distances(D)
+        _add_local_pairs(
+            local_mask,
+            allowed,
+            local_selection_distances,
+            int(n_local_neighbors),
+        )
+    return local_mask
+
+
+def active_pairs_from_landmarks(D, W, allowed, local_mask, landmarks):
+    landmarks = np.unique(np.asarray(landmarks, dtype=int))
+    if len(landmarks) == 0:
+        return empty_active_pairs()
+
+    sources = []
+    targets = []
+    weights = []
+    dissimilarities = []
+    denom = 0.0
+    n_pairs = 0
+    for source in landmarks:
+        active = allowed[source] & ~local_mask[source]
+        source_targets = np.flatnonzero(active)
+        if len(source_targets) == 0:
+            continue
+        source_weights = W[source, source_targets].astype(float, copy=False)
+        source_dissimilarities = D[source, source_targets].astype(float, copy=False)
+        sources.append(source)
+        targets.append(source_targets)
+        weights.append(source_weights)
+        dissimilarities.append(source_dissimilarities)
+        denom += float(np.sum(source_weights * source_dissimilarities**2))
+        n_pairs += len(source_targets)
+
+    if not sources:
+        return empty_active_pairs()
+    return ActivePairs(
+        sources=np.asarray(sources, dtype=int),
+        targets=targets,
+        weights=weights,
+        dissimilarities=dissimilarities,
+        denom=denom,
+        n_pairs=n_pairs,
+    )
+
+
+def reweight_local_global_pairs(
+        global_pairs,
+        local_pairs,
+        *,
+        local_pair_mode,
+        mode,
+        local_weight,
+):
     if global_pairs.n_pairs == 0 and local_pairs.n_pairs == 0:
         raise ValueError("No active pair remains for geodesic optimization.")
 
     global_factor, local_factor = group_reweighting_factors(
         global_pairs,
         local_pairs,
-        mode=local_global_reweighting,
+        mode=mode,
         local_weight=local_weight,
     )
     global_pairs = scale_active_pairs(global_pairs, global_factor)
@@ -146,7 +208,7 @@ def build_local_global_pairs(
         global_pairs=global_pairs,
         local_pairs=local_pairs,
         local_pair_mode=local_pair_mode,
-        local_global_reweighting=local_global_reweighting,
+        local_global_reweighting=mode,
         local_weight=local_weight,
         global_factor=global_factor,
         local_factor=local_factor,
@@ -185,7 +247,16 @@ def active_pairs_from_mask(D, W, active_mask, *, allow_empty=False):
     )
 
 
-def select_landmarks(D, *, landmark_indices, n_global_landmarks, landmark_sampling, random_state):
+def select_landmarks(
+        D,
+        *,
+        landmark_indices,
+        n_global_landmarks,
+        random_state,
+        random_landmark_fraction=1.0,
+        fps_init="diameter_pair",
+        fixed_farthest_landmarks=None,
+):
     n_samples = D.shape[0]
     if landmark_indices is not None:
         landmarks = np.asarray(landmark_indices, dtype=int)
@@ -198,13 +269,32 @@ def select_landmarks(D, *, landmark_indices, n_global_landmarks, landmark_sampli
     if n_global_landmarks <= 0:
         return np.array([], dtype=int)
 
+    random_landmark_fraction = _validate_fraction(random_landmark_fraction, "random_landmark_fraction")
     rng = check_random_state(random_state)
     n_global_landmarks = min(int(n_global_landmarks), n_samples)
-    if landmark_sampling == "random":
-        return np.sort(rng.choice(n_samples, size=n_global_landmarks, replace=False))
-    if landmark_sampling == "farthest":
-        return _farthest_point_landmarks(D, n_global_landmarks, rng)
-    raise ValueError("landmark_sampling must be 'random' or 'farthest'.")
+    n_random = int(round(random_landmark_fraction * n_global_landmarks))
+    n_random = min(max(n_random, 0), n_global_landmarks)
+    n_farthest = n_global_landmarks - n_random
+
+    if fixed_farthest_landmarks is None:
+        farthest = (
+            _farthest_point_landmarks(D, n_farthest, rng, fps_init=fps_init)
+            if n_farthest > 0
+            else np.array([], dtype=int)
+        )
+    else:
+        farthest = np.asarray(fixed_farthest_landmarks, dtype=int)
+        if len(farthest) != n_farthest:
+            raise ValueError("fixed_farthest_landmarks has the wrong length.")
+
+    if n_random <= 0:
+        return np.sort(farthest)
+
+    available = np.setdiff1d(np.arange(n_samples, dtype=int), farthest, assume_unique=False)
+    if len(available) < n_random:
+        n_random = len(available)
+    random = rng.choice(available, size=n_random, replace=False)
+    return np.sort(np.concatenate([farthest, random]).astype(int, copy=False))
 
 
 def sample_active_pairs(
@@ -364,16 +454,40 @@ def _add_local_pairs(active, allowed, D, n_local_neighbors):
         active[source, chosen] = True
 
 
-def _farthest_point_landmarks(D, n_landmarks, rng):
+def _farthest_point_landmarks(D, n_landmarks, rng, *, fps_init="diameter_pair"):
+    if fps_init not in {"diameter_pair", "random"}:
+        raise ValueError("fps_init must be 'diameter_pair' or 'random'.")
     distances = symmetrized_local_selection_distances(D)
     n_samples = distances.shape[0]
-    first = int(rng.randint(n_samples))
     selected = np.empty(n_landmarks, dtype=int)
-    selected[0] = first
 
-    min_dist = distances[first].copy()
-    min_dist[first] = -np.inf
-    for pos in range(1, n_landmarks):
+    if fps_init == "random" or n_landmarks == 1:
+        if fps_init == "diameter_pair":
+            finite_distances = np.where(np.isfinite(distances), distances, -np.inf)
+            first = int(np.argmax(np.max(finite_distances, axis=1)))
+            if not np.isfinite(finite_distances[first]).any():
+                first = int(rng.randint(n_samples))
+        else:
+            first = int(rng.randint(n_samples))
+        selected[0] = first
+        start_pos = 1
+    else:
+        finite_distances = np.where(np.isfinite(distances), distances, -np.inf)
+        first, second = np.unravel_index(int(np.argmax(finite_distances)), finite_distances.shape)
+        if not np.isfinite(finite_distances[first, second]):
+            first = int(rng.randint(n_samples))
+            row = np.where(np.isfinite(distances[first]), distances[first], -np.inf)
+            second = int(np.argmax(row))
+            if second == first or not np.isfinite(row[second]):
+                second = int((first + 1) % n_samples)
+        selected[:2] = (first, second)
+        start_pos = 2
+
+    min_dist = distances[selected[0]].copy()
+    for pos in range(1, start_pos):
+        min_dist = np.minimum(min_dist, distances[selected[pos]])
+    min_dist[selected[:start_pos]] = -np.inf
+    for pos in range(start_pos, n_landmarks):
         next_point = int(np.argmax(min_dist))
         selected[pos] = next_point
         min_dist = np.minimum(min_dist, distances[next_point])
@@ -401,13 +515,24 @@ def _validate_reweighting(mode):
     return mode
 
 
+def _validate_fraction(value, name):
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1.")
+    return value
+
+
 __all__ = [
     "ActivePairs",
     "LocalGlobalPairs",
+    "active_pairs_from_landmarks",
     "active_pairs_from_mask",
+    "allowed_pair_mask",
+    "build_local_pair_mask",
     "build_local_global_pairs",
     "empty_active_pairs",
     "merge_active_pairs",
+    "reweight_local_global_pairs",
     "sample_active_pairs",
     "scale_active_pairs",
     "select_landmarks",

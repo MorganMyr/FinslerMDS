@@ -20,14 +20,16 @@ from finsler_mds.optimizers.common import (
     prepare_weights_and_mask,
     validate_metric,
 )
+from finsler_mds.optimizers.metric_kernels import (
+    cupy_metric_length_and_grad,
+    gpu_metric_supported,
+)
 from finsler_mds.optimizers.path_frozen import (
     _DirectPairsObjective,
     _add_raw_objective,
-    _cupy_metric_length_and_grad,
     _GpuDirectPairsObjective,
     _full_geodesic_stress,
     _full_stress_active_mask_and_denominator,
-    _gpu_metric_supported,
     _load_cupy,
     _geodesic_source_count,
     _resolve_log_frequency,
@@ -87,7 +89,7 @@ def _resolve_gpu_backend(device, metric, verbose):
         raise ValueError("device must be one of 'cpu', 'auto', 'gpu', or 'cuda'.")
     if device == "cpu":
         return None
-    if not _gpu_metric_supported(metric):
+    if not gpu_metric_supported(metric):
         message = (
             "soft_bellman_ford GPU backend currently supports RandersMetric, "
             "MatsumotoMetric without forbidden_grad_norm, and "
@@ -520,7 +522,7 @@ class _GpuSoftBellmanFordObjective:
         grad = cp.zeros_like(X)
 
         edge_vectors = X[self.cols] - X[self.rows]
-        edge_lengths, edge_grads = _cupy_metric_length_and_grad(cp, edge_vectors, self.metric)
+        edge_lengths, edge_grads = cupy_metric_length_and_grad(cp, edge_vectors, self.metric)
         finite_edges = cp.isfinite(edge_lengths)
         if not cp.all(cp.isfinite(edge_grads[finite_edges])).item():
             raise ValueError("The metric produced non-finite gradients on active graph edges.")
@@ -635,7 +637,8 @@ def soft_bellman_ford(
     local_pair_mode="direct",
     landmark_indices=None,
     n_global_landmarks=0,
-    landmark_sampling="random",
+    random_landmark_fraction=1.0,
+    fps_init="diameter_pair",
     mask_random_state=None,
     max_global_targets_per_source=None,
     target_random_state=None,
@@ -662,7 +665,9 @@ def soft_bellman_ford(
     local Finsler constraints instead of launching soft Bellman-Ford from every
     point. Pass ``local_pair_mode="geodesic"`` to run soft Bellman-Ford from
     local sources too. ``device="auto"`` uses a CuPy backend when available.
-    ``landmark_sampling`` is one of ``"random"`` or ``"farthest"``.
+    ``random_landmark_fraction=1`` gives random landmarks; ``0`` gives
+    farthest-point landmarks. ``fps_init`` controls the farthest-point
+    initialization.
     ``log_frequency`` controls progress-line frequency across graph updates,
     with the same adaptive default as ``path_frozen``. With ``verbose >= 2``
     or ``record_history=True``, logged updates also record the all-pairs hard
@@ -696,7 +701,8 @@ def soft_bellman_ford(
         local_pair_mode=local_pair_mode,
         landmark_indices=landmark_indices,
         n_global_landmarks=n_global_landmarks,
-        landmark_sampling=landmark_sampling,
+        random_landmark_fraction=random_landmark_fraction,
+        fps_init=fps_init,
         random_state=mask_random_state,
         local_weight=local_weight,
         local_global_reweighting=local_global_reweighting,

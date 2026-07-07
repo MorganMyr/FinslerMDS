@@ -91,10 +91,10 @@ def main_pancreas(config_overrides=None):
     }
     #MDS 2D:
     #gd_2d_vrand0_r0_s42.npz
-    finsler_optimizer = "gradient_descent"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
-    init_finsler_mds = "umap_2D"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
-    embedding_dim = 2  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
-    cluster_reweight_rho = 1
+    finsler_optimizer = "path_frozen"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    init_finsler_mds = "path_frozen"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    embedding_dim = 3  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
+    cluster_reweight_rho = 0
     frontier_pairs_weight = 1
     selected_frontiers = "all"  # one of {"cbdir", "all"}
     distance_reweighting = {"power": 0, "epsilon": 1e-6}
@@ -120,7 +120,7 @@ def main_pancreas(config_overrides=None):
         "verbose": 1,
     }
     finsler_umap = {
-        "n_neighbors": 50,
+        "n_neighbors": 30,
         "symmetrize_support": True,
         "symmetrize_rho": False,
         "symmetrize_sigma": True,
@@ -139,18 +139,22 @@ def main_pancreas(config_overrides=None):
     }
     path_frozen = {
         "graph_neighbors": 30,
-        "outer_iter": 10,
-        "inner_iter": 3,
+        "outer_iter": 40,
+        "inner_iter": 5,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-9, "maxls": 50},
-        "n_landmark": 800,
-        "landmark_sampling": "random", # "random" or "farthest"
+        "n_landmark": 600,
+        "random_landmark_fraction": 1.0, # 1.0=random, 0.0=farthest
         "n_local_pairs": 30,
         "local_pair_mode": "direct",
         "targets_per_landmark": 1000,
         "local_global_reweighting": "count",
         "local_weight": 10,
+        "direct_stress_weight": 0.0,
+        "direct_stress_mode": "hinge",
+        "direct_stress_margin": 0.5,
+        "outer_step_size": 0.05,
         "device": "auto",
         "verbose": 1,
     }
