@@ -19,12 +19,6 @@ from finsler_mds import (
     geodesic_embedding_stress,
 )
 from finsler_mds import utils
-from finsler_mds.evaluation.rna_velocity.pancreas_gap import (
-    gap_arrays_to_cache,
-    normalize_pancreas_gap_config,
-    pancreas_gap_prefix,
-    select_pancreas_gap,
-)
 from finsler_mds.evaluation.rna_velocity import load_or_compute_boundary_neighbor_plan
 from finsler_mds.utils import plot_3d_embedding_views, plot_categorical_embedding
 from finsler_mds.utils.pancreas import (
@@ -41,6 +35,13 @@ from finsler_mds.utils.pancreas import (
     preprocess_pancreas_for_velocity,
     setup_scvelo_settings,
 )
+from finsler_mds.utils.pancreas_files import (
+    latest_pancreas_embedding_path,
+    pancreas_figure_path,
+    pancreas_raw_embedding_path,
+    pancreas_velocity_cache_path,
+    resolve_pancreas_embedding_path,
+)
 
 def main_pancreas(config_overrides=None):
     # Hyperparameters
@@ -56,9 +57,9 @@ def main_pancreas(config_overrides=None):
     }
     velocity = {
         "mode": "dynamical",
-        "distance_formula": "randers",  # one of {"exponential", "randers", "matsumoto"}
-        "alpha": 1, # should be positive; randers needs alpha*cos_clip<1
-        "cos_clip": 0.99,
+        "distance_formula": "matsumoto",  # one of {"exponential", "randers", "matsumoto"}
+        "alpha": 1, # randers/matsumoto velocity needs alpha*cos_clip*0.77<1
+        "cos_clip": 1,
         "velocity_neighbors": 30, # to average the velocity locally (if "average_velocity" is True)
         "kNN_euclid": 30,  # Euclidean kNN support before adding Finsler-nearest outgoing edges.
         "kNN_finsler": 0,  # Additional outgoing neighbors selected by local asymmetric distance.
@@ -67,16 +68,6 @@ def main_pancreas(config_overrides=None):
         "graph_n_jobs": -1,
         "recover_dynamics_max_iter": 20,
         "recover_dynamics_n_jobs": -1,
-    }
-    gap = {
-        "enabled": False,
-        "name": "preendocrine",
-        "selection": "veloviz_latent_time",
-        "n_before": 300,
-        "n_after": 300,
-        "removed_labels": ("Pre-endocrine",),
-        "before_labels": ("Ngn3 high EP",),
-        "after_labels": ("Alpha", "Beta", "Delta", "Epsilon"),
     }
     umap = {
         "n_neighbors": 50,
@@ -91,8 +82,8 @@ def main_pancreas(config_overrides=None):
     }
     #MDS 2D:
     #gd_2d_vrand0_r0_s42.npz
-    finsler_optimizer = "path_frozen"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
-    init_finsler_mds = "path_frozen"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    finsler_optimizer = "finsler_umap"  # one of {"smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
+    init_finsler_mds = "umap_2D"  # one of {"umap_2D", "umap_3D", "isomap_2D", "isomap_3D", "smacof", "gradient_descent", "finsler_umap", "path_frozen", "soft_bf"}
     embedding_dim = 3  # 2 or 3; 2D inits can seed 3D, but 3D inits cannot seed 2D.
     cluster_reweight_rho = 0
     frontier_pairs_weight = 1
@@ -101,17 +92,17 @@ def main_pancreas(config_overrides=None):
 
     # SMACOF always uses Randers regardless of finsler_metric
     finsler_metric = "randers"  # one of {"randers", "matsumoto", "convexified_matsumoto"}
-    alpha_embedding = 0.8
+    alpha_embedding = 0.3
     smacof = {
         "max_iter": 1000,
-        "eps": 1e-6,
+        "eps": 1e-7,
         "device": "auto",
         "check_monotony": True,
         "project_on_V": True,
         "version": "corrected",
     }
     gradient_descent = {
-        "max_iter": 100,
+        "max_iter": 300,
         "eps": 1e-8,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-10, "maxls": 80, "maxcor": 30},
@@ -139,21 +130,21 @@ def main_pancreas(config_overrides=None):
     }
     path_frozen = {
         "graph_neighbors": 30,
-        "outer_iter": 40,
-        "inner_iter": 5,
+        "outer_iter": 30,
+        "inner_iter": 1,
         "eps": 1e-6,
         "method": "L-BFGS-B",
         "optimizer_options": {"ftol": 1e-9, "maxls": 50},
-        "n_landmark": 600,
-        "random_landmark_fraction": 1.0, # 1.0=random, 0.0=farthest
+        "n_landmark": 300,
+        "random_landmark_fraction": 0.9, # 1.0=random, 0.0=farthest
         "n_local_pairs": 30,
         "local_pair_mode": "direct",
         "targets_per_landmark": 1000,
         "local_global_reweighting": "count",
-        "local_weight": 10,
-        "direct_stress_weight": 0.0,
-        "direct_stress_mode": "hinge",
-        "direct_stress_margin": 0.5,
+        "local_weight": 0.4,
+        "direct_stress_weight": 0.1,
+        "direct_stress_mode": "mds",
+        "direct_stress_margin": 0.5, # for mode "hinge" only
         "outer_step_size": 0.05,
         "device": "auto",
         "verbose": 1,
@@ -195,7 +186,6 @@ def main_pancreas(config_overrides=None):
             overrides,
             preprocessing=preprocessing,
             velocity=velocity,
-            gap=gap,
             umap=umap,
             isomap=isomap,
             smacof=smacof,
@@ -208,16 +198,11 @@ def main_pancreas(config_overrides=None):
     np.random.seed(seed)
     embedding_dim = normalize_embedding_dim(embedding_dim)
 
-    gap = normalize_pancreas_gap_config(gap)
-    if gap["enabled"]:
-        dir_res = str(dir_res_base / "gap")
-        dir_res_raw = dir_res
-    else:
-        dir_res = str(dir_res_base)
-        dir_res_raw = str(dir_res_base / "raw")
+    dir_res = str(dir_res_base)
+    dir_res_raw = str(dir_res_base / "raw")
     os.makedirs(dir_res, exist_ok=True)
     os.makedirs(dir_res_raw, exist_ok=True)
-    dataset_prefix = pancreas_gap_prefix(gap)
+    dataset_prefix = "pancreas"
     file_prefix = pancreas_file_prefix(dataset_prefix)
     state_cache_metadata = pancreas_state_cache_metadata(
         dataset_source=PANCREAS_DATASET_SOURCE,
@@ -227,7 +212,6 @@ def main_pancreas(config_overrides=None):
         moments_n_neighbors=preprocessing["moments_n_neighbors"],
         velocity_mode=velocity["mode"],
         recover_dynamics_max_iter=velocity["recover_dynamics_max_iter"],
-        gap=gap,
         seed=seed,
     )
     velocity_cache_metadata = pancreas_cache_metadata(
@@ -252,7 +236,6 @@ def main_pancreas(config_overrides=None):
         umap_maxiter=umap["maxiter"],
         umap_negative_sample_rate=umap["negative_sample_rate"],
         umap_init_pos=umap["init_pos"],
-        gap=gap,
         seed=seed,
     )
     umap_variant_tag = pancreas_umap_variant_tag(umap)
@@ -270,7 +253,7 @@ def main_pancreas(config_overrides=None):
         f"ke{velocity['kNN_euclid']}_kf{velocity['kNN_finsler']}_"
         f"{umap_variant_tag}s{seed}"
     )
-    velocity_cache_path = os.path.join(
+    velocity_cache_path = pancreas_velocity_cache_path(
         dir_res_raw,
         f"{dataset_prefix}_velocity_inputs_{velocity_cache_tag}.npz",
     )
@@ -281,24 +264,19 @@ def main_pancreas(config_overrides=None):
         dataset_prefix=dataset_prefix,
         seed=seed,
     )
-    gap_selection_cache_path = os.path.join(
-        dir_res_raw,
-        f"{dataset_prefix}_selection_s{seed}.npz",
-    )
     legacy_velocity_cache_paths = []
-    if not gap["enabled"]:
-        legacy_velocity_cache_paths.append(
-            os.path.join(
-                dir_res_raw,
-                f"pancreas_velocity_inputs_{cache_token(velocity['mode'])}_"
-                f"{velocity_cache_formula_tag}_"
-                f"valpha{cache_token(velocity['alpha'])}_"
-                f"cclip{cache_token(velocity['cos_clip'])}_s{seed}.npz",
-            )
+    legacy_velocity_cache_paths.append(
+        pancreas_velocity_cache_path(
+            dir_res_raw,
+            f"pancreas_velocity_inputs_{cache_token(velocity['mode'])}_"
+            f"{velocity_cache_formula_tag}_"
+            f"valpha{cache_token(velocity['alpha'])}_"
+            f"cclip{cache_token(velocity['cos_clip'])}_s{seed}.npz",
         )
-    if not gap["enabled"] and normalize_velocity_distance_formula(velocity["distance_formula"]) == "exponential":
+    )
+    if normalize_velocity_distance_formula(velocity["distance_formula"]) == "exponential":
         legacy_velocity_cache_paths.append(
-            os.path.join(
+            pancreas_velocity_cache_path(
                 dir_res_raw,
                 f"pancreas_velocity_inputs_{cache_token(velocity['mode'])}_"
                 f"valpha{cache_token(velocity['alpha'])}_s{seed}.npz",
@@ -318,6 +296,13 @@ def main_pancreas(config_overrides=None):
     isomap_3d_embedding_path = pancreas_isomap_embedding_path(
         dir_res_raw, isomap_cache_tag, n_components=3, dataset_prefix=dataset_prefix
     )
+    for embedding_path in (
+        umap_2d_embedding_path,
+        umap_3d_embedding_path,
+        isomap_2d_embedding_path,
+        isomap_3d_embedding_path,
+    ):
+        Path(embedding_path).parent.mkdir(parents=True, exist_ok=True)
     embedding_metric_obj = make_embedding_metric({"kind": finsler_metric, "alpha": alpha_embedding})
     embedding_metric_tag_value = embedding_metric_tag(embedding_metric_obj)
     smacof_metric_obj = RandersMetric(alpha=alpha_embedding)
@@ -335,21 +320,25 @@ def main_pancreas(config_overrides=None):
         f"{file_prefix}pf_{embedding_dim_tag}"
         f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
     )
+    path_frozen_cache_path = str(pancreas_raw_embedding_path(dir_res_raw, Path(path_frozen_cache_path).name))
     soft_bf_cache_path = os.path.join(
         dir_res_raw,
         f"{file_prefix}sbf_{embedding_dim_tag}"
         f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
     )
+    soft_bf_cache_path = str(pancreas_raw_embedding_path(dir_res_raw, Path(soft_bf_cache_path).name))
     gradient_descent_cache_path = os.path.join(
         dir_res_raw,
         f"{file_prefix}gd_{embedding_dim_tag}"
         f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
     )
+    gradient_descent_cache_path = str(pancreas_raw_embedding_path(dir_res_raw, Path(gradient_descent_cache_path).name))
     finsler_umap_cache_path = os.path.join(
         dir_res_raw,
         f"{file_prefix}fumap_{embedding_dim_tag}"
         f"{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}_s{seed}.npz",
     )
+    finsler_umap_cache_path = str(pancreas_raw_embedding_path(dir_res_raw, Path(finsler_umap_cache_path).name))
 
     requested_umap_dim = requested_embedding_init_dimension(init_finsler_mds, "umap")
     requested_isomap_dim = requested_embedding_init_dimension(init_finsler_mds, "isomap")
@@ -361,7 +350,7 @@ def main_pancreas(config_overrides=None):
         fallback_paths=legacy_velocity_cache_paths,
     )
     if cached_inputs is not None:
-        x_umap, dists_velocity, labels, cell_ids, original_indices, gap_arrays = cached_inputs
+        x_umap, dists_velocity, labels, cell_ids, original_indices = cached_inputs
         if not os.path.exists(umap_2d_embedding_path):
             np.save(umap_2d_embedding_path, x_umap)
         print(
@@ -377,36 +366,14 @@ def main_pancreas(config_overrides=None):
         setup_scvelo_settings()
         state_inputs = load_pancreas_state_cache(state_cache_path, state_cache_metadata)
         if state_inputs is not None:
-            adata, labels, cell_ids, original_indices, gap_arrays = state_inputs
+            adata, labels, cell_ids, original_indices = state_inputs
         else:
             print(f"Loading pancreas dataset from {PANCREAS_DATASET_SOURCE}")
             adata = load_pancreas_dataset()
             print(f"Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
-            full_labels = labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None)
-            cell_ids_full = np.asarray(adata.obs_names, dtype=str)
-            gap_ordering = None
-            if gap["enabled"] and gap["selection"] in {"latent_time", "veloviz_latent_time"}:
-                gap_ordering = load_or_compute_pancreas_gap_ordering(
-                    adata,
-                    gap_selection_cache_path,
-                    preprocessing=preprocessing,
-                    velocity=velocity,
-                    gap=gap,
-                    seed=seed,
-                )
-            gap_selection = select_pancreas_gap(full_labels, gap, cell_ids=cell_ids_full, ordering=gap_ordering)
-            if gap_selection.enabled:
-                print(
-                    f"Applying pancreas gap {gap_selection.config['name']!r}: "
-                    f"removed {gap_selection.removed_mask.sum()} cells; "
-                    f"kept {gap_selection.keep_mask.sum()} cells "
-                    f"({len(gap_selection.before_indices)} before, {len(gap_selection.after_indices)} after)"
-                )
-                adata = adata[gap_selection.keep_mask].copy()
-            labels = gap_selection.labels
-            cell_ids = gap_selection.cell_ids
-            original_indices = gap_selection.original_indices
-            gap_arrays = gap_arrays_to_cache(gap_selection)
+            labels = labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None)
+            cell_ids = np.asarray(adata.obs_names, dtype=str)
+            original_indices = np.arange(adata.n_obs, dtype=int)
 
             print("Preprocessing")
             preprocess_pancreas_for_velocity(adata, preprocessing, seed=seed)
@@ -431,7 +398,6 @@ def main_pancreas(config_overrides=None):
                 labels=labels,
                 cell_ids=cell_ids,
                 original_indices=original_indices,
-                gap_arrays=gap_arrays,
                 metadata=state_cache_metadata,
             )
 
@@ -488,7 +454,9 @@ def main_pancreas(config_overrides=None):
             velocity_cache_path,
             x_umap=x_umap,
             dists_velocity=dists_velocity,
-            **gap_arrays,
+            labels=labels_to_cache(labels),
+            cell_ids=np.asarray(cell_ids, dtype=str),
+            original_indices=np.asarray(original_indices, dtype=int),
             metadata_json=json.dumps(velocity_cache_metadata, sort_keys=True),
         )
         print(f"Saved 2D UMAP embedding: {umap_2d_embedding_path}")
@@ -510,7 +478,7 @@ def main_pancreas(config_overrides=None):
             plot_3d_umap(
                 x_umap_3d,
                 labels=labels,
-                save_path=os.path.join(dir_res, f"{file_prefix}umap_3d.pdf"),
+                save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}umap_3d.pdf"),
                 random_state=seed,
             )
             adata.obsm["X_umap"] = x_umap
@@ -532,7 +500,7 @@ def main_pancreas(config_overrides=None):
                 x_isomap_3d,
                 labels=labels,
                 title="scVelo pancreas Isomap 3D",
-                save_path=os.path.join(dir_res, f"{file_prefix}isomap_3d.pdf"),
+                save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}isomap_3d.pdf"),
                 point_fraction=1.0,
                 random_state=seed,
                 cmap=PANCREAS_CLUSTER_COLORS,
@@ -557,7 +525,7 @@ def main_pancreas(config_overrides=None):
                 title="scVelo pancreas Isomap",
                 xlabel="Isomap 1",
                 ylabel="Isomap 2",
-                save_path=os.path.join(dir_res, f"{file_prefix}isomap.pdf"),
+                save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}isomap.pdf"),
                 cmap=PANCREAS_CLUSTER_COLORS,
             )
             print(f"Saved 2D Isomap embedding: {isomap_2d_embedding_path}")
@@ -568,14 +536,13 @@ def main_pancreas(config_overrides=None):
             preprocessing=preprocessing,
             velocity=velocity,
             umap=umap,
-            gap=gap,
             n_components=3,
             random_state=seed,
         )
         plot_3d_umap(
             x_umap_3d,
             labels=labels_umap_3d,
-            save_path=os.path.join(dir_res, f"{file_prefix}umap_3d.pdf"),
+            save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}umap_3d.pdf"),
             random_state=seed,
         )
         print(f"Saved 3D UMAP embedding: {umap_3d_embedding_path}")
@@ -585,7 +552,6 @@ def main_pancreas(config_overrides=None):
             preprocessing=preprocessing,
             velocity=velocity,
             umap=umap,
-            gap=gap,
             n_components=2,
             random_state=seed,
         )
@@ -597,7 +563,6 @@ def main_pancreas(config_overrides=None):
             preprocessing=preprocessing,
             velocity=velocity,
             isomap=isomap,
-            gap=gap,
             n_components=3,
             random_state=seed,
         )
@@ -605,7 +570,7 @@ def main_pancreas(config_overrides=None):
             x_isomap_3d,
             labels=labels_isomap_3d,
             title="scVelo pancreas Isomap 3D",
-            save_path=os.path.join(dir_res, f"{file_prefix}isomap_3d.pdf"),
+            save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}isomap_3d.pdf"),
             point_fraction=1.0,
             random_state=seed,
             cmap=PANCREAS_CLUSTER_COLORS,
@@ -617,7 +582,6 @@ def main_pancreas(config_overrides=None):
             preprocessing=preprocessing,
             velocity=velocity,
             isomap=isomap,
-            gap=gap,
             n_components=2,
             random_state=seed,
         )
@@ -627,7 +591,7 @@ def main_pancreas(config_overrides=None):
             title="scVelo pancreas Isomap",
             xlabel="Isomap 1",
             ylabel="Isomap 2",
-            save_path=os.path.join(dir_res, f"{file_prefix}isomap.pdf"),
+            save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}isomap.pdf"),
             cmap=PANCREAS_CLUSTER_COLORS,
         )
         print(f"Saved 2D Isomap embedding: {isomap_2d_embedding_path}")
@@ -638,7 +602,7 @@ def main_pancreas(config_overrides=None):
         title="scVelo pancreas UMAP",
         xlabel="UMAP 1",
         ylabel="UMAP 2",
-        save_path=os.path.join(dir_res, f"{file_prefix}umap.pdf"),
+        save_path=pancreas_figure_path(dir_res_base, f"{file_prefix}umap.pdf"),
         cmap=PANCREAS_CLUSTER_COLORS,
     )
 
@@ -672,20 +636,20 @@ def main_pancreas(config_overrides=None):
                 "isomap": isomap_2d_embedding_path,
                 "isomap_2d": isomap_2d_embedding_path,
                 "isomap_3d": isomap_3d_embedding_path,
-                "smacof": latest_finsler_embedding_path(
-                    dir_res_raw, dataset_prefix, "smacof", embedding_dim
+                "smacof": latest_pancreas_embedding_path(
+                    dir_res_raw, "smacof", embedding_dim, dataset_prefix=dataset_prefix
                 ),
-                "gradient_descent": latest_finsler_embedding_path(
-                    dir_res_raw, dataset_prefix, "gd", embedding_dim
+                "gradient_descent": latest_pancreas_embedding_path(
+                    dir_res_raw, "gd", embedding_dim, dataset_prefix=dataset_prefix
                 ),
-                "finsler_umap": latest_finsler_embedding_path(
-                    dir_res_raw, dataset_prefix, "fumap", embedding_dim
+                "finsler_umap": latest_pancreas_embedding_path(
+                    dir_res_raw, "fumap", embedding_dim, dataset_prefix=dataset_prefix
                 ),
-                "path_frozen": latest_finsler_embedding_path(
-                    dir_res_raw, dataset_prefix, "pf", embedding_dim
+                "path_frozen": latest_pancreas_embedding_path(
+                    dir_res_raw, "pf", embedding_dim, dataset_prefix=dataset_prefix
                 ),
-                "soft_bf": latest_finsler_embedding_path(
-                    dir_res_raw, dataset_prefix, "sbf", embedding_dim
+                "soft_bf": latest_pancreas_embedding_path(
+                    dir_res_raw, "sbf", embedding_dim, dataset_prefix=dataset_prefix
                 ),
             },
             raw_dir=dir_res_raw,
@@ -737,23 +701,23 @@ def main_pancreas(config_overrides=None):
                 on_unreachable="inf",
             )
             print(f"smacof final full geodesic stress: {full_geodesic_stress}")
-            output_cache_path = os.path.join(
-                dir_res_raw,
-                f"{file_prefix}{smacof_tag}_{velocity_formula_tag}{pair_weight_tag}_s{seed}.npz",
+            output_cache_path = str(
+                pancreas_raw_embedding_path(
+                    dir_res_raw,
+                    f"{file_prefix}{smacof_tag}_{velocity_formula_tag}{pair_weight_tag}_s{seed}.npz",
+                )
             )
             cache_payload = dict(
                 embedding=proj_finsler,
                 stress=np.asarray(stress_finsler),
                 full_geodesic_stress=np.asarray(full_geodesic_stress),
                 init_finsler_mds=np.asarray(str(init_finsler_mds)),
-                **gap_arrays,
                 metadata_json=json.dumps(
                     {
                         "optimizer": optimizer_kind,
                         "init": str(init_finsler_mds),
                         "embedding_dim": embedding_dim,
                         "seed": seed,
-                        "gap": gap,
                         "velocity": velocity,
                         "finsler_metric": "randers",
                         "alpha_embedding": alpha_embedding,
@@ -773,6 +737,7 @@ def main_pancreas(config_overrides=None):
                     sort_keys=True,
                 ),
             )
+            Path(output_cache_path).parent.mkdir(parents=True, exist_ok=True)
             np.savez(output_cache_path, **cache_payload)
             print(f"Saved {optimizer_kind} embedding: {output_cache_path}")
             if adata is not None:
@@ -784,8 +749,8 @@ def main_pancreas(config_overrides=None):
                     f"Pancreas {embedding_dim}D Randers SMACOF "
                     f"({velocity_formula_tag}, alpha={alpha_embedding})"
                 ),
-                save_path=os.path.join(
-                    dir_res,
+                save_path=pancreas_figure_path(
+                    dir_res_base,
                     f"{file_prefix}{smacof_tag}_{velocity_formula_tag}{pair_weight_tag}.pdf",
                 ),
                 random_state=seed,
@@ -832,6 +797,7 @@ def main_pancreas(config_overrides=None):
                 dir_res,
                 f"{file_prefix}{file_tag}_{embedding_dim_tag}{velocity_formula_tag}_{embedding_metric_tag_value}{pair_weight_tag}.pdf",
             )
+            plot_path = pancreas_figure_path(dir_res_base, Path(plot_path).name)
             adata_key = f"X_finsler_{optimizer_kind}"
         else:
             raise ValueError(
@@ -842,14 +808,12 @@ def main_pancreas(config_overrides=None):
             embedding=proj_finsler,
             stress=np.asarray(stress_finsler),
             init_finsler_mds=np.asarray(str(init_finsler_mds)),
-            **gap_arrays,
             metadata_json=json.dumps(
                 {
                     "optimizer": optimizer_kind,
                     "init": str(init_finsler_mds),
                     "embedding_dim": embedding_dim,
                     "seed": seed,
-                    "gap": gap,
                     "velocity": velocity,
                     "finsler_metric": normalize_embedding_metric_kind(finsler_metric),
                     "alpha_embedding": alpha_embedding,
@@ -872,6 +836,7 @@ def main_pancreas(config_overrides=None):
         )
         if full_geodesic_stress is not None:
             cache_payload["full_geodesic_stress"] = np.asarray(full_geodesic_stress)
+        Path(output_cache_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez(output_cache_path, **cache_payload)
         print(f"Saved {optimizer_kind} embedding: {output_cache_path}")
         if adata is not None:
@@ -905,60 +870,6 @@ def project_velocity_to_pca(adata, n_pcs):
     pcs = np.asarray(adata.varm["PCs"][:, :n_pcs], dtype=float)
     velocity_pca = velocity @ pcs
     return np.asarray(velocity_pca, dtype=float)
-
-
-def load_or_compute_pancreas_gap_ordering(
-        adata_raw,
-        cache_path,
-        *,
-        preprocessing,
-        velocity,
-        gap,
-        seed,
-):
-    metadata = pancreas_cache_metadata(
-        dataset_source=PANCREAS_DATASET_SOURCE,
-        preprocessing=preprocessing,
-        velocity_mode=velocity["mode"],
-        recover_dynamics_max_iter=velocity["recover_dynamics_max_iter"],
-        gap=gap,
-        seed=seed,
-    )
-    if os.path.exists(cache_path):
-        with np.load(cache_path) as cache:
-            if "metadata_json" in cache:
-                cached_metadata = json.loads(str(cache["metadata_json"].item()))
-                if cached_metadata == metadata and "latent_time" in cache:
-                    print(f"Loaded pancreas gap latent-time selection cache: {cache_path}")
-                    return np.asarray(cache["latent_time"], dtype=float)
-
-    print("Computing full-pancreas latent time for VeloViz-like gap selection")
-    adata = adata_raw.copy()
-    preprocess_pancreas_for_velocity(adata, preprocessing, seed=seed)
-    compute_pancreas_velocity(
-        adata,
-        mode=velocity["mode"],
-        recover_dynamics_max_iter=velocity["recover_dynamics_max_iter"],
-        recover_dynamics_n_jobs=velocity["recover_dynamics_n_jobs"],
-    )
-    compute_pancreas_velocity_graph(
-        adata,
-        n_jobs=velocity["graph_n_jobs"],
-        show_progress_bar=False,
-    )
-    import scvelo as scv
-
-    scv.tl.latent_time(adata)
-    latent_time = np.asarray(adata.obs["latent_time"], dtype=float)
-    np.savez(
-        cache_path,
-        latent_time=latent_time,
-        labels=labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None),
-        cell_ids=np.asarray(adata.obs_names, dtype=str),
-        metadata_json=json.dumps(metadata, sort_keys=True),
-    )
-    print(f"Saved pancreas gap latent-time selection cache: {cache_path}")
-    return latent_time
 
 
 def normalize_velocity_distance_formula(distance_formula):
@@ -1075,15 +986,19 @@ def metric_metadata(metric):
 def pancreas_umap_embedding_path(cache_dir, cache_tag, *, n_components, dataset_prefix="pancreas"):
     prefix = pancreas_file_prefix(dataset_prefix)
     if int(n_components) == 2:
-        return os.path.join(cache_dir, f"{prefix}umap_{cache_tag}.npy")
-    return os.path.join(cache_dir, f"{prefix}umap_{int(n_components)}d_{cache_tag}.npy")
+        filename = f"{prefix}umap_{cache_tag}.npy"
+    else:
+        filename = f"{prefix}umap_{int(n_components)}d_{cache_tag}.npy"
+    return str(pancreas_raw_embedding_path(cache_dir, filename))
 
 
 def pancreas_isomap_embedding_path(cache_dir, cache_tag, *, n_components, dataset_prefix="pancreas"):
     prefix = pancreas_file_prefix(dataset_prefix)
     if int(n_components) == 2:
-        return os.path.join(cache_dir, f"{prefix}isomap_{cache_tag}.npy")
-    return os.path.join(cache_dir, f"{prefix}isomap_{int(n_components)}d_{cache_tag}.npy")
+        filename = f"{prefix}isomap_{cache_tag}.npy"
+    else:
+        filename = f"{prefix}isomap_{int(n_components)}d_{cache_tag}.npy"
+    return str(pancreas_raw_embedding_path(cache_dir, filename))
 
 
 def pancreas_umap_variant_tag(umap):
@@ -1167,7 +1082,6 @@ def compute_and_save_pancreas_umap_embedding(
         preprocessing,
         velocity,
         umap,
-        gap,
         n_components,
         random_state,
 ):
@@ -1179,14 +1093,6 @@ def compute_and_save_pancreas_umap_embedding(
     print(f"Loading pancreas dataset from {PANCREAS_DATASET_SOURCE} for {n_components}D UMAP")
     adata = load_pancreas_dataset()
     print(f"Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
-    labels_full = labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None)
-    gap_selection = select_pancreas_gap(labels_full, gap, cell_ids=np.asarray(adata.obs_names, dtype=str))
-    if gap_selection.enabled:
-        print(
-            f"Applying pancreas gap {gap_selection.config['name']!r}: "
-            f"removed {gap_selection.removed_mask.sum()} cells."
-        )
-        adata = adata[gap_selection.keep_mask].copy()
 
     print("Preprocessing for UMAP")
     preprocess_pancreas_for_velocity(adata, preprocessing, seed=random_state)
@@ -1225,7 +1131,6 @@ def compute_and_save_pancreas_isomap_embedding(
         preprocessing,
         velocity,
         isomap,
-        gap,
         n_components,
         random_state,
 ):
@@ -1235,14 +1140,6 @@ def compute_and_save_pancreas_isomap_embedding(
     print(f"Loading pancreas dataset from {PANCREAS_DATASET_SOURCE} for {n_components}D Isomap")
     adata = load_pancreas_dataset()
     print(f"Raw pancreas shape: {adata.n_obs} cells x {adata.n_vars} genes")
-    labels_full = labels_to_numpy(adata.obs["clusters"] if "clusters" in adata.obs else None)
-    gap_selection = select_pancreas_gap(labels_full, gap, cell_ids=np.asarray(adata.obs_names, dtype=str))
-    if gap_selection.enabled:
-        print(
-            f"Applying pancreas gap {gap_selection.config['name']!r}: "
-            f"removed {gap_selection.removed_mask.sum()} cells."
-        )
-        adata = adata[gap_selection.keep_mask].copy()
 
     print("Preprocessing for Isomap")
     preprocess_pancreas_for_velocity(adata, preprocessing, seed=random_state)
@@ -1425,17 +1322,7 @@ def resolve_finsler_init(
 
 
 def resolve_raw_embedding_path(init_finsler_mds, raw_dir):
-    path = Path(str(init_finsler_mds))
-    candidates = [path] if path.is_absolute() else [Path(raw_dir) / path]
-    if path.suffix == "":
-        candidates.extend(candidate.with_suffix(suffix) for candidate in candidates[:] for suffix in (".npz", ".npy"))
-    for candidate in candidates:
-        if candidate.exists() and candidate.suffix in {".npz", ".npy"}:
-            return candidate
-    raise FileNotFoundError(
-        f"init_finsler_mds={init_finsler_mds!r} is not a known init keyword and "
-        f"was not found as a .npz/.npy file in {raw_dir}."
-    )
+    return resolve_pancreas_embedding_path(str(init_finsler_mds), raw_dir)
 
 
 def normalize_finsler_init_kind(init_finsler_mds):
@@ -1490,54 +1377,6 @@ def load_saved_embedding(path):
     raise ValueError(f"Unsupported embedding file extension for {path}")
 
 
-def latest_embedding_path(cache_dir, pattern):
-    candidates = list(Path(cache_dir).glob(pattern))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def latest_finsler_embedding_path(cache_dir, dataset_prefix, family, embedding_dim):
-    cache_dir = Path(cache_dir)
-    prefix = pancreas_file_prefix(dataset_prefix)
-    if int(embedding_dim) == 2:
-        patterns = [f"{prefix}{family}_2d_*.npz"]
-    else:
-        patterns = [
-            f"{prefix}{family}_3d_*.npz",
-            f"{prefix}{family}_2d_*.npz",
-        ]
-    candidates = []
-    for pattern in patterns:
-        candidates.extend(cache_dir.glob(pattern))
-    if family == "smacof":
-        legacy_prefix = f"{dataset_prefix}_" if dataset_prefix else ""
-        short_patterns = ["s_new", "s_old"]
-        for short_family in short_patterns:
-            if int(embedding_dim) == 2:
-                candidates.extend(cache_dir.glob(f"{prefix}{short_family}_2d_*.npz"))
-            else:
-                candidates.extend(cache_dir.glob(f"{prefix}{short_family}_3d_*.npz"))
-                candidates.extend(cache_dir.glob(f"{prefix}{short_family}_2d_*.npz"))
-        legacy_family = "randers_smacof"
-        if int(embedding_dim) == 2:
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_2d_*.npz"))
-        else:
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_*.npz"))
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_2d_*.npz"))
-    elif family in {"pf", "sbf"}:
-        legacy_family = {"pf": "path_frozen", "sbf": "soft_bf"}[family]
-        legacy_prefix = f"{dataset_prefix}_" if dataset_prefix else ""
-        if int(embedding_dim) == 2:
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_2d_*.npz"))
-        else:
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_*.npz"))
-            candidates.extend(cache_dir.glob(f"{legacy_prefix}{legacy_family}_2d_*.npz"))
-    if not candidates:
-        return None
-    return max(set(candidates), key=lambda path: path.stat().st_mtime)
-
-
 def normalize_finsler_optimizer(finsler_optimizer):
     if not isinstance(finsler_optimizer, str):
         raise TypeError(
@@ -1589,16 +1428,8 @@ def _load_one_velocity_inputs_cache(cache_path, expected_metadata):
         labels = cached_labels(cache)
         cell_ids = cached_string_array(cache, "cell_ids", default_size=len(x_umap))
         original_indices = cached_int_array(cache, "original_indices", default_size=len(x_umap))
-        gap_arrays = {
-            "labels": labels_to_cache(labels),
-            "cell_ids": cell_ids,
-            "original_indices": original_indices,
-            "gap_removed_original_indices": cached_int_array(cache, "gap_removed_original_indices"),
-            "gap_before_indices": cached_int_array(cache, "gap_before_indices"),
-            "gap_after_indices": cached_int_array(cache, "gap_after_indices"),
-        }
 
-    return x_umap, dists_velocity, labels, cell_ids, original_indices, gap_arrays
+    return x_umap, dists_velocity, labels, cell_ids, original_indices
 
 
 def pancreas_state_cache_path(raw_dir, *, preprocessing, velocity, dataset_prefix="pancreas", seed=42):
@@ -1640,24 +1471,7 @@ def load_pancreas_state_cache(cache_path, expected_metadata):
         original_indices = np.asarray(adata.obs["finsler_mds_original_index"], dtype=int)
     else:
         original_indices = np.arange(adata.n_obs, dtype=int)
-    gap_arrays = {
-        "labels": labels_to_cache(labels),
-        "cell_ids": cell_ids,
-        "original_indices": original_indices,
-        "gap_removed_original_indices": np.asarray(
-            adata.uns.get("finsler_mds_gap_removed_original_indices", []),
-            dtype=int,
-        ),
-        "gap_before_indices": np.asarray(
-            adata.uns.get("finsler_mds_gap_before_indices", []),
-            dtype=int,
-        ),
-        "gap_after_indices": np.asarray(
-            adata.uns.get("finsler_mds_gap_after_indices", []),
-            dtype=int,
-        ),
-    }
-    return adata, labels, cell_ids, original_indices, gap_arrays
+    return adata, labels, cell_ids, original_indices
 
 
 def pancreas_state_cache_matches(adata, expected_metadata):
@@ -1693,7 +1507,6 @@ def save_pancreas_state_cache(
         labels,
         cell_ids,
         original_indices,
-        gap_arrays,
         metadata,
 ):
     cache_path = Path(cache_path)
@@ -1704,12 +1517,6 @@ def save_pancreas_state_cache(
         adata.obs["clusters"] = np.asarray(labels, dtype=str)
     adata.obs["finsler_mds_original_index"] = np.asarray(original_indices, dtype=int)
     adata.uns["finsler_mds_state_metadata_json"] = json.dumps(metadata, sort_keys=True)
-    for key, uns_key in [
-            ("gap_removed_original_indices", "finsler_mds_gap_removed_original_indices"),
-            ("gap_before_indices", "finsler_mds_gap_before_indices"),
-            ("gap_after_indices", "finsler_mds_gap_after_indices"),
-    ]:
-        adata.uns[uns_key] = np.asarray(gap_arrays.get(key, []), dtype=int)
     adata.write_h5ad(cache_path)
     print(f"Saved pancreas velocity state cache: {cache_path}")
 
@@ -1717,11 +1524,6 @@ def save_pancreas_state_cache(
 def velocity_cache_metadata_matches(cached_metadata, expected_metadata):
     if cached_metadata == expected_metadata:
         return True
-    if not expected_metadata.get("gap", {}).get("enabled", False) and "gap" not in cached_metadata:
-        legacy_expected = dict(expected_metadata)
-        legacy_expected.pop("gap", None)
-        if cached_metadata == legacy_expected:
-            return True
     # Caches created before the Finsler-neighbor refactor used
     # ``velocity_graph_neighbors`` for the Euclidean support and had no
     # additional Finsler-neighbor edges.
@@ -1733,8 +1535,6 @@ def velocity_cache_metadata_matches(cached_metadata, expected_metadata):
         legacy_expected = dict(expected_metadata)
         legacy_expected["velocity_graph_neighbors"] = legacy_expected.pop("velocity_kNN_euclid")
         legacy_expected.pop("velocity_kNN_finsler", None)
-        if not legacy_expected.get("gap", {}).get("enabled", False):
-            legacy_expected.pop("gap", None)
         if cached_metadata == legacy_expected:
             return True
     # Older caches used the exponential formula before the formula was explicit

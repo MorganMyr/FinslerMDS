@@ -64,7 +64,7 @@ def build_local_global_pairs(
         landmark_indices=None,
         n_global_landmarks=0,
         random_landmark_fraction=1.0,
-        fps_init="diameter_pair",
+        fps_init="random",
         random_state=None,
         local_weight=1.0,
         local_global_reweighting="none",
@@ -254,7 +254,7 @@ def select_landmarks(
         n_global_landmarks,
         random_state,
         random_landmark_fraction=1.0,
-        fps_init="diameter_pair",
+        fps_init="random",
         fixed_farthest_landmarks=None,
 ):
     n_samples = D.shape[0]
@@ -454,7 +454,7 @@ def _add_local_pairs(active, allowed, D, n_local_neighbors):
         active[source, chosen] = True
 
 
-def _farthest_point_landmarks(D, n_landmarks, rng, *, fps_init="diameter_pair"):
+def _farthest_point_landmarks(D, n_landmarks, rng, *, fps_init="random"):
     if fps_init not in {"diameter_pair", "random"}:
         raise ValueError("fps_init must be 'diameter_pair' or 'random'.")
     distances = symmetrized_local_selection_distances(D)

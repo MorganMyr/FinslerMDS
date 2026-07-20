@@ -688,8 +688,8 @@ def path_frozen(
     landmark_indices=None,
     n_landmark=0,
     random_landmark_fraction=1.0,
-    fps_init="diameter_pair",
-    resample_random_landmarks=False,
+    fps_init="random",
+    resample_random_landmarks=True,
     mask_random_state=None,
     targets_per_landmark=None,
     target_random_state=None,
@@ -732,7 +732,7 @@ def path_frozen(
     ``resample_random_landmarks``
         If True, re-select only the random landmark subset at each outer
         iteration. Farthest-point landmarks and explicit ``landmark_indices``
-        remain fixed.
+        remain fixed. Enabled by default.
     ``pair_mask``
         Restrict all active-pair choices to a user-provided boolean mask.
     ``targets_per_landmark``

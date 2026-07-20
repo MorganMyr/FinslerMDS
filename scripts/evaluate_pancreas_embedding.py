@@ -42,6 +42,10 @@ from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     load_or_compute_boundary_neighbor_plan,
     velocity_alignment_preservation_from_neighbors,
 )
+from finsler_mds.utils.pancreas_files import (  # noqa: E402
+    pancreas_velocity_cache_path,
+    resolve_pancreas_embedding_path,
+)
 from finsler_mds.utils.pancreas import (  # noqa: E402
     PANCREAS_DATASET_SOURCE,
     PANCREAS_TRANSITIONS,
@@ -540,13 +544,14 @@ def velocity_inputs_path(
         kNN_euclid=30,
         kNN_finsler=0,
 ):
-    return Path(raw_dir) / (
+    filename = (
         f"pancreas_velocity_inputs_{VELOCITY['mode']}_"
         f"{velocity_formula_tag(distance_formula)}_"
         f"valpha{cache_token(velocity_alpha)}_"
         f"cclip{cache_token(cos_clip)}_"
         f"ke{int(kNN_euclid)}_kf{int(kNN_finsler)}_s{SEED}.npz"
     )
+    return pancreas_velocity_cache_path(raw_dir, filename)
 
 
 def load_embedding(path) -> np.ndarray:
@@ -568,15 +573,7 @@ def load_embedding(path) -> np.ndarray:
 
 
 def resolve_embedding_path(value: str, raw_dir: Path) -> Path:
-    path = Path(value)
-    candidates = [path]
-    if not path.is_absolute():
-        candidates.insert(0, raw_dir / path)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    searched = ", ".join(str(candidate) for candidate in candidates)
-    raise FileNotFoundError(f"Embedding file not found. Searched: {searched}")
+    return resolve_pancreas_embedding_path(value, raw_dir)
 
 
 def boundary_plan_name(n_neighbors: int) -> str:
@@ -631,11 +628,11 @@ def normalize_selected_frontiers(selected_frontiers):
 def print_row(row: dict[str, object]) -> None:
     parts = [
         str(row.get("name", "")),
-        f"CBDir={float(row['cbdir']):.6f}",
-        f"ICVCoh={float(row['icvcoh']):.6f}",
-        f"GVCoh={float(row['gvcoh']):.6f}",
-        f"SpearmanCos={float(row['spearman_cos']):.6f}",
-        f"Sign={float(row['sign_correctness']):.6f}",
+        f"CBDir={float(row['cbdir']):.3f}",
+        f"ICVCoh={float(row['icvcoh']):.3f}",
+        f"VAC={float(row['spearman_cos']):.3f}",
+        f"VAS={float(row['sign_correctness']):.3f}",
+        f"GVCoh={float(row['gvcoh']):.3f}",
     ]
     if "direct_weighted_stress" in row:
         parts.append(f"stress={float(row['direct_weighted_stress']):.6g}")

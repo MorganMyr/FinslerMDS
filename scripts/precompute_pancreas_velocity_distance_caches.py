@@ -23,16 +23,16 @@ from scripts.main_pancreas import (  # noqa: E402
     cache_token,
     labels_to_cache,
     main_pancreas,
-    normalize_pancreas_gap_config,
     normalize_velocity_distance_formula,
     pancreas_cache_metadata,
-    pancreas_gap_prefix,
     pancreas_state_cache_metadata,
     pancreas_state_cache_path,
+    pancreas_umap_embedding_path,
     pancreas_umap_variant_tag,
     project_velocity_to_pca,
     load_pancreas_state_cache,
 )
+from finsler_mds.utils.pancreas_files import pancreas_velocity_cache_path  # noqa: E402
 
 
 SEED = 42
@@ -61,7 +61,6 @@ UMAP = {
     "negative_sample_rate": 10,
     "init_pos": "spectral",
 }
-GAP = normalize_pancreas_gap_config({"enabled": False})
 
 ALPHA_CLIP_GRID = [
     (0.0, 0.4),
@@ -82,7 +81,7 @@ def main():
     raw_dir = script_dir / "res" / "pancreas" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    adata, labels, cell_ids, original_indices, gap_arrays = load_or_create_state(raw_dir)
+    adata, labels, cell_ids, original_indices = load_or_create_state(raw_dir)
     x_pca = np.asarray(adata.obsm["X_pca"][:, :PREPROCESSING["n_pcs"]], dtype=float)
     velocity_pca = project_velocity_to_pca(adata, PREPROCESSING["n_pcs"])
     x_umap = load_or_create_umap_2d(raw_dir)
@@ -96,7 +95,6 @@ def main():
             labels,
             cell_ids,
             original_indices,
-            gap_arrays,
             alpha,
             cos_clip,
         )
@@ -111,14 +109,13 @@ def load_or_create_state(raw_dir):
         moments_n_neighbors=PREPROCESSING["moments_n_neighbors"],
         velocity_mode=VELOCITY["mode"],
         recover_dynamics_max_iter=VELOCITY["recover_dynamics_max_iter"],
-        gap=GAP,
         seed=SEED,
     )
     state_path = pancreas_state_cache_path(
         raw_dir,
         preprocessing=PREPROCESSING,
         velocity=VELOCITY,
-        dataset_prefix=pancreas_gap_prefix(GAP),
+        dataset_prefix="pancreas",
         seed=SEED,
     )
     state = load_pancreas_state_cache(state_path, state_metadata)
@@ -137,7 +134,8 @@ def load_or_create_state(raw_dir):
 
 
 def load_or_create_umap_2d(raw_dir):
-    path = raw_dir / f"umap_{VELOCITY['mode']}_{pancreas_umap_variant_tag(UMAP)}s{SEED}.npy"
+    cache_tag = f"{VELOCITY['mode']}_{pancreas_umap_variant_tag(UMAP)}s{SEED}"
+    path = Path(pancreas_umap_embedding_path(raw_dir, cache_tag, n_components=2, dataset_prefix="pancreas"))
     if path.exists():
         return np.asarray(np.load(path), dtype=float)
     print("2D UMAP cache missing; running main_pancreas once to create it.")
@@ -155,7 +153,6 @@ def ensure_distance_cache(
         labels,
         cell_ids,
         original_indices,
-        gap_arrays,
         alpha,
         cos_clip,
 ):
@@ -186,9 +183,6 @@ def ensure_distance_cache(
         labels=labels_to_cache(labels),
         cell_ids=np.asarray(cell_ids, dtype=str),
         original_indices=np.asarray(original_indices, dtype=int),
-        gap_removed_original_indices=np.asarray(gap_arrays.get("gap_removed_original_indices", []), dtype=int),
-        gap_before_indices=np.asarray(gap_arrays.get("gap_before_indices", []), dtype=int),
-        gap_after_indices=np.asarray(gap_arrays.get("gap_after_indices", []), dtype=int),
         metadata_json=json.dumps(metadata, sort_keys=True),
     )
     print(f"Saved: {path.name}")
@@ -203,7 +197,7 @@ def velocity_inputs_path(raw_dir, *, alpha, cos_clip):
         f"ke{VELOCITY['kNN_euclid']}_kf{VELOCITY['kNN_finsler']}_"
         f"{pancreas_umap_variant_tag(UMAP)}s{SEED}"
     )
-    return Path(raw_dir) / f"{pancreas_gap_prefix(GAP)}_velocity_inputs_{tag}.npz"
+    return pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{tag}.npz")
 
 
 def velocity_cache_metadata(alpha, cos_clip):
@@ -229,7 +223,6 @@ def velocity_cache_metadata(alpha, cos_clip):
         umap_maxiter=UMAP["maxiter"],
         umap_negative_sample_rate=UMAP["negative_sample_rate"],
         umap_init_pos=UMAP["init_pos"],
-        gap=GAP,
         seed=SEED,
     )
 

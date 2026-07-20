@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from finsler_mds.utils.pancreas_files import pancreas_velocity_cache_path  # noqa: E402
 from finsler_mds.utils.umap import directed_fuzzy_graph_from_dense  # noqa: E402
 from scripts.main_pancreas import cache_token  # noqa: E402
 
@@ -81,7 +82,8 @@ def main() -> None:
 
 
 def load_dissimilarities(v_alpha, cos_clip):
-    path = RAW_DIR / (
+    path = pancreas_velocity_cache_path(
+        RAW_DIR,
         "pancreas_velocity_inputs_dynamical_vrand_"
         f"valpha{cache_token(v_alpha)}_"
         f"cclip{cache_token(cos_clip)}_"

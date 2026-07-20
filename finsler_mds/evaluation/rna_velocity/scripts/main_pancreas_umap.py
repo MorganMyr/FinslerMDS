@@ -19,6 +19,7 @@ from finsler_mds.evaluation.rna_velocity import (  # noqa: E402
     project_velocity_graph_to_embedding,
 )
 from finsler_mds.utils.pancreas import PANCREAS_TRANSITIONS  # noqa: E402
+from finsler_mds.utils.pancreas_files import pancreas_velocity_cache_dir, pancreas_velocity_cache_path  # noqa: E402
 
 
 def main_pancreas_umap():
@@ -193,10 +194,10 @@ def _matching_velocity_cache(raw_dir, embedding_path):
         tag = name[len("umap_"):-len(".npy")]
     else:
         return None
-    direct = raw_dir / f"pancreas_velocity_inputs_{tag}.npz"
+    direct = pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{tag}.npz")
     if direct.exists():
         return direct
-    candidates = sorted(raw_dir.glob("pancreas_velocity_inputs_*.npz"))
+    candidates = sorted(pancreas_velocity_cache_dir(raw_dir).glob("pancreas_velocity_inputs_*.npz"))
     if len(candidates) == 1:
         return candidates[0]
     return None

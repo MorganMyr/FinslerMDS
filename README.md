@@ -48,6 +48,14 @@ Run the following scripts to replicate the visual results from the paper:
 
 - `main_graph`: Fig 5
 
+## Directed link prediction
+
+The separate `finsler_mds.link_prediction` package reproduces the Table 2
+representation-learning protocol, supports Randers and Matsumoto metrics, and
+can evaluate external baselines such as MagNet on the exact same splits.
+See [`finsler_mds/link_prediction/README.md`](finsler_mds/link_prediction/README.md)
+and the `scripts/main_link_prediction_*.py` entry points.
+
 ---
 
 ## Note on (worm)holes

@@ -27,6 +27,7 @@ from finsler_mds.evaluation.rna_velocity.scripts.main_pancreas_saved_embeddings 
     _short_embedding_name,
 )
 from finsler_mds.evaluation.rna_velocity.scripts.main_pancreas_scvelo_umap import _csv_value  # noqa: E402
+from finsler_mds.utils.pancreas_files import pancreas_velocity_cache_dir, pancreas_velocity_cache_path  # noqa: E402
 
 
 def main_pancreas_asymmetry_embeddings():
@@ -251,19 +252,19 @@ def _velocity_cache_path(raw_dir, velocity_alpha, *, velocity_formula, velocity_
     token = _cache_token(velocity_alpha)
     legacy_token = str(float(velocity_alpha)).replace(".", "p")
     candidates = [
-        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_cclip0p4_ke30_kf0_s{seed}.npz",
-        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_s{seed}.npz",
-        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_valpha{token}_s{seed}.npz",
-        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{legacy_token}_s{seed}.npz",
-        raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_valpha{legacy_token}_s{seed}.npz",
+        pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_cclip0p4_ke30_kf0_s{seed}.npz"),
+        pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_s{seed}.npz"),
+        pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_valpha{token}_s{seed}.npz"),
+        pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{legacy_token}_s{seed}.npz"),
+        pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_valpha{legacy_token}_s{seed}.npz"),
     ]
     if np.isclose(velocity_alpha, 2.0) and formula_tag == "vexp":
-        candidates.append(raw_dir / f"pancreas_velocity_inputs_{velocity_mode}_s{seed}.npz")
+        candidates.append(pancreas_velocity_cache_path(raw_dir, f"pancreas_velocity_inputs_{velocity_mode}_s{seed}.npz"))
     for candidate in candidates:
         if candidate.exists():
             return candidate
     globbed = sorted(
-        raw_dir.glob(f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_*.npz"),
+        pancreas_velocity_cache_dir(raw_dir).glob(f"pancreas_velocity_inputs_{velocity_mode}_{formula_tag}_valpha{token}_*.npz"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )

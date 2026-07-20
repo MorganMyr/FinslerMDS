@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Optional directed link-prediction experiments. Dataset loading and splitting
+# remain local; PyG Signed Directed is used only for external GNN baselines.
+torch==2.13.0
+optuna==4.9.0
+torch-geometric==2.8.0
+torch-geometric-signed-directed==1.1.1

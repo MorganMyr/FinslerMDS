@@ -185,11 +185,11 @@ def velocity_directed_graph(
         if not 0 <= cos_clip <= 1:
             raise ValueError("cos_clip must be None or a float in [0, 1].")
     if distance_formula in {"randers", "matsumoto"}:
-        max_cos = 1.0 if cos_clip is None else cos_clip
+        max_cos = 0.77 if cos_clip is None else 0.77 * cos_clip
         if alpha < 0 or alpha * max_cos >= 1:
             raise ValueError(
                 f"{distance_formula.title()} velocity distances require alpha >= 0 and "
-                "alpha * max(|cos|) < 1. Lower alpha or set a smaller cos_clip."
+                "alpha * cos_clip * 0.77 < 1. Lower alpha or set a smaller cos_clip."
             )
 
     support = symmetric_knn_graph(

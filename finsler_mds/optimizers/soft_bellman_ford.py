@@ -638,7 +638,7 @@ def soft_bellman_ford(
     landmark_indices=None,
     n_global_landmarks=0,
     random_landmark_fraction=1.0,
-    fps_init="diameter_pair",
+    fps_init="random",
     mask_random_state=None,
     max_global_targets_per_source=None,
     target_random_state=None,
