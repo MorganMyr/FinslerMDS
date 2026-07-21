@@ -91,7 +91,6 @@ def generate_splits(
     *,
     num_splits: int = 10,
     first_seed: int = 0,
-    evaluation_reverse_negative_fraction: float | None = None,
 ) -> list[LinkPredictionSplit]:
     """Generate the noisy binary tasks used by MagNet's EdgeSplitter pipeline.
 
@@ -101,10 +100,6 @@ def generate_splits(
     task = LinkTask(task)
     if num_splits <= 0:
         raise ValueError("num_splits must be positive.")
-    if evaluation_reverse_negative_fraction is not None and not (
-        0 <= evaluation_reverse_negative_fraction <= 1
-    ):
-        raise ValueError("evaluation_reverse_negative_fraction must be in [0, 1].")
     if np.any(graph.edge_index[0] == graph.edge_index[1]):
         raise ValueError("Remove self-loops before generating splits.")
 
@@ -119,13 +114,7 @@ def generate_splits(
             full_graph, _TEST_FRACTION, test_rng, keep_connected=True
         )
         test = _make_examples(
-            test_positive,
-            directed_edges,
-            task,
-            full_graph,
-            test_rng,
-            used_non_edges,
-            evaluation_reverse_negative_fraction,
+            test_positive, directed_edges, task, full_graph, test_rng, used_non_edges
         )
 
         validation_rng = np.random.RandomState(seed)
@@ -139,7 +128,6 @@ def generate_splits(
             full_graph,
             validation_rng,
             used_non_edges,
-            evaluation_reverse_negative_fraction,
         )
 
         train_rng = np.random.RandomState(seed)
@@ -212,7 +200,6 @@ def _make_examples(
     full_graph: nx.Graph,
     rng: np.random.RandomState,
     used_non_edges: set[tuple[int, int]],
-    reverse_negative_fraction: float | None = None,
 ) -> EdgeExamples:
     non_edges = np.empty((0, 2), dtype=np.int64)
     if task is LinkTask.EXISTENCE:
@@ -222,14 +209,7 @@ def _make_examples(
         used_non_edges.update(sampled)
         used_non_edges.update((v, u) for u, v in sampled)
         non_edges = np.asarray(sampled, dtype=np.int64)
-    return _label_noisy(
-        positive_pairs,
-        non_edges,
-        directed_edges,
-        task,
-        rng,
-        reverse_negative_fraction,
-    )
+    return _label_noisy(positive_pairs, non_edges, directed_edges, task, rng)
 
 
 def _label_noisy(
@@ -238,7 +218,6 @@ def _label_noisy(
     directed_edges: set[tuple[int, int]],
     task: LinkTask,
     rng: np.random.RandomState,
-    reverse_negative_fraction: float | None = None,
 ) -> EdgeExamples:
     """Alternate orientations and randomize the target of reciprocal pairs."""
     pairs = np.asarray(positive_pairs, dtype=np.int64).copy()
@@ -264,28 +243,6 @@ def _label_noisy(
 
     if task is LinkTask.DIRECTION:
         return EdgeExamples(pairs, labels)
-
-    if reverse_negative_fraction is not None:
-        positive = np.flatnonzero(labels == 1)
-        reverse = np.flatnonzero(labels == 0)
-        target = len(positive)
-        while round(target * reverse_negative_fraction) > len(reverse):
-            target -= 1
-        num_reverse = round(target * reverse_negative_fraction)
-        selected = np.concatenate(
-            (
-                rng.choice(positive, target, replace=False),
-                rng.choice(reverse, num_reverse, replace=False),
-                len(pairs)
-                + rng.choice(len(non_edges), target - num_reverse, replace=False),
-            )
-        )
-        all_labels = np.concatenate(
-            (labels, np.zeros(len(non_edges), dtype=np.float32))
-        )
-        return EdgeExamples(
-            np.vstack((pairs, non_edges))[selected], all_labels[selected]
-        )
 
     pairs = np.vstack((pairs, non_edges))
     labels = np.concatenate((labels, np.zeros(len(non_edges), dtype=np.float32)))

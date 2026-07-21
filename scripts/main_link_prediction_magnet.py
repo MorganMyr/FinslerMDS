@@ -29,18 +29,17 @@ from finsler_mds.link_prediction.baselines import (  # noqa: E402
     BaselineTrainingConfig,
     MagNetBaseline,
     MagNetHyperparameters,
-    evaluate_baseline,
-    save_baseline_summary,
-    tune_baseline,
+    run_baseline,
 )
 from finsler_mds.link_prediction.datasets import (  # noqa: E402
     DATASET_NAMES,
     load_directed_dataset,
 )
-from finsler_mds.link_prediction.runs import (  # noqa: E402
-    create_tagged_run_directory,
-    save_json,
+from finsler_mds.link_prediction.optimization import (  # noqa: E402
+    HYPERPARAMETER_SELECTION_PROTOCOL,
+    OptunaConfig,
 )
+from finsler_mds.link_prediction.runs import create_run_directory, save_json  # noqa: E402
 from finsler_mds.link_prediction.split_cache import load_or_create_splits  # noqa: E402
 from finsler_mds.link_prediction.splits import (  # noqa: E402
     LinkTask,
@@ -63,7 +62,6 @@ def parse_args():
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--num-splits", type=int, default=10)
     parser.add_argument("--first-split-seed", type=int, default=0)
-    parser.add_argument("--evaluation-reverse-negative-fraction", type=float)
     parser.add_argument("--trials", type=int, default=50)
     parser.add_argument("--optuna-seed", type=int, default=0)
     parser.add_argument("--timeout", type=float)
@@ -95,11 +93,10 @@ def main():
     args = parse_args()
     if args.num_splits <= 0:
         raise ValueError("--num-splits must be positive.")
-    evaluation_mix = args.evaluation_reverse_negative_fraction
-    if evaluation_mix is not None and not 0 <= evaluation_mix <= 1:
-        raise ValueError("--evaluation-reverse-negative-fraction must be in [0, 1].")
     if not args.fixed and args.trials <= 0:
         raise ValueError("--trials must be positive.")
+    if args.timeout is not None and args.timeout <= 0:
+        raise ValueError("--timeout must be positive when provided.")
 
     graph = load_directed_dataset(
         args.dataset,
@@ -130,12 +127,11 @@ def main():
         )
     )
     dataset_output = args.output_root / graph.name
-    run_directory = create_tagged_run_directory(
-        dataset_output / "baselines" / baseline.name,
+    run_directory = create_run_directory(
+        dataset_output,
         graph.name,
         baseline.name,
         "fixed" if args.fixed else f"n{args.trials}",
-        SPLIT_PROTOCOL,
     )
     tasks = (
         (LinkTask.EXISTENCE, LinkTask.DIRECTION)
@@ -145,7 +141,7 @@ def main():
     save_json(
         run_directory / "config.json",
         {
-            "format": "link_prediction_baseline_run_v1",
+            "format": "link_prediction_baseline_run_v2",
             "run_id": run_directory.name,
             "baseline": baseline.name,
             "dataset": graph.name,
@@ -154,7 +150,6 @@ def main():
             "tasks": [task.value for task in tasks],
             "splits": {
                 **split_protocol_metadata(),
-                "evaluation_reverse_negative_fraction": evaluation_mix,
                 "count": args.num_splits,
                 "first_seed": args.first_split_seed,
             },
@@ -171,9 +166,10 @@ def main():
                 if args.fixed
                 else {
                     "method": "optuna",
-                    "num_trials": args.trials,
+                    "protocol": HYPERPARAMETER_SELECTION_PROTOCOL,
+                    "num_trials_per_split": args.trials,
                     "seed": args.optuna_seed,
-                    "timeout": args.timeout,
+                    "timeout_per_split": args.timeout,
                     "search_space": baseline.search_space,
                 }
             ),
@@ -182,11 +178,9 @@ def main():
     print(f"Run directory: {run_directory}")
 
     for task in tasks:
-        task_evaluation_mix = evaluation_mix if task is LinkTask.EXISTENCE else None
-        mix_suffix = "" if task_evaluation_mix is None else f"_rev{task_evaluation_mix}"
         split_cache = dataset_output / "split_cache" / (
             f"{SPLIT_PROTOCOL}_{task.value}_n{args.num_splits}_"
-            f"seed{args.first_split_seed}{mix_suffix}.npz"
+            f"seed{args.first_split_seed}.npz"
         )
         splits = load_or_create_splits(
             split_cache,
@@ -194,7 +188,6 @@ def main():
             task,
             num_splits=args.num_splits,
             first_seed=args.first_split_seed,
-            evaluation_reverse_negative_fraction=task_evaluation_mix,
         )
         print(
             f"{task.value}: {len(splits)} splits; train/val/test examples = "
@@ -203,32 +196,31 @@ def main():
             f"{len(splits[0].test.labels)}; observed arcs = "
             f"{splits[0].observed_edge_index.shape[1]}"
         )
-        if args.fixed:
-            hyperparameters = fixed_hyperparameters
-        else:
+        optuna_config = None
+        if not args.fixed:
             database = (run_directory / f"{task.value}_optuna.sqlite3").resolve()
-            hyperparameters, study = tune_baseline(
-                baseline,
-                graph,
-                splits,
-                training_config,
+            optuna_config = OptunaConfig(
                 num_trials=args.trials,
-                optuna_seed=args.optuna_seed,
+                seed=args.optuna_seed,
                 storage=f"sqlite:///{database}",
                 timeout=args.timeout,
             )
-            print(f"{task.value}: best validation AUC={study.best_value:.6f}")
-            print(f"{task.value}: best hyperparameters={hyperparameters}")
-
-        summary = evaluate_baseline(
+        summary = run_baseline(
             baseline,
             graph,
             splits,
-            hyperparameters,
             training_config,
+            optuna_config=optuna_config,
+            fixed_hyperparameters=(fixed_hyperparameters if args.fixed else None),
+            progress=lambda run: print(
+                f"{task.value}: split {run.split_index + 1}/{len(splits)}, "
+                f"validation={run.validation_roc_auc:.6f}, "
+                f"test={run.test_roc_auc:.6f}, "
+                f"hyperparameters={run.hyperparameters}"
+            ),
         )
         result_path = run_directory / f"{task.value}_summary.json"
-        save_baseline_summary(result_path, summary)
+        save_json(result_path, summary.as_dict())
         print(
             f"{task.value}: test ROC-AUC = "
             f"{100 * summary.mean_test_roc_auc:.2f} ± "

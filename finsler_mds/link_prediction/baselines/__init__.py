@@ -3,9 +3,7 @@
 from .base import (
     BaselineSummary,
     BaselineTrainingConfig,
-    evaluate_baseline,
-    save_baseline_summary,
-    tune_baseline,
+    run_baseline,
 )
 from .magnet import MagNetBaseline, MagNetHyperparameters
 
@@ -14,7 +12,5 @@ __all__ = [
     "BaselineTrainingConfig",
     "MagNetBaseline",
     "MagNetHyperparameters",
-    "evaluate_baseline",
-    "save_baseline_summary",
-    "tune_baseline",
+    "run_baseline",
 ]

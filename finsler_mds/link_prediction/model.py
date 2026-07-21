@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from .decoder import FermiDiracDecoder
-from .initialization import DEFAULT_INITIALIZATION, INITIALIZATION_NAMES
 
 
 class FinslerLinkPredictor(nn.Module):
@@ -22,8 +21,6 @@ class FinslerLinkPredictor(nn.Module):
         *,
         radius: float,
         temperature: float,
-        initialization: str = DEFAULT_INITIALIZATION,
-        initial_embedding=None,
     ):
         super().__init__()
         if num_nodes <= 0 or dimension <= 0:
@@ -36,33 +33,11 @@ class FinslerLinkPredictor(nn.Module):
             radius=radius,
             temperature=temperature,
         )
-        self._initialize_embedding(initialization, initial_embedding, radius)
+        self.reset_parameters()
 
-    @torch.no_grad()
-    def _initialize_embedding(self, initialization, initial_embedding, radius):
-        if initialization not in INITIALIZATION_NAMES:
-            raise ValueError(f"Unknown embedding initialization {initialization!r}.")
-        # Always consume the same Gaussian draw so later training randomness is
-        # unchanged when only the initialization mode changes.
+    def reset_parameters(self):
         nn.init.normal_(self.embedding.weight, std=1 / math.sqrt(self.dimension))
-        if initialization == "spectral":
-            if initial_embedding is None:
-                raise ValueError("Spectral initialization requires coordinates.")
-            self.embedding.weight.copy_(
-                torch.as_tensor(
-                    initial_embedding,
-                    dtype=self.embedding.weight.dtype,
-                    device=self.embedding.weight.device,
-                )
-            )
         self.center_embeddings_()
-        if initialization == "normal":
-            self.embedding.weight.mul_(math.sqrt(self.dimension))
-        elif initialization == "radius":
-            mean_pair_squared = (
-                2 * self.embedding.weight.square().sum() / (self.num_nodes - 1)
-            )
-            self.embedding.weight.mul_(math.sqrt(radius / mean_pair_squared.item()))
 
     def edge_displacements(self, pairs: torch.Tensor) -> torch.Tensor:
         if pairs.ndim != 2 or pairs.shape[1] != 2:

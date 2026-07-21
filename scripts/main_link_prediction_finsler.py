@@ -33,27 +33,22 @@ from finsler_mds.link_prediction.datasets import (  # noqa: E402
 from finsler_mds.link_prediction.experiments import (  # noqa: E402
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_DIMENSIONS,
-    HYPERPARAMETER_SELECTION_PROTOCOL,
     METRIC_NAMES,
     ModelHyperparameters,
-    OptunaConfig,
     OptunaSearchSpace,
-    evaluate_hyperparameters,
-    rerank_hyperparameters,
-    save_experiment_summary,
-    tune_hyperparameters,
+    run_experiment,
 )
 from finsler_mds.link_prediction.evaluation import (  # noqa: E402
     SCORING_PROTOCOL,
     score_name,
 )
-from finsler_mds.link_prediction.initialization import (  # noqa: E402
-    DEFAULT_INITIALIZATION,
-    INITIALIZATION_NAMES,
-)
 from finsler_mds.link_prediction.runs import (  # noqa: E402
     create_run_directory,
     save_json,
+)
+from finsler_mds.link_prediction.optimization import (  # noqa: E402
+    HYPERPARAMETER_SELECTION_PROTOCOL,
+    OptunaConfig,
 )
 from finsler_mds.link_prediction.split_cache import load_or_create_splits  # noqa: E402
 from finsler_mds.link_prediction.splits import (  # noqa: E402
@@ -88,7 +83,6 @@ def parse_args():
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--num-splits", type=int, default=10)
     parser.add_argument("--first-split-seed", type=int, default=0)
-    parser.add_argument("--evaluation-reverse-negative-fraction", type=float)
     parser.add_argument(
         "--dimension",
         dest="dimensions",
@@ -99,8 +93,6 @@ def parse_args():
     parser.add_argument("--trials", type=int, default=50)
     parser.add_argument("--optuna-seed", type=int, default=0)
     parser.add_argument("--timeout", type=float)
-    parser.add_argument("--rerank-top", type=int, default=8)
-    parser.add_argument("--rerank-splits", type=int, default=3)
 
     parser.add_argument("--alpha-max", type=float)
     parser.add_argument("--max-epochs", type=int, default=1_500)
@@ -110,12 +102,6 @@ def parse_args():
     parser.add_argument("--evaluation-batch-size", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--training-seed", type=int, default=0)
-    parser.add_argument(
-        "--initialization",
-        choices=INITIALIZATION_NAMES,
-        default=DEFAULT_INITIALIZATION,
-        help="Node-coordinate initialization (default: current).",
-    )
 
     fixed = parser.add_argument_group(
         "fixed execution (alpha, radius, temperature, and learning rate skip Optuna)"
@@ -131,6 +117,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.num_splits <= 0:
+        raise ValueError("--num-splits must be positive.")
+    if args.timeout is not None and args.timeout <= 0:
+        raise ValueError("--timeout must be positive when provided.")
     requested_dimensions = (
         tuple(args.dimensions) if args.dimensions else DEFAULT_EMBEDDING_DIMENSIONS
     )
@@ -138,9 +128,6 @@ def main():
         raise ValueError("--dimension values must be positive.")
     if len(set(requested_dimensions)) != len(requested_dimensions):
         raise ValueError("--dimension values must not contain duplicates.")
-    evaluation_mix = args.evaluation_reverse_negative_fraction
-    if evaluation_mix is not None and not 0 <= evaluation_mix <= 1:
-        raise ValueError("--evaluation-reverse-negative-fraction must be in [0, 1].")
     graph = load_directed_dataset(
         args.dataset,
         root=args.data_root,
@@ -161,7 +148,6 @@ def main():
         ),
         device=args.device,
         seed=args.training_seed,
-        initialization=args.initialization,
     )
     fixed_values = (args.alpha, args.radius, args.temperature, args.learning_rate)
     if any(value is not None for value in fixed_values) and not all(
@@ -208,14 +194,6 @@ def main():
             )
         if args.trials <= 0:
             raise ValueError("--trials must be positive.")
-        if args.timeout is not None and args.timeout <= 0:
-            raise ValueError("--timeout must be positive when provided.")
-        if args.rerank_top <= 0:
-            raise ValueError("--rerank-top must be positive.")
-        if args.rerank_splits < 0 or args.rerank_splits >= args.num_splits:
-            raise ValueError(
-                "--rerank-splits must be between 0 and --num-splits - 1."
-            )
         search_space = (
             OptunaSearchSpace(dimensions=requested_dimensions)
             if args.alpha_max is None
@@ -232,53 +210,27 @@ def main():
     dataset_output = args.output_root / graph.name
     run_directory = create_run_directory(
         dataset_output,
-        dataset=graph.name,
-        metric=args.metric,
-        dimensions=requested_dimensions,
-        alpha_max=None if search_space is None else search_space.alpha_max,
-        num_trials=None if search_space is None else args.trials,
-        protocol="_".join(
-            (
-                SPLIT_PROTOCOL,
-                EMBEDDING_TRAINING_PROTOCOL,
-                SCORING_PROTOCOL,
-                f"init{args.initialization}",
-                (
-                    f"rerank{args.rerank_top}x{args.rerank_splits}"
-                    if search_space is not None
-                    else "fixed"
-                ),
-            )
-        ),
+        graph.name,
+        args.metric,
+        "m" + "-".join(map(str, requested_dimensions)),
+        "fixed" if search_space is None else f"n{args.trials}",
     )
     optimization = (
         {"method": "fixed", "hyperparameters": asdict(fixed_hyperparameters)}
         if fixed_hyperparameters is not None
         else {
             "method": "optuna",
-            "num_trials": args.trials,
+            "protocol": HYPERPARAMETER_SELECTION_PROTOCOL,
+            "num_trials_per_split": args.trials,
             "seed": args.optuna_seed,
-            "timeout": args.timeout,
+            "timeout_per_split": args.timeout,
             "search_space": asdict(search_space),
-            "selection": {
-                "protocol": HYPERPARAMETER_SELECTION_PROTOCOL,
-                "tuning_split_index": 0,
-                "top_candidates": args.rerank_top,
-                "reranking_split_indices": list(
-                    range(1, args.rerank_splits + 1)
-                ),
-                "selection_score": (
-                    "mean_validation_roc_auc_excluding_tuning_split"
-                    if args.rerank_splits
-                    else "tuning_validation_roc_auc"
-                ),
-            },
         }
     )
     save_json(
         run_directory / "config.json",
         {
-            "format": "finsler_link_prediction_run_v5",
+            "format": "finsler_link_prediction_run_v6",
             "run_id": run_directory.name,
             "dataset": graph.name,
             "graph_fingerprint": graph.fingerprint,
@@ -290,7 +242,6 @@ def main():
             "evaluation_scores": {task.value: score_name(task) for task in tasks},
             "splits": {
                 **split_protocol_metadata(),
-                "evaluation_reverse_negative_fraction": evaluation_mix,
                 "count": args.num_splits,
                 "first_seed": args.first_split_seed,
             },
@@ -302,11 +253,9 @@ def main():
     print(f"Run directory: {run_directory}")
 
     for task in tasks:
-        task_evaluation_mix = evaluation_mix if task is LinkTask.EXISTENCE else None
-        mix_suffix = "" if task_evaluation_mix is None else f"_rev{task_evaluation_mix}"
         split_cache = dataset_output / "split_cache" / (
             f"{SPLIT_PROTOCOL}_{task.value}_n{args.num_splits}_"
-            f"seed{args.first_split_seed}{mix_suffix}.npz"
+            f"seed{args.first_split_seed}.npz"
         )
         splits = load_or_create_splits(
             split_cache,
@@ -314,7 +263,6 @@ def main():
             task,
             num_splits=args.num_splits,
             first_seed=args.first_split_seed,
-            evaluation_reverse_negative_fraction=task_evaluation_mix,
         )
         print(
             f"{task.value}: {len(splits)} cached splits; "
@@ -324,63 +272,32 @@ def main():
             f"{len(splits[0].test.labels)}"
         )
 
-        if fixed_hyperparameters is not None:
-            hyperparameters = fixed_hyperparameters
-        else:
+        optuna_config = None
+        if fixed_hyperparameters is None:
             database = (run_directory / f"{task.value}_optuna.sqlite3").resolve()
-            study = tune_hyperparameters(
-                graph,
-                splits,
-                metric_name=args.metric,
-                training_config=training_config,
-                search_space=search_space,
-                optuna_config=OptunaConfig(
-                    num_trials=args.trials,
-                    seed=args.optuna_seed,
-                    storage=f"sqlite:///{database}",
-                    timeout=args.timeout,
-                ),
+            optuna_config = OptunaConfig(
+                num_trials=args.trials,
+                seed=args.optuna_seed,
+                storage=f"sqlite:///{database}",
+                timeout=args.timeout,
             )
-            print(
-                f"{task.value}: best split-0 validation "
-                f"AUC={study.best_value:.6f}"
-            )
-            if args.rerank_splits:
-                selection = rerank_hyperparameters(
-                    graph,
-                    splits,
-                    study,
-                    metric_name=args.metric,
-                    top_candidates=args.rerank_top,
-                    num_reranking_splits=args.rerank_splits,
-                    training_config=training_config,
-                    progress=lambda index, total, candidate: print(
-                        f"{task.value}: reranking {index}/{total}, "
-                        f"trial {candidate.trial_number}, mean validation "
-                        f"AUC={candidate.mean_reranking_validation_roc_auc:.6f}"
-                    ),
-                )
-                hyperparameters = selection.hyperparameters
-                selection_path = run_directory / f"{task.value}_selection.json"
-                save_json(selection_path, selection.as_dict())
-                print(
-                    f"{task.value}: selected trial "
-                    f"{selection.selected_trial_number} after reranking"
-                )
-                print(f"Saved {selection_path}")
-            else:
-                hyperparameters = ModelHyperparameters(**study.best_params)
-            print(f"{task.value}: best hyperparameters={hyperparameters}")
-
-        summary = evaluate_hyperparameters(
+        summary = run_experiment(
             graph,
             splits,
-            hyperparameters,
             metric_name=args.metric,
             training_config=training_config,
+            search_space=search_space,
+            optuna_config=optuna_config,
+            fixed_hyperparameters=fixed_hyperparameters,
+            progress=lambda run: print(
+                f"{task.value}: split {run.split_index + 1}/{len(splits)}, "
+                f"validation={run.validation_roc_auc:.6f}, "
+                f"test={run.test_roc_auc:.6f}, "
+                f"hyperparameters={run.hyperparameters}"
+            ),
         )
         result_path = run_directory / f"{task.value}_summary.json"
-        save_experiment_summary(result_path, summary)
+        save_json(result_path, summary.as_dict())
         print(
             f"{task.value}: test ROC-AUC = "
             f"{100 * summary.mean_test_roc_auc:.2f} ± "
