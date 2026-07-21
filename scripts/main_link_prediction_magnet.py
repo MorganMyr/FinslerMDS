@@ -63,6 +63,7 @@ def parse_args():
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--num-splits", type=int, default=10)
     parser.add_argument("--first-split-seed", type=int, default=0)
+    parser.add_argument("--evaluation-reverse-negative-fraction", type=float)
     parser.add_argument("--trials", type=int, default=50)
     parser.add_argument("--optuna-seed", type=int, default=0)
     parser.add_argument("--timeout", type=float)
@@ -94,6 +95,9 @@ def main():
     args = parse_args()
     if args.num_splits <= 0:
         raise ValueError("--num-splits must be positive.")
+    evaluation_mix = args.evaluation_reverse_negative_fraction
+    if evaluation_mix is not None and not 0 <= evaluation_mix <= 1:
+        raise ValueError("--evaluation-reverse-negative-fraction must be in [0, 1].")
     if not args.fixed and args.trials <= 0:
         raise ValueError("--trials must be positive.")
 
@@ -150,6 +154,7 @@ def main():
             "tasks": [task.value for task in tasks],
             "splits": {
                 **split_protocol_metadata(),
+                "evaluation_reverse_negative_fraction": evaluation_mix,
                 "count": args.num_splits,
                 "first_seed": args.first_split_seed,
             },
@@ -177,9 +182,11 @@ def main():
     print(f"Run directory: {run_directory}")
 
     for task in tasks:
+        task_evaluation_mix = evaluation_mix if task is LinkTask.EXISTENCE else None
+        mix_suffix = "" if task_evaluation_mix is None else f"_rev{task_evaluation_mix}"
         split_cache = dataset_output / "split_cache" / (
             f"{SPLIT_PROTOCOL}_{task.value}_n{args.num_splits}_"
-            f"seed{args.first_split_seed}.npz"
+            f"seed{args.first_split_seed}{mix_suffix}.npz"
         )
         splits = load_or_create_splits(
             split_cache,
@@ -187,6 +194,7 @@ def main():
             task,
             num_splits=args.num_splits,
             first_seed=args.first_split_seed,
+            evaluation_reverse_negative_fraction=task_evaluation_mix,
         )
         print(
             f"{task.value}: {len(splits)} splits; train/val/test examples = "

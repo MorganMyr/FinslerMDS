@@ -13,6 +13,10 @@ from finsler_mds.metrics import (  # noqa: E402
 )
 from finsler_mds.link_prediction.decoder import FermiDiracDecoder  # noqa: E402
 from finsler_mds.link_prediction.evaluation import link_scores  # noqa: E402
+from finsler_mds.link_prediction.initialization import (  # noqa: E402
+    spectral_initialization,
+)
+from finsler_mds.link_prediction.model import FinslerLinkPredictor  # noqa: E402
 from finsler_mds.link_prediction.torch_metrics import torch_metric_length  # noqa: E402
 from finsler_mds.link_prediction.data import DirectedGraphData  # noqa: E402
 from finsler_mds.link_prediction.splits import (  # noqa: E402
@@ -78,7 +82,47 @@ def test_matsumoto_forbidden_surrogate_is_rejected():
         torch_metric_length(torch.tensor([[0.0, 1.0]]), metric)
 
 
-def test_end_to_end_training_smoke():
+def test_random_initializations_share_one_draw_and_radius_only_rescales_it():
+    def initialize(name):
+        torch.manual_seed(7)
+        model = FinslerLinkPredictor(
+            30,
+            5,
+            RandersMetric(alpha=0.4),
+            radius=3.0,
+            temperature=1.0,
+            initialization=name,
+        )
+        return model.embedding.weight.detach().clone(), torch.rand(4)
+
+    current, random_after_current = initialize("current")
+    normal, random_after_normal = initialize("normal")
+    radius, random_after_radius = initialize("radius")
+
+    torch.testing.assert_close(normal, current * np.sqrt(5))
+    scale = (radius * current).sum() / current.square().sum()
+    torch.testing.assert_close(radius, current * scale)
+    mean_pair_squared = 2 * radius.square().sum() / (len(radius) - 1)
+    torch.testing.assert_close(mean_pair_squared, torch.tensor(3.0))
+    torch.testing.assert_close(random_after_current, random_after_normal)
+    torch.testing.assert_close(random_after_current, random_after_radius)
+
+
+def test_spectral_initialization_is_centered_and_uses_default_scale():
+    edges = np.asarray(
+        [(node, (node + offset) % 20) for node in range(20) for offset in (1, 3)],
+        dtype=np.int64,
+    ).T
+    coordinates = spectral_initialization(edges, 20, 4, seed=3)
+
+    assert coordinates.shape == (20, 4)
+    np.testing.assert_allclose(coordinates.mean(axis=0), 0, atol=1e-6)
+    mean_pair_squared = 2 * np.square(coordinates).sum() / 19
+    np.testing.assert_allclose(mean_pair_squared, 2, rtol=1e-6)
+
+
+@pytest.mark.parametrize("initialization", ["current", "spectral"])
+def test_end_to_end_training_smoke(initialization):
     edges = []
     for node in range(20):
         edges.extend(
@@ -98,7 +142,13 @@ def test_end_to_end_training_smoke():
         dimension=4,
         radius=2.0,
         temperature=1.0,
-        config=TrainingConfig(max_epochs=5, patience=2, seed=3, device="cpu"),
+        config=TrainingConfig(
+            max_epochs=5,
+            patience=2,
+            seed=3,
+            device="cpu",
+            initialization=initialization,
+        ),
     )
     assert result.embedding.shape == (20, 4)
     assert np.isfinite(result.validation_auc)

@@ -65,6 +65,28 @@ def test_existence_splits_are_balanced_after_magnet_downsampling():
         assert examples.num_positive == examples.num_negative
 
 
+def test_existence_evaluation_negative_composition_is_configurable():
+    graph = _synthetic_graph()
+    directed_edges = set(map(tuple, graph.edge_index.T.tolist()))
+    legacy = generate_splits(graph, LinkTask.EXISTENCE, num_splits=1)[0]
+
+    for fraction in (0.0, 1.0):
+        split = generate_splits(
+            graph,
+            LinkTask.EXISTENCE,
+            num_splits=1,
+            evaluation_reverse_negative_fraction=fraction,
+        )[0]
+        np.testing.assert_array_equal(split.train.pairs, legacy.train.pairs)
+        np.testing.assert_array_equal(split.train.labels, legacy.train.labels)
+        for examples in (split.validation, split.test):
+            negatives = examples.pairs[examples.labels == 0]
+            reversed_fraction = np.mean(
+                [(int(v), int(u)) in directed_edges for u, v in negatives]
+            )
+            assert reversed_fraction == fraction
+
+
 def test_noisy_direction_randomizes_reciprocal_targets_reproducibly():
     positive = np.asarray([(i, i + 100) for i in range(100)])
     directed_edges = set(map(tuple, positive.tolist()))

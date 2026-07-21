@@ -10,6 +10,11 @@ import torch
 import torch.nn.functional as torch_f
 
 from .evaluation import roc_auc
+from .initialization import (
+    DEFAULT_INITIALIZATION,
+    INITIALIZATION_NAMES,
+    spectral_initialization,
+)
 from .model import FinslerLinkPredictor
 from .splits import LinkPredictionSplit
 
@@ -27,6 +32,7 @@ class TrainingConfig:
     evaluation_batch_size: int | None = None
     device: str = "auto"
     seed: int = 0
+    initialization: str = DEFAULT_INITIALIZATION
 
     def __post_init__(self):
         if self.learning_rate <= 0:
@@ -39,6 +45,10 @@ class TrainingConfig:
             raise ValueError("batch_size must be positive when provided.")
         if self.evaluation_batch_size is not None and self.evaluation_batch_size <= 0:
             raise ValueError("evaluation_batch_size must be positive when provided.")
+        if self.initialization not in INITIALIZATION_NAMES:
+            raise ValueError(
+                f"initialization must be one of {', '.join(INITIALIZATION_NAMES)}."
+            )
 
 
 @dataclass(frozen=True)
@@ -70,12 +80,24 @@ def fit_link_predictor(
         raise ValueError("reverse_negative_fraction must be in [0, 1].")
     _seed_everything(config.seed)
     device = resolve_device(config.device)
+    initial_embedding = (
+        spectral_initialization(
+            split.observed_edge_index,
+            num_nodes,
+            dimension,
+            config.seed,
+        )
+        if config.initialization == "spectral"
+        else None
+    )
     model = FinslerLinkPredictor(
         num_nodes,
         dimension,
         metric,
         radius=radius,
         temperature=temperature,
+        initialization=config.initialization,
+        initial_embedding=initial_embedding,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -26,6 +26,7 @@ from .training import (
 METRIC_NAMES = ("randers", "matsumoto", "convexified_matsumoto")
 DEFAULT_EMBEDDING_DIMENSION = 50
 DEFAULT_EMBEDDING_DIMENSIONS = (5, 10, 20, 50)
+HYPERPARAMETER_SELECTION_PROTOCOL = "split0_topn_rerank_other_splits_v1"
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,55 @@ class OptunaConfig:
 
 
 @dataclass(frozen=True)
+class CandidateRerankingResult:
+    trial_number: int
+    hyperparameters: ModelHyperparameters
+    tuning_validation_roc_auc: float
+    reranking_validation_roc_auc: tuple[float, ...]
+
+    @property
+    def mean_reranking_validation_roc_auc(self) -> float:
+        return float(np.mean(self.reranking_validation_roc_auc))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "trial_number": self.trial_number,
+            "hyperparameters": asdict(self.hyperparameters),
+            "tuning_validation_roc_auc": self.tuning_validation_roc_auc,
+            "reranking_validation_roc_auc": self.reranking_validation_roc_auc,
+            "mean_reranking_validation_roc_auc": (
+                self.mean_reranking_validation_roc_auc
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RerankingResult:
+    split_indices: tuple[int, ...]
+    candidates: tuple[CandidateRerankingResult, ...]
+    selected_trial_number: int
+
+    @property
+    def hyperparameters(self) -> ModelHyperparameters:
+        return next(
+            candidate.hyperparameters
+            for candidate in self.candidates
+            if candidate.trial_number == self.selected_trial_number
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "protocol": HYPERPARAMETER_SELECTION_PROTOCOL,
+            "tuning_split_index": 0,
+            "reranking_split_indices": self.split_indices,
+            "selection_score": "mean_validation_roc_auc_excluding_tuning_split",
+            "selected_trial_number": self.selected_trial_number,
+            "selected_hyperparameters": asdict(self.hyperparameters),
+            "candidates": [candidate.as_dict() for candidate in self.candidates],
+        }
+
+
+@dataclass(frozen=True)
 class SplitRunResult:
     split_index: int
     split_seed: int
@@ -198,7 +248,7 @@ def tune_hyperparameters(
     search_space: OptunaSearchSpace | None = None,
     optuna_config: OptunaConfig | None = None,
 ):
-    """Tune on validation AUC only and return ``(best_params, study)``."""
+    """Run an Optuna study on the validation set of split 0."""
     try:
         import optuna
     except ImportError as exc:
@@ -207,34 +257,23 @@ def tune_hyperparameters(
             "link-prediction dependencies."
         ) from exc
 
-    training_config = TrainingConfig() if training_config is None else training_config
+    training_config = (
+        TrainingConfig() if training_config is None else training_config
+    )
     search_space = OptunaSearchSpace() if search_space is None else search_space
     optuna_config = OptunaConfig() if optuna_config is None else optuna_config
-    if not splits:
-        raise ValueError("splits must not be empty.")
-    if any(split.task != splits[0].task for split in splits):
-        raise ValueError("All splits in an experiment must use the same task.")
+    _validate_splits(splits)
     tuning_split = splits[0]
 
     def objective(trial):
         params = search_space.sample(trial)
-        metric = make_metric(metric_name, params.alpha)
-        run_config = replace(
-            training_config,
-            learning_rate=params.learning_rate,
-            seed=training_config.seed + tuning_split.seed,
-        )
         try:
-            result = fit_link_predictor(
-                graph.num_nodes,
+            result = _fit_hyperparameters(
+                graph,
                 tuning_split,
-                metric,
-                dimension=params.dimension,
-                radius=params.radius,
-                temperature=params.temperature,
-                positive_weight=params.positive_weight,
-                reverse_negative_fraction=params.reverse_negative_fraction,
-                config=run_config,
+                params,
+                metric_name,
+                training_config,
                 evaluate_test=False,
             )
         except FloatingPointError as exc:
@@ -252,18 +291,68 @@ def tune_hyperparameters(
         n_trials=optuna_config.num_trials,
         timeout=optuna_config.timeout,
     )
-    best = ModelHyperparameters(
-        dimension=study.best_params["dimension"],
-        alpha=study.best_params["alpha"],
-        radius=study.best_params["radius"],
-        temperature=study.best_params["temperature"],
-        learning_rate=study.best_params["learning_rate"],
-        positive_weight=study.best_params["positive_weight"],
-        reverse_negative_fraction=study.best_params[
-            "reverse_negative_fraction"
-        ],
+    return study
+
+
+def rerank_hyperparameters(
+    graph: DirectedGraphData,
+    splits: list[LinkPredictionSplit],
+    study,
+    *,
+    metric_name: str,
+    top_candidates: int = 8,
+    num_reranking_splits: int = 3,
+    training_config: TrainingConfig | None = None,
+    progress: Callable[[int, int, CandidateRerankingResult], None] | None = None,
+) -> RerankingResult:
+    """Rerank the best split-0 trials on other validation partitions."""
+    _validate_splits(splits)
+    if top_candidates <= 0 or num_reranking_splits <= 0:
+        raise ValueError("Reranking counts must be positive.")
+    if num_reranking_splits >= len(splits):
+        raise ValueError("Reranking requires enough splits after split 0.")
+    trials = sorted(
+        (trial for trial in study.trials if trial.value is not None),
+        key=lambda trial: trial.value,
+        reverse=True,
+    )[:top_candidates]
+    if not trials:
+        raise RuntimeError("The Optuna study has no completed trial to rerank.")
+
+    training_config = TrainingConfig() if training_config is None else training_config
+    split_indices = tuple(range(1, num_reranking_splits + 1))
+    candidates = []
+    for trial in trials:
+        hyperparameters = ModelHyperparameters(**trial.params)
+        validation_auc = tuple(
+            _fit_hyperparameters(
+                graph,
+                splits[index],
+                hyperparameters,
+                metric_name,
+                training_config,
+                evaluate_test=False,
+            ).validation_auc
+            for index in split_indices
+        )
+        candidate = CandidateRerankingResult(
+            trial_number=trial.number,
+            hyperparameters=hyperparameters,
+            tuning_validation_roc_auc=float(trial.value),
+            reranking_validation_roc_auc=validation_auc,
+        )
+        candidates.append(candidate)
+        if progress is not None:
+            progress(len(candidates), len(trials), candidate)
+    selected = max(
+        candidates,
+        key=lambda candidate: candidate.mean_reranking_validation_roc_auc,
     )
-    return best, study
+    return RerankingResult(
+        split_indices=split_indices,
+        candidates=tuple(candidates),
+        selected_trial_number=selected.trial_number,
+    )
 
 
 def evaluate_hyperparameters(
@@ -274,10 +363,7 @@ def evaluate_hyperparameters(
     metric_name: str,
     training_config: TrainingConfig | None = None,
 ) -> ExperimentSummary:
-    if not splits:
-        raise ValueError("splits must not be empty.")
-    if any(split.task != splits[0].task for split in splits):
-        raise ValueError("All splits in an experiment must use the same task.")
+    _validate_splits(splits)
     training_config = TrainingConfig() if training_config is None else training_config
     training_config = replace(
         training_config,
@@ -285,21 +371,13 @@ def evaluate_hyperparameters(
     )
     runs = []
     for split_index, split in enumerate(splits):
-        metric = make_metric(metric_name, hyperparameters.alpha)
-        run_config = replace(
-            training_config,
-            seed=training_config.seed + split.seed,
-        )
-        result = fit_link_predictor(
-            graph.num_nodes,
+        result = _fit_hyperparameters(
+            graph,
             split,
-            metric,
-            dimension=hyperparameters.dimension,
-            radius=hyperparameters.radius,
-            temperature=hyperparameters.temperature,
-            positive_weight=hyperparameters.positive_weight,
-            reverse_negative_fraction=hyperparameters.reverse_negative_fraction,
-            config=run_config,
+            hyperparameters,
+            metric_name,
+            training_config,
+            evaluate_test=True,
         )
         if result.test_auc is None:
             raise RuntimeError("Final split evaluation did not produce test metrics.")
@@ -323,21 +401,59 @@ def evaluate_hyperparameters(
     )
 
 
+def _fit_hyperparameters(
+    graph: DirectedGraphData,
+    split: LinkPredictionSplit,
+    hyperparameters: ModelHyperparameters,
+    metric_name: str,
+    training_config: TrainingConfig,
+    *,
+    evaluate_test: bool,
+):
+    return fit_link_predictor(
+        graph.num_nodes,
+        split,
+        make_metric(metric_name, hyperparameters.alpha),
+        dimension=hyperparameters.dimension,
+        radius=hyperparameters.radius,
+        temperature=hyperparameters.temperature,
+        positive_weight=hyperparameters.positive_weight,
+        reverse_negative_fraction=hyperparameters.reverse_negative_fraction,
+        config=replace(
+            training_config,
+            learning_rate=hyperparameters.learning_rate,
+            seed=training_config.seed + split.seed,
+        ),
+        evaluate_test=evaluate_test,
+    )
+
+
+def _validate_splits(splits: list[LinkPredictionSplit]):
+    if not splits:
+        raise ValueError("splits must not be empty.")
+    if any(split.task != splits[0].task for split in splits):
+        raise ValueError("All splits in an experiment must use the same task.")
+
+
 def save_experiment_summary(path, summary: ExperimentSummary):
     save_json(path, summary.as_dict())
 
 
 __all__ = [
-    "ExperimentSummary",
+    "CandidateRerankingResult",
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_EMBEDDING_DIMENSIONS",
+    "ExperimentSummary",
+    "HYPERPARAMETER_SELECTION_PROTOCOL",
     "METRIC_NAMES",
     "ModelHyperparameters",
     "OptunaConfig",
     "OptunaSearchSpace",
+    "RerankingResult",
     "SplitRunResult",
     "evaluate_hyperparameters",
     "make_metric",
+    "rerank_hyperparameters",
     "save_experiment_summary",
     "tune_hyperparameters",
 ]

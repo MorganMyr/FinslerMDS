@@ -15,7 +15,17 @@ non-edges. Observed arcs and both orientations of every validation/test query
 are excluded. MagNet's noisy binary examples are used only for validation and
 test (and to train supervised baselines). Optuna tunes the dimensions
 `{5, 10, 20, 50}`, metric asymmetry, decoder radius and temperature, learning
-rate, positive-class weight, and fraction of inverse negatives.
+rate, positive-class weight, and fraction of inverse negatives. After tuning on
+split 0, the eight best trials are evaluated on validations 1–3 and selected by
+their mean on those three splits; the split-0 score is excluded from this final
+choice.
+
+Coordinates default to the original `N(0, 1/sqrt(d))` initialization. With
+`--initialization`, `normal` uses `N(0, 1)`, `radius` keeps the exact same
+centered Gaussian draw as the default and only rescales it so its mean squared
+pairwise distance equals the decoder radius, and `spectral` uses cached
+normalized-Laplacian coordinates of the observed graph. Spectral coordinates
+never use held-out edges and are rescaled to the default pairwise scale.
 
 Existence AUC ranks pairs by `logit_ij` (equivalently `p_ij`). Direction AUC
 ranks them by `logit_ij - logit_ji`, the log-odds ratio between the two
@@ -30,10 +40,12 @@ the edge-reconstruction cross-entropy remains unchanged.
   persistence.
 - `torch_metrics.py`: differentiable Randers and Matsumoto kernels tied to the
   metric objects in `finsler_mds.metrics`.
-- `decoder.py` and `model.py`: Fermi-Dirac decoder and direct node embeddings.
+- `decoder.py`, `model.py`, and `initialization.py`: Fermi-Dirac decoder,
+  direct node embeddings, and their initial coordinates.
 - `training.py` and `evaluation.py`: dynamic negative sampling, early stopping,
   and ROC-AUC.
-- `experiments.py`: Optuna tuning on validation data and ten-split evaluation.
+- `experiments.py`: split-0 Optuna tuning, validation reranking, and ten-split
+  evaluation.
 - `baselines/`: common external-method runner and thin method adapters. MagNet
   imports the public PyG implementation but always uses this package's splits.
 
@@ -54,11 +66,16 @@ python scripts/main_link_prediction_magnet.py --dataset squirrel
 ```
 
 Each invocation creates a protocol-suffixed run directory. It contains
-`config.json`, one summary per requested task, and one Optuna database per task
-when tuning is enabled. Split caches remain outside the run directories so
-every method uses the same examples. Use `--dimension 50` to restrict Optuna to
-one dimension (or pass several values) and `--alpha-max` for asymmetry
-ablations; previous runs are never resumed or overwritten implicitly.
+`config.json`, one summary per requested task, and, when tuning is enabled, an
+Optuna database and a selection record per task. Split caches remain outside
+the run directories so every method uses the same examples. Use
+`--dimension 50` to restrict Optuna to one dimension (or pass several values)
+and `--alpha-max` for asymmetry ablations. Use `--rerank-top` and
+`--rerank-splits` to change the default `8x3` reselection
+(`--rerank-splits 0` disables it). Previous runs are never resumed or
+overwritten implicitly. `--evaluation-reverse-negative-fraction 0` evaluates
+existence against true non-edges only, while `1` uses reversed arcs only; the
+option affects validation and test, not embedding training.
 
 The pinned loaders retain 4,552 underlying pairs for CiteSeer, 5,278 for Cora,
 31,371 for Chameleon, 198,353 for Squirrel, and 1,157,799 for Arxiv-Year.

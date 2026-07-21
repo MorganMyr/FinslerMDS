@@ -28,6 +28,7 @@ def load_or_create_splits(
     *,
     num_splits: int = 10,
     first_seed: int = 0,
+    evaluation_reverse_negative_fraction: float | None = None,
 ) -> list[LinkPredictionSplit]:
     path = Path(path)
     if path.exists():
@@ -43,6 +44,7 @@ def load_or_create_splits(
         task,
         num_splits=num_splits,
         first_seed=first_seed,
+        evaluation_reverse_negative_fraction=evaluation_reverse_negative_fraction,
     )
     save_splits(path, graph, splits)
     return splits
