@@ -17,10 +17,6 @@ from .directional_metrics import (
     project_velocity_graph_to_embedding,
     save_boundary_neighbor_plan,
 )
-from .geometry_velocity import (
-    GeometryVelocityResult,
-    finsler_induced_velocity_field,
-)
 from .gap_distance import (
     GapDistanceResult,
     normalized_gap_distance,
@@ -50,12 +46,10 @@ __all__ = [
     "ClusterTransitionScore",
     "DEFAULT_PANCREAS_GAP",
     "GapDistanceResult",
-    "GeometryVelocityResult",
     "GVCohResult",
     "ICVCohResult",
     "PancreasGapSelection",
     "cross_boundary_direction_correctness",
-    "finsler_induced_velocity_field",
     "gap_arrays_to_cache",
     "global_velocity_coherence",
     "in_cluster_velocity_coherence",

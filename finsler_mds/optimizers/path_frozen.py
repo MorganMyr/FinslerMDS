@@ -684,7 +684,7 @@ def path_frozen(
     weight=None,
     pair_mask=None,
     n_local_pairs=None,
-    local_pair_mode="geodesic",
+    local_pair_mode="direct",
     landmark_indices=None,
     n_landmark=0,
     random_landmark_fraction=1.0,
@@ -694,9 +694,9 @@ def path_frozen(
     targets_per_landmark=None,
     target_random_state=None,
     local_weight=1.0,
-    local_global_reweighting="none",
+    local_global_reweighting="count",
     direct_stress_weight=0.0,
-    direct_stress_mode="hinge",
+    direct_stress_mode="mds",
     direct_stress_margin=0.5,
     device="cpu",
     gpu_max_path_edges=100_000_000,
@@ -718,9 +718,9 @@ def path_frozen(
 
     ``n_local_pairs``
         Keep the closest target dissimilarities in each row. With the default
-        ``local_pair_mode="geodesic"``, these local constraints use the frozen
-        graph-geodesic objective. Pass ``local_pair_mode="direct"`` to use
-        direct Finsler distances for local pairs instead.
+        ``local_pair_mode="direct"``, these local constraints use direct
+        Finsler distances. Pass ``local_pair_mode="geodesic"`` to use the
+        frozen graph-geodesic objective for local pairs instead.
     ``n_landmark`` or ``landmark_indices``
         Keep all valid outgoing pairs from selected landmark sources. Automatic
         landmarks are a mix of fixed farthest-point landmarks and random
@@ -743,6 +743,7 @@ def path_frozen(
         ``"none"`` keeps the input weights. ``"count"`` balances ``sum w_ij``
         between local and global groups. ``"energy"`` balances
         ``sum w_ij D_ij^2``. ``local_weight`` then multiplies the local group.
+        The default is ``"count"``.
     ``device``
         ``"cpu"`` keeps the historical implementation. ``"auto"`` uses a
         CuPy/CUDA stress-gradient backend when available and falls back to CPU.
@@ -764,10 +765,10 @@ def path_frozen(
         ``1`` keeps the historical behavior.
     ``direct_stress_weight``
         Weight of an optional all-pairs direct-distance regularizer. With
-        ``direct_stress_mode="mds"``, this is an ordinary direct Finsler-MDS
-        stress. With ``"hinge"``, only pairs whose direct embedding distance is
-        below ``direct_stress_margin * dissimilarity`` are penalized. The
-        default weight ``0`` disables the term entirely.
+        the default ``direct_stress_mode="mds"``, this is an ordinary direct
+        Finsler-MDS stress. With ``"hinge"``, only pairs whose direct embedding
+        distance is below ``direct_stress_margin * dissimilarity`` are
+        penalized. The default weight ``0`` disables the term entirely.
     """
     metric = validate_metric(metric)
     outer_step_size = float(outer_step_size)

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
-import sys
 
 import numpy as np
 import scipy.linalg
@@ -636,16 +634,14 @@ def smacof_randers(
 ):
     """Compute a Randers-MDS embedding with the Randers-SMACOF update.
 
-    Parameters are intentionally close to the legacy ``_mds_finsler.smacof``
-    function, but the Randers strength now comes from ``metric.alpha``.
+    The Randers strength comes from ``metric.alpha``.
     ``device="auto"`` uses a CuPy/CUDA backend for the dense SMACOF iteration
     when available and falls back to CPU otherwise.
 
-    version : {"corrected", "legacy", "original"}, default="corrected"
+    version : {"corrected", "legacy"}, default="corrected"
         Which SMACOF implementation to use. ``corrected`` uses the current
         revised Randers-SMACOF implementation. ``legacy`` uses the previous
         dense implementation from this module, including GPU support.
-        ``original`` uses the older `_mds_finsler.smacof` implementation.
     """
     metric = _validate_randers_metric(metric)
     dissimilarities = check_array(dissimilarities)
@@ -653,8 +649,9 @@ def smacof_randers(
         raise ValueError("dissimilarities must be a square matrix.")
     random_state = check_random_state(random_state)
 
+    if version not in {"corrected", "legacy"}:
+        raise ValueError("version must be one of {'corrected', 'legacy'}.")
     use_legacy_update = version == "legacy"
-    use_original = version == "original"
 
     if normalized_stress == "auto":
         normalized_stress = False
@@ -676,50 +673,6 @@ def smacof_randers(
                 RuntimeWarning,
             )
             n_init = 1
-
-    if use_original:
-        if device != "cpu":
-            raise ValueError(
-                "Original smacof version only supports device='cpu'."
-            )
-        try:
-            legacy_dir = Path(__file__).resolve().parents[2] / "legacy"
-            if str(legacy_dir) not in sys.path:
-                sys.path.insert(0, str(legacy_dir))
-            from legacy._mds_finsler import smacof as legacy_smacof
-        except ImportError as exc:
-            raise RuntimeError(
-                "Legacy smacof implementation is unavailable."
-            ) from exc
-
-        legacy_return_n_iter = return_result or return_n_iter
-        legacy_result = legacy_smacof(
-            dissimilarities,
-            randers_w_alpha=metric.alpha,
-            metric=True,
-            n_components=n_components,
-            init=init,
-            n_init=n_init,
-            max_iter=max_iter,
-            verbose=verbose,
-            eps=eps,
-            random_state=random_state,
-            normalized_stress=normalized_stress,
-            weight=weight,
-            pseudo_inv_solver=pseudo_inv_solver,
-            project_on_V=project_on_V,
-            check_monotony=check_monotony,
-            return_n_iter=legacy_return_n_iter,
-        )
-
-        if return_result:
-            embedding, stress, n_iter = legacy_result
-            return SmacofRandersResult(
-                embedding=np.asarray(embedding),
-                stress=float(stress),
-                n_iter=int(n_iter),
-            )
-        return legacy_result
 
     if effective_n_jobs(n_jobs) == 1:
         best = None

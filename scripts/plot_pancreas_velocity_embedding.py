@@ -29,7 +29,7 @@ from finsler_mds.utils.pancreas import (  # noqa: E402
     PANCREAS_CLUSTER_COLORS,
     project_velocity_to_embedding,
 )
-from evaluate_pancreas_embedding import (  # noqa: E402
+from scripts.evaluate_pancreas_embedding import (  # noqa: E402
     N_EVAL_NEIGHBORS,
     load_embedding,
     load_pancreas_evaluation_context,

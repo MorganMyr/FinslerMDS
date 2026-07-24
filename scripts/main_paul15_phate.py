@@ -50,13 +50,12 @@ def main_paul15_phate():
     }
     path_frozen_params = {
         "graph_neighbors": 30,
-        "max_iter": 50,
+        "outer_iter": 50,
         "inner_iter": 10,
-        "n_local_neighbors": 30,
+        "n_local_pairs": 30,
         "local_pair_mode": "direct",
-        "n_global_landmarks": 150,
-        "max_global_targets_per_source": 300,
-        "global_target_sampling": "mixed",
+        "n_landmark": 150,
+        "targets_per_landmark": 300,
         "local_weight": 1.0,
         "local_global_reweighting": "count",
         "random_state": seed,

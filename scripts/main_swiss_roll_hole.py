@@ -13,7 +13,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from finsler_mds import MatsumotoMetric, RandersMetric, utils
 from finsler_mds.api import fit_finsler_mds
-from legacy import _mds
 
 
 def main_swiss_roll_partial():
@@ -255,8 +254,10 @@ def main_swiss_roll_partial():
         raise ValueError('Unknown initialisation strategy')
 
     if not os.path.exists(os.path.join(dir_res_raw, 'proj_smacof_unif_hole_' + param_str + '.npy')):
-        proj_smacof_unif_hole, _ = _mds.smacof(
-            dists_hole, metric=True,
+        proj_smacof_unif_hole, _ = fit_finsler_mds(
+            dists_hole,
+            metric=RandersMetric(alpha=0.0),
+            optimizer="smacof_randers",
             init=init, n_components=proj_dim, n_init=1, n_jobs=1,
             weight=mask_wormhole * 1., max_iter=max_iter_wormhole
         )
