@@ -48,16 +48,7 @@ Run the following scripts to replicate the visual results from the paper:
 
 - `main_graph`: Fig 5
 
-## Directed link prediction
-
-The separate `finsler_mds.link_prediction` package reproduces the Table 2
-representation-learning protocol, supports Randers and Matsumoto metrics, and
-can evaluate external baselines such as MagNet on the exact same splits.
-See [`finsler_mds/link_prediction/README.md`](finsler_mds/link_prediction/README.md)
-and the `scripts/main_link_prediction_*.py` entry points.
-
 ---
-
 ## Note on (worm)holes
 
 The Finsler wormhole code is built on top of the code for the original symmetric wormhole criterion, from the paper *Bracha et al. Wormhole Loss for Partial Shape Matching, NeurIPS 2024* [[paper]](https://proceedings.neurips.cc/paper_files/paper/2024/hash/ed24eafde44aef581b9f605319583b6d-Abstract-Conference.html)[[code]](https://github.com/ABracha/Wormhole/tree/main). Our code is also an official implementation for this work by taking `alpha = 0` for the embedding's canonical Randers space.
