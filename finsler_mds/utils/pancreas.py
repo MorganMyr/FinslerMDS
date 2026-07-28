@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import os
+from pathlib import Path
 import warnings
 
 import numpy as np
 from scipy import sparse
+
+from finsler_mds.metrics import (
+    ConvexifiedMatsumotoMetric,
+    MatsumotoMetric,
+    RandersMetric,
+)
+
+from .embedding_io import cache_token, metric_alpha_tag
+from .graph import compute_velocity_dist_matrix
+from .initialization import IsomapWithPreds
+from .orientation import rotate_embedding_to_mean_velocity_down, rotation_to_down_axis
+from .pancreas_files import (
+    load_pancreas_embedding,
+    pancreas_embedding_path,
+    pancreas_reference_stem,
+    pancreas_velocity_inputs_path,
+    save_pancreas_embedding,
+)
 
 
 PANCREAS_DATASET_SOURCE = "cellrank.datasets.pancreas"
@@ -29,11 +50,13 @@ PANCREAS_CLUSTER_COLORS = {
     "Ngn3 high EP": "#f28e2b",
     "Ngn3 low EP": "#d62728",
     "Pre-endocrine": "#f1c40f",
-    "alpha": "#7b3294",
-    "beta": "#08306b",
-    "delta": "#28b7c9",
-    "ductal": "#c51b7d",
-    "epsilon": "#74c476",
+}
+PANCREAS_N_EVAL_NEIGHBORS = 30
+PANCREAS_PREPROCESSING = {
+    "min_shared_counts": 20,
+    "n_top_genes": 3000,
+    "n_pcs": 50,
+    "moments_n_neighbors": 30,
 }
 
 
@@ -111,187 +134,6 @@ def canonicalize_pancreas_clusters(adata, *, aliases=None):
     return adata
 
 
-def cluster_balanced_pair_weights(
-        labels,
-        dissimilarities=None,
-        *,
-        rho=0.5,
-        return_info=False,
-):
-    """Return pair weights that soften cluster-size imbalance.
-
-    Each cell receives weight ``(median_cluster_size / cluster_size) ** rho``.
-    Pair weights are the product of source and target cell weights. With
-    ``rho=1``, each directed cluster-to-cluster block has comparable total
-    weight; ``rho=0`` gives uniform weights.
-    """
-    labels = np.asarray(labels, dtype=str)
-    if labels.ndim != 1:
-        raise ValueError("labels must be a 1D array.")
-    if len(labels) == 0:
-        raise ValueError("labels must not be empty.")
-    rho = float(rho)
-    if rho < 0:
-        raise ValueError("rho must be non-negative.")
-
-    unique, inverse, counts = np.unique(labels, return_inverse=True, return_counts=True)
-    n_ref = float(np.median(counts))
-    cell_weights = (n_ref / counts[inverse].astype(float)) ** rho
-    weights = np.outer(cell_weights, cell_weights)
-    np.fill_diagonal(weights, 0.0)
-
-    active = ~np.eye(len(labels), dtype=bool)
-    if dissimilarities is not None:
-        D = np.asarray(dissimilarities, dtype=float)
-        if D.shape != weights.shape:
-            raise ValueError("dissimilarities must have shape (n_cells, n_cells).")
-        active &= np.isfinite(D)
-
-    info = {
-        "rho": rho,
-        "n_ref": n_ref,
-        "cluster_sizes": {str(label): int(count) for label, count in zip(unique, counts)},
-        "cluster_cell_weights": {
-            str(label): float((n_ref / count) ** rho)
-            for label, count in zip(unique, counts)
-        },
-        "mean_active_weight": float(np.mean(weights[active])) if np.any(active) else np.nan,
-        "min_active_weight": float(np.min(weights[active])) if np.any(active) else np.nan,
-        "max_active_weight": float(np.max(weights[active])) if np.any(active) else np.nan,
-    }
-    if return_info:
-        return weights, info
-    return weights
-
-
-def apply_distance_pair_reweight(
-        weights,
-        dissimilarities,
-        *,
-        power=0.0,
-        epsilon=1e-6,
-        return_info=False,
-):
-    """Downweight large dissimilarities with a median-scaled inverse power.
-
-    The multiplicative factor is
-    ``(d_ij / median(d) + epsilon) ** (-power)`` on finite off-diagonal pairs.
-    """
-    power = float(power)
-    epsilon = float(epsilon)
-    if power < 0:
-        raise ValueError("distance reweighting power must be non-negative.")
-    if epsilon < 0:
-        raise ValueError("distance reweighting epsilon must be non-negative.")
-
-    weights = np.asarray(weights, dtype=float).copy()
-    D = np.asarray(dissimilarities, dtype=float)
-    if D.shape != weights.shape:
-        raise ValueError("dissimilarities must have the same shape as weights.")
-
-    active = np.isfinite(D) & (weights != 0)
-    np.fill_diagonal(active, False)
-    positive = active & (D > 0)
-    median_delta = float(np.median(D[positive])) if np.any(positive) else np.nan
-    if power == 0 or not np.isfinite(median_delta) or median_delta <= 0:
-        info = {
-            "power": power,
-            "epsilon": epsilon,
-            "enabled": False,
-            "median_delta": median_delta,
-        }
-        return (weights, info) if return_info else weights
-
-    factor = np.ones_like(D, dtype=float)
-    factor[active] = np.power(D[active] / median_delta + epsilon, -power)
-    weights[active] *= factor[active]
-
-    info = {
-        "power": power,
-        "epsilon": epsilon,
-        "enabled": True,
-        "median_delta": median_delta,
-        "mean_factor": float(np.mean(factor[active])) if np.any(active) else np.nan,
-        "min_factor": float(np.min(factor[active])) if np.any(active) else np.nan,
-        "max_factor": float(np.max(factor[active])) if np.any(active) else np.nan,
-    }
-    return (weights, info) if return_info else weights
-
-
-def normalize_pair_weights(
-        weights,
-        dissimilarities=None,
-):
-    """Normalize the final active pair-weight matrix to mean one."""
-    weights = np.asarray(weights, dtype=float).copy()
-    active = weights != 0
-    np.fill_diagonal(active, False)
-    if dissimilarities is not None:
-        D = np.asarray(dissimilarities, dtype=float)
-        if D.shape != weights.shape:
-            raise ValueError("dissimilarities must have the same shape as weights.")
-        active &= np.isfinite(D)
-
-    normalizer = float(np.mean(weights[active])) if np.any(active) else 0.0
-    if normalizer > 0:
-        weights[active] /= normalizer
-    return weights, normalizer
-
-
-def apply_frontier_pair_weight(
-        weights,
-        boundary_plan,
-        *,
-        factor,
-        dissimilarities=None,
-        symmetric=True,
-        return_info=False,
-):
-    """Multiply weights of CBDir frontier neighbor pairs.
-
-    ``boundary_plan`` is the precomputed CBDir plan. Its pairs are directed
-    source-cluster cell -> target-cluster neighbor pairs. With ``symmetric``,
-    the reverse pairs receive the same multiplier.
-    """
-    factor = float(factor)
-    if factor <= 0:
-        raise ValueError("frontier pair weight factor must be positive.")
-    weights = np.asarray(weights, dtype=float).copy()
-    if factor == 1.0:
-        info = {"factor": factor, "enabled": False, "n_directed_pairs": 0, "n_weighted_pairs": 0}
-        return (weights, info) if return_info else weights
-
-    pair_mask = np.zeros(weights.shape, dtype=bool)
-    for transition in boundary_plan.transitions.values():
-        for pos, source in enumerate(transition.cell_indices):
-            start = transition.target_indptr[pos]
-            end = transition.target_indptr[pos + 1]
-            targets = transition.target_indices[start:end]
-            pair_mask[int(source), targets] = True
-
-    directed_pair_count = int(np.count_nonzero(pair_mask))
-    if symmetric:
-        pair_mask |= pair_mask.T
-    if dissimilarities is not None:
-        D = np.asarray(dissimilarities, dtype=float)
-        if D.shape != weights.shape:
-            raise ValueError("dissimilarities must have shape (n_cells, n_cells).")
-        pair_mask &= np.isfinite(D)
-    np.fill_diagonal(pair_mask, False)
-    weights[pair_mask] *= factor
-
-    info = {
-        "factor": factor,
-        "enabled": True,
-        "symmetric": bool(symmetric),
-        "n_directed_pairs": directed_pair_count,
-        "n_weighted_pairs": int(np.count_nonzero(pair_mask)),
-    }
-    if return_info:
-        return weights, info
-    return weights
-
-
 def setup_scvelo_settings():
     """Configure scVelo plotting/verbosity and return the module."""
     suppress_pancreas_noise_warnings()
@@ -302,18 +144,12 @@ def setup_scvelo_settings():
     return scv
 
 
-def pancreas_preprocessing_neighbors(preprocessing):
-    if "moments_n_neighbors" in preprocessing:
-        return int(preprocessing["moments_n_neighbors"])
-    return int(preprocessing["n_neighbors"])
-
-
 def preprocess_pancreas_for_velocity(adata, preprocessing, *, seed):
     """Run the Scanpy/scVelo preprocessing used before velocity estimation."""
     import scanpy as sc
 
     scv = setup_scvelo_settings()
-    n_neighbors = pancreas_preprocessing_neighbors(preprocessing)
+    n_neighbors = int(preprocessing["moments_n_neighbors"])
     n_pcs = int(preprocessing["n_pcs"])
 
     scv.pp.filter_and_normalize(
@@ -429,3 +265,563 @@ def project_velocity_to_embedding(adata, embedding, *, basis="eval"):
         del adata.obsm[key]
     scv.tl.velocity_embedding(adata, basis=basis)
     return np.asarray(adata.obsm[key], dtype=float)
+
+
+@dataclass
+class PancreasInputs:
+    """Arrays needed by pancreas embeddings, plus the reusable state cache."""
+
+    dissimilarities: np.ndarray
+    labels: np.ndarray
+    cell_ids: np.ndarray
+    original_indices: np.ndarray
+    state_path: Path
+    state_metadata: dict
+    adata: object | None = None
+
+
+def normalize_velocity_distance_formula(distance_formula):
+    if not isinstance(distance_formula, str):
+        raise TypeError("velocity distance formula must be 'randers' or 'matsumoto'.")
+    aliases = {
+        "randers": "randers",
+        "mats": "matsumoto",
+        "matsumoto": "matsumoto",
+    }
+    try:
+        return aliases[distance_formula.lower()]
+    except KeyError as exc:
+        raise ValueError("velocity distance formula must be 'randers' or 'matsumoto'.") from exc
+
+
+def velocity_distance_formula_tag(distance_formula, alpha=None):
+    prefix = {
+        "randers": "vrand",
+        "matsumoto": "vmats",
+    }[normalize_velocity_distance_formula(distance_formula)]
+    return prefix if alpha is None else f"{prefix}{metric_alpha_tag(alpha)}"
+
+
+def normalize_embedding_metric_kind(kind):
+    if not isinstance(kind, str):
+        raise TypeError("metric kind must be a string.")
+    aliases = {
+        "r": "randers",
+        "randers": "randers",
+        "m": "matsumoto",
+        "mats": "matsumoto",
+        "matsumoto": "matsumoto",
+        "cm": "convexified_matsumoto",
+        "cmats": "convexified_matsumoto",
+        "convexified_matsumoto": "convexified_matsumoto",
+        "convexifiedmatsumoto": "convexified_matsumoto",
+    }
+    try:
+        return aliases[kind.lower().replace("-", "_")]
+    except KeyError as exc:
+        raise ValueError(
+            "metric kind must be 'randers', 'matsumoto', or 'convexified_matsumoto'."
+        ) from exc
+
+
+def make_embedding_metric(kind, alpha=0.0):
+    metric_class = {
+        "randers": RandersMetric,
+        "matsumoto": MatsumotoMetric,
+        "convexified_matsumoto": ConvexifiedMatsumotoMetric,
+    }[normalize_embedding_metric_kind(kind)]
+    return metric_class(alpha=float(alpha))
+
+
+def embedding_metric_tag(metric):
+    if isinstance(metric, RandersMetric):
+        prefix = "r"
+    elif isinstance(metric, ConvexifiedMatsumotoMetric):
+        prefix = "cmats"
+    elif isinstance(metric, MatsumotoMetric):
+        prefix = "mats"
+    else:
+        raise TypeError(f"Unsupported embedding metric {type(metric).__name__}.")
+    return f"{prefix}{metric_alpha_tag(metric.alpha)}"
+
+
+def metric_display_name(metric):
+    name = type(metric).__name__.removesuffix("Metric")
+    if name.startswith("Convexified"):
+        name = name.replace("Convexified", "Convexified ", 1)
+    return f"{name} alpha={metric.alpha:g}"
+
+
+def normalize_embedding_dim(embedding_dim):
+    embedding_dim = int(embedding_dim)
+    if embedding_dim not in {2, 3}:
+        raise ValueError("embedding_dim must be 2 or 3.")
+    return embedding_dim
+
+
+def labels_to_numpy(labels):
+    if labels is None:
+        return None
+    if hasattr(labels, "to_numpy"):
+        labels = labels.to_numpy()
+    return np.asarray(labels, dtype=str)
+
+
+def labels_to_cache(labels):
+    return np.asarray([], dtype=str) if labels is None else np.asarray(labels, dtype=str)
+
+
+def pancreas_cache_metadata(**params):
+    return {key: _json_safe(value) for key, value in params.items()}
+
+
+def _json_safe(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def pancreas_state_cache_path(raw_dir, *, preprocessing, velocity, dataset_prefix="pancreas", seed=42):
+    prefix = "" if dataset_prefix == "pancreas" else f"{dataset_prefix}_"
+    return Path(raw_dir) / (
+        f"{prefix}pancreas_campaign_state_{cache_token(velocity['mode'])}_"
+        f"hvg{preprocessing['n_top_genes']}_pca{preprocessing['n_pcs']}_s{int(seed)}.h5ad"
+    )
+
+
+def load_pancreas_state_cache(cache_path, expected_metadata):
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    print(f"Loading cached pancreas velocity state: {cache_path}")
+    import scanpy as sc
+
+    adata = sc.read_h5ad(cache_path)
+    if not pancreas_state_cache_matches(adata, expected_metadata):
+        print("Cached pancreas velocity state has different parameters; recomputing.")
+        return None
+    _validate_pancreas_state(adata, cache_path)
+    labels = labels_to_numpy(adata.obs.get("clusters"))
+    cell_ids = np.asarray(adata.obs_names, dtype=str)
+    original_indices = np.asarray(
+        adata.obs.get("finsler_mds_original_index", np.arange(adata.n_obs)),
+        dtype=int,
+    )
+    return adata, labels, cell_ids, original_indices
+
+
+def pancreas_state_cache_matches(adata, expected_metadata):
+    metadata_json = adata.uns.get("finsler_mds_state_metadata_json")
+    if metadata_json is None:
+        return False
+    try:
+        return json.loads(str(metadata_json)) == expected_metadata
+    except json.JSONDecodeError:
+        return False
+
+
+def _validate_pancreas_state(adata, cache_path):
+    required = {
+        "obs['clusters']": "clusters" in adata.obs,
+        "obsm['X_pca']": "X_pca" in adata.obsm,
+        "layers['velocity']": "velocity" in adata.layers,
+        "varm['PCs']": "PCs" in adata.varm,
+    }
+    missing = [name for name, present in required.items() if not present]
+    if missing:
+        raise ValueError(f"Invalid pancreas state cache {cache_path}: missing {', '.join(missing)}.")
+
+
+def save_pancreas_state_cache(
+    cache_path,
+    adata,
+    *,
+    labels,
+    cell_ids,
+    original_indices,
+    metadata,
+):
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    adata = adata.copy()
+    adata.obs_names = np.asarray(cell_ids, dtype=str)
+    if labels is not None:
+        adata.obs["clusters"] = np.asarray(labels, dtype=str)
+    adata.obs["finsler_mds_original_index"] = np.asarray(original_indices, dtype=int)
+    adata.uns["finsler_mds_state_metadata_json"] = json.dumps(metadata, sort_keys=True)
+    adata.write_h5ad(cache_path)
+    print(f"Saved pancreas velocity state: {cache_path}")
+
+
+def pancreas_state_metadata(preprocessing, velocity, seed, **extra):
+    return pancreas_cache_metadata(
+        dataset_source=PANCREAS_DATASET_SOURCE,
+        min_shared_counts=preprocessing["min_shared_counts"],
+        n_top_genes=preprocessing["n_top_genes"],
+        n_pcs=preprocessing["n_pcs"],
+        moments_n_neighbors=preprocessing["moments_n_neighbors"],
+        velocity_mode=velocity["mode"],
+        recover_dynamics_max_iter=velocity["recover_dynamics_max_iter"],
+        seed=seed,
+        **extra,
+    )
+
+
+def load_or_compute_pancreas_state(
+    raw_dir,
+    *,
+    preprocessing,
+    velocity,
+    seed=42,
+    dataset_prefix="pancreas",
+    prepare_dataset=None,
+    metadata_extra=None,
+):
+    metadata_extra = dict(metadata_extra or {})
+    metadata = pancreas_state_metadata(preprocessing, velocity, seed, **metadata_extra)
+    path = pancreas_state_cache_path(
+        raw_dir,
+        preprocessing=preprocessing,
+        velocity=velocity,
+        dataset_prefix=dataset_prefix,
+        seed=seed,
+    )
+    cached = load_pancreas_state_cache(path, metadata)
+    if cached is not None:
+        return (*cached, path, metadata)
+
+    print(f"Loading pancreas dataset from {PANCREAS_DATASET_SOURCE}")
+    adata = load_pancreas_dataset()
+    labels = labels_to_numpy(adata.obs.get("clusters"))
+    cell_ids = np.asarray(adata.obs_names, dtype=str)
+    original_indices = np.arange(adata.n_obs, dtype=int)
+    if prepare_dataset is not None:
+        adata, labels, cell_ids, original_indices = prepare_dataset(adata)
+    preprocess_pancreas_for_velocity(adata, preprocessing, seed=seed)
+    compute_pancreas_velocity(
+        adata,
+        mode=velocity["mode"],
+        recover_dynamics_max_iter=velocity["recover_dynamics_max_iter"],
+        recover_dynamics_n_jobs=velocity["recover_dynamics_n_jobs"],
+    )
+    save_pancreas_state_cache(
+        path,
+        adata,
+        labels=labels,
+        cell_ids=cell_ids,
+        original_indices=original_indices,
+        metadata=metadata,
+    )
+    return adata, labels, cell_ids, original_indices, path, metadata
+
+
+def pancreas_distance_cache_metadata(preprocessing, velocity, seed, **extra):
+    return pancreas_cache_metadata(
+        **pancreas_state_metadata(preprocessing, velocity, seed, **extra),
+        velocity_distance_formula=normalize_velocity_distance_formula(velocity["distance_formula"]),
+        velocity_alpha=velocity["alpha"],
+        velocity_cos_clip=velocity["cos_clip"],
+        velocity_neighbors=velocity["velocity_neighbors"],
+        velocity_kNN_euclid=velocity["kNN_euclid"],
+        velocity_kNN_finsler=velocity["kNN_finsler"],
+        average_velocity=velocity["average_velocity"],
+        symmetrize_velocity_support=velocity["symmetrize_support"],
+    )
+
+
+def load_pancreas_distance_cache(path, expected_metadata):
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path) as cache:
+        if "metadata_json" not in cache:
+            return None
+        if json.loads(str(cache["metadata_json"].item())) != expected_metadata:
+            return None
+        dissimilarities = np.asarray(cache["dists_velocity"], dtype=float)
+        labels = np.asarray(cache["labels"], dtype=str)
+        cell_ids = np.asarray(cache["cell_ids"], dtype=str)
+        original_indices = np.asarray(cache["original_indices"], dtype=int)
+    print(f"Loaded pancreas velocity dissimilarities: {path}")
+    return dissimilarities, labels, cell_ids, original_indices
+
+
+def save_pancreas_distance_cache(
+    path,
+    dissimilarities,
+    *,
+    labels,
+    cell_ids,
+    original_indices,
+    metadata,
+):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        dists_velocity=np.asarray(dissimilarities, dtype=float),
+        labels=labels_to_cache(labels),
+        cell_ids=np.asarray(cell_ids, dtype=str),
+        original_indices=np.asarray(original_indices, dtype=int),
+        metadata_json=json.dumps(metadata, sort_keys=True),
+    )
+    print(f"Saved pancreas velocity dissimilarities: {path}")
+
+
+def load_or_compute_pancreas_inputs(
+    raw_dir,
+    *,
+    preprocessing,
+    velocity,
+    seed=42,
+    dataset_prefix="pancreas",
+    state=None,
+    prepare_dataset=None,
+    metadata_extra=None,
+):
+    velocity = dict(velocity)
+    velocity["distance_formula"] = normalize_velocity_distance_formula(velocity["distance_formula"])
+    metadata_extra = dict(metadata_extra or {})
+    metadata = pancreas_distance_cache_metadata(
+        preprocessing,
+        velocity,
+        seed,
+        **metadata_extra,
+    )
+    distance_path = pancreas_velocity_inputs_path(
+        raw_dir,
+        velocity=velocity,
+        dataset_prefix=dataset_prefix,
+        seed=seed,
+    )
+    state_path = pancreas_state_cache_path(
+        raw_dir,
+        preprocessing=preprocessing,
+        velocity=velocity,
+        dataset_prefix=dataset_prefix,
+        seed=seed,
+    )
+    state_metadata = pancreas_state_metadata(preprocessing, velocity, seed, **metadata_extra)
+    adata = None
+    if state is not None:
+        adata, _, state_cell_ids, _, state_path, state_metadata = state
+    cached = load_pancreas_distance_cache(distance_path, metadata)
+    if cached is not None:
+        dissimilarities, labels, cell_ids, original_indices = cached
+        if state is not None and not np.array_equal(cell_ids, state_cell_ids):
+            raise ValueError("Pancreas state and distance cache contain different cells.")
+        return PancreasInputs(
+            dissimilarities,
+            labels,
+            cell_ids,
+            original_indices,
+            state_path,
+            state_metadata,
+            adata,
+        )
+
+    if state is None:
+        adata, labels, cell_ids, original_indices, state_path, state_metadata = (
+            load_or_compute_pancreas_state(
+                raw_dir,
+                preprocessing=preprocessing,
+                velocity=velocity,
+                seed=seed,
+                dataset_prefix=dataset_prefix,
+                prepare_dataset=prepare_dataset,
+                metadata_extra=metadata_extra,
+            )
+        )
+    else:
+        _, labels, cell_ids, original_indices, _, _ = state
+    x_pca = np.asarray(adata.obsm["X_pca"][:, :preprocessing["n_pcs"]], dtype=float)
+    velocity_pca = project_velocity_to_pca(adata, preprocessing["n_pcs"])
+    print("Building directed velocity dissimilarities")
+    dissimilarities, _, _, _ = compute_velocity_dist_matrix(
+        x_pca,
+        velocity_pca,
+        kNN_euclid=velocity["kNN_euclid"],
+        kNN_finsler=velocity["kNN_finsler"],
+        alpha=velocity["alpha"],
+        distance_formula=velocity["distance_formula"],
+        cos_clip=velocity["cos_clip"],
+        velocity_neighbors=velocity["velocity_neighbors"],
+        average_velocity=velocity["average_velocity"],
+        symmetrize_support=velocity["symmetrize_support"],
+        n_jobs=velocity["graph_n_jobs"],
+    )
+    save_pancreas_distance_cache(
+        distance_path,
+        dissimilarities,
+        labels=labels,
+        cell_ids=np.asarray(cell_ids, dtype=str),
+        original_indices=np.asarray(original_indices, dtype=int),
+        metadata=metadata,
+    )
+    return PancreasInputs(
+        np.asarray(dissimilarities, dtype=float),
+        labels,
+        cell_ids,
+        original_indices,
+        state_path,
+        state_metadata,
+        adata,
+    )
+
+
+def load_inputs_state(
+        inputs,
+        *,
+        preprocessing=None,
+        velocity=None,
+        seed=42,
+        dataset_prefix="pancreas",
+):
+    if inputs.adata is not None:
+        return inputs.adata
+    cached = load_pancreas_state_cache(inputs.state_path, inputs.state_metadata)
+    if cached is None:
+        if preprocessing is None or velocity is None:
+            raise FileNotFoundError(f"Pancreas state cache is unavailable: {inputs.state_path}")
+        cached = load_or_compute_pancreas_state(
+            inputs.state_path.parent,
+            preprocessing=preprocessing,
+            velocity=velocity,
+            seed=seed,
+            dataset_prefix=dataset_prefix,
+        )
+        adata, _, cell_ids, _, inputs.state_path, inputs.state_metadata = cached
+        if not np.array_equal(cell_ids, inputs.cell_ids):
+            raise ValueError("Rebuilt pancreas state does not match the distance-cache cells.")
+        inputs.adata = adata
+    else:
+        inputs.adata = cached[0]
+    return inputs.adata
+
+
+def compute_pancreas_umap(adata, *, preprocessing, umap, n_components, seed):
+    import scanpy as sc
+
+    sc.pp.neighbors(
+        adata,
+        n_neighbors=umap["n_neighbors"],
+        n_pcs=preprocessing["n_pcs"],
+        random_state=seed,
+    )
+    sc.tl.umap(
+        adata,
+        n_components=n_components,
+        min_dist=umap["min_dist"],
+        spread=umap["spread"],
+        maxiter=umap["maxiter"],
+        negative_sample_rate=umap["negative_sample_rate"],
+        init_pos=umap["init_pos"],
+        random_state=seed,
+    )
+    return np.asarray(adata.obsm["X_umap"], dtype=float)
+
+
+def orient_pancreas_embedding_by_velocity(adata, embedding, *, velocity, label):
+    embedding = np.asarray(embedding, dtype=float)
+    if "velocity_graph" not in adata.uns:
+        compute_pancreas_velocity_graph(
+            adata,
+            n_neighbors=velocity["velocity_neighbors"],
+            n_jobs=velocity["graph_n_jobs"],
+        )
+    velocity_embedding = project_velocity_to_embedding(adata, embedding, basis="orientation")
+    oriented, _, mean_velocity = rotate_embedding_to_mean_velocity_down(
+        embedding,
+        velocity_embedding,
+    )
+    oriented_mean = np.nanmean(velocity_embedding, axis=0) @ rotation_to_down_axis(mean_velocity).T
+    print(
+        f"Oriented {label}: {np.array2string(mean_velocity, precision=3)} -> "
+        f"{np.array2string(oriented_mean, precision=3)}"
+    )
+    return oriented
+
+
+def ensure_pancreas_reference_embedding(
+    inputs,
+    raw_dir,
+    *,
+    method,
+    n_components,
+    preprocessing,
+    velocity,
+    options,
+    seed=42,
+    dataset_prefix="pancreas",
+):
+    method = str(method).lower()
+    n_neighbors = int(options["n_neighbors"])
+    stem = pancreas_reference_stem(
+        method,
+        n_components=n_components,
+        n_neighbors=n_neighbors,
+        min_dist=options.get("min_dist") if method == "umap" else None,
+        dataset_prefix=dataset_prefix,
+    )
+    reference_metadata = pancreas_cache_metadata(
+        method=method,
+        n_components=n_components,
+        state=pancreas_state_metadata(preprocessing, velocity, seed),
+        velocity_neighbors=velocity["velocity_neighbors"],
+        options=options,
+    )
+    path = pancreas_embedding_path(raw_dir, stem)
+    if path.exists():
+        try:
+            return (
+                load_pancreas_embedding(
+                    path,
+                    cell_ids=inputs.cell_ids,
+                    expected_shape=(len(inputs.cell_ids), n_components),
+                    expected_metadata=reference_metadata,
+                ),
+                path,
+            )
+        except (KeyError, OSError, ValueError):
+            print(f"Ignoring incompatible {method} cache: {path}")
+
+    adata = load_inputs_state(
+        inputs,
+        preprocessing=preprocessing,
+        velocity=velocity,
+        seed=seed,
+        dataset_prefix=dataset_prefix,
+    )
+    if method == "umap":
+        embedding = compute_pancreas_umap(
+            adata,
+            preprocessing=preprocessing,
+            umap=options,
+            n_components=n_components,
+            seed=seed,
+        )
+    elif method == "isomap":
+        embedding = IsomapWithPreds(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+        ).fit_transform(np.asarray(adata.obsm["X_pca"][:, :preprocessing["n_pcs"]], dtype=float))
+    else:
+        raise ValueError("Reference method must be 'umap' or 'isomap'.")
+
+    embedding = orient_pancreas_embedding_by_velocity(
+        adata,
+        embedding,
+        velocity=velocity,
+        label=f"{n_components}D {method.upper()}",
+    )
+    save_pancreas_embedding(
+        path,
+        embedding,
+        inputs.cell_ids,
+        metadata=reference_metadata,
+    )
+    return np.asarray(embedding, dtype=float), path

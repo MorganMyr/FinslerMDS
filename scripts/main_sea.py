@@ -1,570 +1,306 @@
-"""Sea-current Finsler-MDS experiments.
-
-This script is a compact version of ``main_2D_maps.main_sea`` meant for
-comparing direct and embedding-geodesic Finsler-MDS variants on a synthetic
-current map.
-"""
+"""Generate Sea dataset and fit a direct or geodesic Finsler-MDS embedding."""
 
 from __future__ import annotations
 
-import os
+from copy import deepcopy
 from pathlib import Path
 import sys
 
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parents[0]
-for path in (SCRIPT_DIR, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
-import matplotlib.pyplot as plt
-import numpy as np
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from finsler_mds import (
-    ConvexifiedMatsumotoMetric,
-    ConvexifiedToblerMetric,
-    MatsumotoMetric,
-    RandersMetric,
-    fit_finsler_mds,
-    utils,
-)
-from sea_datasets import (
-    add_obstacles_to_axis,
-    current_map_distances,
-    make_sea_dataset,
-    normalize_sea_dataset_name,
-    obstacle_array,
+from finsler_mds import fit_finsler_mds, utils  # noqa: E402
+from finsler_mds.utils.sea import (  # noqa: E402
+    load_or_compute_sea_inputs,
+    make_metric,
+    metric_tag,
+    normalize_metric_name,
+    normalize_optimizer,
+    normalized_x,
 )
 
 
-def main_sea():
-    seed = 0
-    script_dir = Path(__file__).resolve().parent
-
-    dataset_name = normalize_sea_dataset_name(os.environ.get("SEA_DATASET", "sea1"))
-
-    dir_res = script_dir / "res" / dataset_name
-    dir_fig = dir_res / "figures"
-    dir_embeddings = dir_res / "embeddings"
-
-    optimizer = os.environ.get("SEA_OPTIMIZER", "path_frozen")  # one of {"smacof", "gd", "path_frozen", "soft_bf"}
-    metric_name = os.environ.get("SEA_METRIC", "matsumoto")
-    alpha_current = 0.8
-    alpha_embedding = 0.7
-    tobler = {"a": 7.0, "b": 0.04}
-    init_source = os.environ.get(
-        "SEA_INIT",
-        "isomap",
-    )  # one of {"isomap", "target_mds", "latest_same"}
-
-    n_samples = 2000
-    n_components = 3
-    n_neighbors = 10
-    sea_length = 10.0
-    sea_width = 10.0
-    current_frequency = 2.0
-
-    smacof = {
+CONFIG = {
+    "seed": 0,
+    "n_samples": 2000,
+    "n_neighbors": 10,
+    "data_metric": "randers",  # "randers", "matsumoto", "convexified_matsumoto"
+    "alpha_current": 0.8,
+    "optimizer": "path_frozen",  # "smacof", "gradient_descent", "path_frozen"
+    "embedding_metric": "matsumoto",  # same choices as data_metric
+    "alpha_embedding": 0.2,
+    "init": "isomap",  # "isomap", "latest", or an NPZ path
+    "result_suffix": "",
+    "sea": {"length": 10.0, "width": 10.0, "current_frequency": 2.0},
+    "smacof": {
         "max_iter": 100,
-        "pseudo_inv_solver": "gmres",
         "project_on_V": True,
         "check_monotony": False,
-    }
-    gd = {
+        "device": "auto",  # "cpu", "auto", "gpu", or "cuda"
+        "verbose": 1,
+    },
+    "gradient_descent": {
         "max_iter": 350,
         "eps": 1e-6,
-        "method": "L-BFGS-B",
-        "optimizer_options": {"ftol": 1e-9, "maxls": 40},
+        "device": "auto",  # "cpu", "auto", "gpu", or "cuda"
         "verbose": 0,
-    }
-    path_frozen = {
+    },
+    "path_frozen": {
         "graph_neighbors": 12,
         "outer_iter": 20,
         "inner_iter": 50,
-        "eps": 1e-6,
-        "method": "L-BFGS-B",
-        "optimizer_options": {"ftol": 1e-8, "maxls": 40},
-        "n_landmark": 200,
-        "random_landmark_fraction": 1.0,
+        "n_landmark": 50,
+        "random_landmark_fraction": 0.5,
         "n_local_pairs": 12,
-        "local_pair_mode": "direct",
-        "targets_per_landmark": 400,
-        "local_global_reweighting": "count",
+        "targets_per_landmark": 100,
         "local_weight": 1.0,
-        "device": "auto",
+        "direct_stress_weight": 0.1,
+        "outer_step_size": 1,
+        "device": "auto",  # "cpu", "auto", "gpu", or "cuda"
         "verbose": 1,
-    }
-    soft_bf = {
-        "graph_neighbors": 12,
-        "beta": 30.0,
-        "n_relaxations": 30,
-        "max_iter": 150,
-        "n_graph_updates": 10,
-        "eps": 1e-6,
-        "method": "L-BFGS-B",
-        "optimizer_options": {"ftol": 1e-8, "maxls": 40},
-        "n_global_landmarks": 150,
-        "n_local_neighbors": 12,
-        "local_pair_mode": "direct",
-        "max_global_targets_per_source": 200,
-        "local_global_reweighting": "count",
-        "local_weight": 1.0,
-        "source_batch_size": 8,
-        "device": "auto",
-        "verbose": 1,
-    }
-    for directory in (dir_fig, dir_embeddings):
+    },
+}
+
+
+def main_sea(config_overrides=None):
+    config = merged_config(config_overrides)
+    optimizer = normalize_optimizer(config["optimizer"])
+    embedding_metric_name = normalize_metric_name(config["embedding_metric"])
+    if optimizer == "smacof" and embedding_metric_name != "randers":
+        raise ValueError("SMACOF is specific to a Randers embedding metric.")
+
+    sea_dir = Path(__file__).parent / "res" / "sea"
+    raw_dir = sea_dir / "raw"
+    embedding_dir = sea_dir / "embeddings"
+    figure_dir = sea_dir / "figures"
+    for directory in (raw_dir, embedding_dir, figure_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(seed)
-    dataset = make_sea_dataset(
-        dataset_name,
-        n_samples=n_samples,
-        alpha_current=alpha_current,
-        rng=rng,
-        graph_neighbors=n_neighbors,
-        sea_length=sea_length,
-        sea_width=sea_width,
-        current_frequency=current_frequency,
+    sea = config["sea"]
+    inputs = load_or_compute_sea_inputs(
+        raw_dir,
+        n_samples=config["n_samples"],
+        seed=config["seed"],
+        n_neighbors=config["n_neighbors"],
+        data_metric=config["data_metric"],
+        alpha_current=config["alpha_current"],
+        sea_length=sea["length"],
+        sea_width=sea["width"],
+        current_frequency=sea["current_frequency"],
     )
-    X = dataset.X
-    randers_field = dataset.randers_field
-    current_field = dataset.current_field
-    optimizer_kind = normalize_optimizer(optimizer)
-    effective_metric_name = "randers" if optimizer_kind == "smacof" else normalize_metric_name(metric_name)
-    run_key = sea_run_key(
-        optimizer_kind,
-        effective_metric_name,
-        alpha_current,
-        alpha_embedding,
-        tobler=tobler,
+    init, init_description = resolve_init(
+        config["init"],
+        inputs.X,
+        embedding_dir=embedding_dir,
+        optimizer=optimizer,
+        data_metric=config["data_metric"],
+        alpha_current=config["alpha_current"],
+        embedding_metric=embedding_metric_name,
+        alpha_embedding=config["alpha_embedding"],
+        n_neighbors=config["n_neighbors"],
     )
-
-    print(f"Dataset: {dataset.key} ({dataset.title})")
-    print("Target Randers geodesic distances on the current map")
-    target_distances, target_predecessors = current_map_distances(
-        dataset,
-        n_neighbors=n_neighbors,
-        path_method="auto",
+    metric = make_metric(embedding_metric_name, config["alpha_embedding"])
+    optimizer_name, options = optimizer_spec(optimizer, config)
+    print(
+        f"Running {optimizer} from {init_description}: "
+        f"data={metric_tag(config['data_metric'], config['alpha_current'])}, "
+        f"embedding={metric_tag(embedding_metric_name, config['alpha_embedding'])}"
     )
-
-    init = make_initialization(
-        X,
-        n_components=n_components,
-        n_neighbors=n_neighbors,
-        target_distances=target_distances,
-        init_source=init_source,
-        dir_embeddings=dir_embeddings,
-        optimizer=optimizer_kind,
-        metric_name=effective_metric_name,
-        alpha_current=alpha_current,
-    )
-    metric = make_metric(effective_metric_name, alpha_embedding, tobler=tobler)
-    fit_kwargs = optimizer_kwargs(
-        optimizer_kind,
+    embedding, objective = fit_finsler_mds(
+        inputs.dissimilarities,
+        optimizer=optimizer_name,
         metric=metric,
         init=init,
-        n_components=n_components,
-        smacof=smacof,
-        gd=gd,
-        path_frozen=path_frozen,
-        soft_bf=soft_bf,
-        seed=seed,
+        n_components=3,
+        random_state=config["seed"],
+        print_time=True,
+        **options,
     )
 
-    print(
-        f"Running {optimizer_kind} with metric={display_metric_name(effective_metric_name)} "
-        f"({metric_parameter_summary(effective_metric_name, alpha_embedding, tobler=tobler)}, "
-        f"target alpha={alpha_current:g})"
-    )
-    embedding, stress = fit_finsler_mds(target_distances, print_time=True, **fit_kwargs)
-    print(f"  stress: {stress}")
-    extrema = utils.get_extrema(embedding) if embedding.shape[1] == 3 else None
-
+    stem = result_stem(config, optimizer, embedding_metric_name)
+    output_path = embedding_dir / f"{stem}.npz"
     np.savez(
-        dir_embeddings / f"{run_key}.npz",
+        output_path,
         embedding=embedding,
-        stress=np.asarray(stress, dtype=float),
-        X=X,
-        randers_field=randers_field,
-        current_field=current_field,
-        target_distances=target_distances,
-        target_predecessors=target_predecessors,
-        init=init,
-        init_source=np.asarray(init_source),
-        dataset=np.asarray(dataset.key),
-        optimizer=np.asarray(optimizer_kind),
-        metric=np.asarray(display_metric_name(effective_metric_name)),
-        alpha_current=np.asarray(alpha_current, dtype=float),
-        alpha_embedding=np.asarray(alpha_embedding, dtype=float),
-        tobler_a=np.asarray(tobler["a"], dtype=float),
-        tobler_b=np.asarray(tobler["b"], dtype=float),
-        obstacles=obstacle_array(dataset.obstacles),
-        bounds=np.asarray(dataset.bounds, dtype=float),
+        objective=np.asarray(objective, dtype=float),
+        input_cache=np.asarray(inputs.path.name),
+        optimizer=np.asarray(optimizer),
+        embedding_metric=np.asarray(embedding_metric_name),
+        alpha_embedding=np.asarray(config["alpha_embedding"], dtype=float),
+        init=np.asarray(str(config["init"])),
     )
-
     plot_current_map(
-        X,
-        current_field,
-        title=f"{dataset.title}, alpha={alpha_current:g}",
-        save_path=dir_fig / f"sea_a{alpha_tag(alpha_current)}_current.pdf",
-        extrema=extrema,
-        obstacles=dataset.obstacles,
-        bounds=dataset.bounds,
+        inputs.X,
+        inputs.current_field,
+        path=figure_dir
+        / f"sea_{metric_tag(config['data_metric'], config['alpha_current'])}_current.pdf",
     )
-
     plot_embedding(
         embedding,
+        inputs.X,
+        title=stem,
+        path=figure_dir / f"{stem}.pdf",
+    )
+    print(f"Objective: {objective}")
+    print(f"Saved embedding: {output_path}")
+    return embedding, objective
+
+
+def resolve_init(
+        value,
         X,
-        extrema=extrema,
-        title=(
-            f"Sea {display_optimizer_name(optimizer_kind)}, "
-            f"{display_metric_name(effective_metric_name)}, "
-            f"target alpha={alpha_current:g}, "
-            f"{metric_parameter_summary(effective_metric_name, alpha_embedding, tobler=tobler)}"
-        ),
-        save_path=dir_fig / f"{run_key}.pdf",
-    )
-    print(f"Saved figures in: {dir_fig}")
-    print(f"Saved embedding: {dir_embeddings / f'{run_key}.npz'}")
-
-
-def make_metric(metric_name, alpha, *, tobler):
-    name = normalize_metric_name(metric_name)
-    if name == "randers":
-        return RandersMetric(alpha=alpha)
-    if name == "matsumoto":
-        return MatsumotoMetric(alpha=alpha)
-    if name == "convexified_matsumoto":
-        return ConvexifiedMatsumotoMetric(alpha=alpha)
-    if name == "convexified_tobler":
-        return ConvexifiedToblerMetric(a=tobler["a"], b=tobler["b"])
-    raise ValueError(f"Unknown metric {metric_name!r}.")
-
-
-def make_initialization(
-    X,
-    *,
-    n_components,
-    n_neighbors,
-    target_distances,
-    init_source,
-    dir_embeddings,
-    optimizer,
-    metric_name,
-    alpha_current,
+        *,
+        embedding_dir,
+        optimizer,
+        data_metric,
+        alpha_current,
+        embedding_metric,
+        alpha_embedding,
+        n_neighbors,
 ):
-    source = normalize_init_source(init_source)
-    if source == "isomap":
-        return utils.IsomapWithPreds(n_components=n_components, n_neighbors=n_neighbors).fit_transform(X)
-    if source == "target_mds":
-        return classical_mds_initialization(target_distances, n_components=n_components)
-
-    path = latest_embedding_path(
-        dir_embeddings,
-        optimizer=optimizer,
-        metric_name=metric_name,
-        alpha_current=alpha_current,
-    )
-    with np.load(path) as data:
-        init = np.asarray(data["embedding"], dtype=float)
-    if init.shape[0] != X.shape[0]:
-        raise ValueError(
-            f"Saved init {path} has {init.shape[0]} points, but current dataset has {X.shape[0]}."
+    normalized = str(value).lower().replace("-", "_")
+    if normalized == "isomap":
+        init = utils.IsomapWithPreds(
+            n_components=3, n_neighbors=n_neighbors
+        ).fit_transform(X)
+        return init, "Isomap"
+    if normalized in {"latest", "latest_same", "saved"}:
+        prefix = result_prefix(
+            optimizer,
+            data_metric,
+            alpha_current,
+            embedding_metric,
+            alpha_embedding,
         )
-    init = adapt_embedding_dimension(init, n_components)
-    print(f"Loaded initialization from: {path}")
-    return init
-
-
-def classical_mds_initialization(distances, *, n_components):
-    D = np.asarray(distances, dtype=float)
-    if not np.all(np.isfinite(D)):
-        raise ValueError("target_mds initialization requires finite target distances.")
-    sym = 0.5 * (D + D.T)
-    n = sym.shape[0]
-    squared = sym**2
-    row_mean = squared.mean(axis=1, keepdims=True)
-    col_mean = squared.mean(axis=0, keepdims=True)
-    total_mean = squared.mean()
-    gram = -0.5 * (squared - row_mean - col_mean + total_mean)
-    eigvals, eigvecs = np.linalg.eigh(gram)
-    order = np.argsort(eigvals)[::-1][:n_components]
-    eigvals = np.maximum(eigvals[order], 0.0)
-    return eigvecs[:, order] * np.sqrt(eigvals)
-
-
-def latest_embedding_path(dir_embeddings, *, optimizer, metric_name, alpha_current):
-    optimizer = normalize_optimizer(optimizer)
-    metric = normalize_metric_name(metric_name)
-    prefix = f"sea_a{alpha_tag(alpha_current)}_{optimizer_abbrev(optimizer)}_{metric_abbrev(metric)}_"
-    candidates = sorted(
-        dir_embeddings.glob(f"{prefix}*.npz"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise FileNotFoundError(
-            f"No saved embedding matching {prefix}*.npz in {dir_embeddings}. "
-            "Set init_source='isomap' to start from scratch."
+        candidates = sorted(
+            embedding_dir.glob(f"{prefix}*.npz"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
         )
-    return candidates[0]
+        if not candidates:
+            raise FileNotFoundError(f"No saved Sea embedding matching {prefix}*.npz.")
+        path = candidates[0]
+    else:
+        path = Path(str(value))
+        if path.suffix == "":
+            path = path.with_suffix(".npz")
+        if not path.is_absolute() and not path.exists():
+            path = embedding_dir / path
+        if not path.exists():
+            raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as saved:
+        init = np.asarray(saved["embedding"], dtype=float)
+    if init.shape[0] != len(X):
+        raise ValueError(f"Saved init has {len(init)} points; expected {len(X)}: {path}")
+    return promote_embedding(init, 3), str(path)
 
 
-def adapt_embedding_dimension(embedding, n_components):
+def optimizer_spec(optimizer, config):
+    if optimizer == "smacof":
+        return "smacof_randers", {"n_init": 1, "n_jobs": 1, **config["smacof"]}
+    return optimizer, dict(config[optimizer])
+
+
+def result_prefix(
+        optimizer,
+        data_metric,
+        alpha_current,
+        embedding_metric,
+        alpha_embedding,
+):
+    optimizer_tag = {"smacof": "smacof", "gradient_descent": "gd", "path_frozen": "pf"}[
+        normalize_optimizer(optimizer)
+    ]
+    return (
+        f"sea_{metric_tag(data_metric, alpha_current)}_{optimizer_tag}_"
+        f"{metric_tag(embedding_metric, alpha_embedding)}"
+    )
+
+
+def result_stem(config, optimizer, embedding_metric):
+    stem = result_prefix(
+        optimizer,
+        config["data_metric"],
+        config["alpha_current"],
+        embedding_metric,
+        config["alpha_embedding"],
+    )
+    suffix = str(config.get("result_suffix", "")).strip().strip("_")
+    return stem if not suffix else f"{stem}_{suffix}"
+
+
+def promote_embedding(embedding, n_components):
+    embedding = np.asarray(embedding, dtype=float)
+    if embedding.ndim != 2 or embedding.shape[1] > n_components:
+        raise ValueError(f"Initialization cannot be promoted from shape {embedding.shape} to {n_components}D.")
     if embedding.shape[1] == n_components:
         return embedding
-    if embedding.shape[1] > n_components:
-        return embedding[:, :n_components]
-    padding = np.zeros((embedding.shape[0], n_components - embedding.shape[1]), dtype=embedding.dtype)
-    return np.hstack([embedding, padding])
+    return np.column_stack((embedding, np.zeros((len(embedding), n_components - embedding.shape[1]))))
 
 
-def optimizer_kwargs(optimizer, *, metric, init, n_components, smacof, gd, path_frozen, soft_bf, seed):
-    if optimizer == "smacof":
-        return {
-            "optimizer": "smacof_randers",
-            "metric": RandersMetric(alpha=metric.alpha),
-            "init": init,
-            "n_components": n_components,
-            "n_init": 1,
-            "n_jobs": 1,
-            **smacof,
-        }
-    if optimizer == "gd":
-        return {
-            "optimizer": "gradient_descent",
-            "metric": metric,
-            "init": init,
-            "n_components": n_components,
-            "random_state": seed,
-            **gd,
-        }
-    if optimizer == "path_frozen":
-        return {
-            "optimizer": "path_frozen",
-            "metric": metric,
-            "init": init,
-            "n_components": n_components,
-            "random_state": seed,
-            **path_frozen,
-        }
-    if optimizer == "soft_bf":
-        return {
-            "optimizer": "soft_bellman_ford",
-            "metric": metric,
-            "init": init,
-            "n_components": n_components,
-            "random_state": seed,
-            **soft_bf,
-        }
-    raise ValueError(f"Unknown optimizer {optimizer!r}.")
-
-
-def plot_current_map(X, current_field, *, title, save_path, extrema=None, obstacles=(), bounds=None):
+def plot_current_map(X, current_field, *, path):
     fig, ax = plt.subplots(figsize=(6, 6))
-    colors = sea_colors(X)
-    ax.scatter(X[:, 0], X[:, 1], c=colors, s=45, lw=0)
+    colors = normalized_x(X)
+    ax.scatter(X[:, 0], X[:, 1], c=colors, cmap="jet", s=25, lw=0)
     ax.quiver(
-        X[:, 0],
-        X[:, 1],
-        current_field[:, 0],
-        current_field[:, 1],
-        color="black",
-        angles="xy",
-        scale_units="xy",
-        scale=1.4,
-        width=0.004,
-        alpha=0.75,
+        X[:, 0], X[:, 1], current_field[:, 0], current_field[:, 1],
+        color="black", angles="xy", scale_units="xy", scale=1.4,
+        width=0.004, alpha=0.75,
     )
-    add_obstacles_to_axis(ax, obstacles)
-    add_extrema_to_2d_axis(ax, X, extrema)
-    ax.set_title(title)
-    ax.set_aspect("equal", adjustable="box" if bounds is not None else "datalim")
-    if bounds is not None:
-        xmin, xmax, ymin, ymax = bounds
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="datalim")
     ax.set_axis_off()
     fig.tight_layout()
-    fig.savefig(save_path)
+    fig.savefig(path)
     plt.close(fig)
 
 
-def plot_embedding(embedding, X_original, *, title, save_path, extrema=None):
-    embedding = np.asarray(embedding, dtype=float)
-    colors = sea_colors(X_original)
-    if embedding.shape[1] == 3:
-        fig = plt.figure(figsize=(11, 9))
-        views = [("front", 20, -60), ("side", 20, 30), ("top", 90, -90), ("diagonal", 35, 135)]
-        for view_id, (view_name, elev, azim) in enumerate(views):
-            ax = fig.add_subplot(2, 2, view_id + 1, projection="3d")
-            ax.scatter(embedding[:, 0], embedding[:, 1], embedding[:, 2], c=colors, s=18, lw=0)
-            add_extrema_to_3d_axis(ax, extrema)
-            ax.view_init(elev=elev, azim=azim)
-            ax.set_title(view_name)
-            ax.set_box_aspect([1, 1, 1])
-            utils.set_axes_equal(ax)
-            ax.set_xlabel("Embedding 1")
-            ax.set_ylabel("Embedding 2")
-            ax.set_zlabel("Embedding 3")
-        fig.suptitle(title)
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
-    else:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.scatter(embedding[:, 0], embedding[:, 1], c=colors, s=32, lw=0)
-        add_extrema_to_2d_axis(ax, embedding, extrema)
-        ax.set_title(title)
-        ax.set_aspect("equal", adjustable="datalim")
-        ax.set_axis_off()
-        fig.tight_layout()
-    fig.savefig(save_path)
-    plt.close(fig)
-
-
-def add_extrema_to_2d_axis(ax, points, extrema):
-    if extrema is None:
-        return
-    max_idx = np.asarray(extrema["maxima"]["indices"], dtype=int)
-    min_idx = np.asarray(extrema["minima"]["indices"], dtype=int)
-    if len(max_idx):
-        ax.scatter(points[max_idx, 0], points[max_idx, 1], c="black", s=200, lw=0, alpha=1, zorder=1_000_000)
-    if len(min_idx):
-        ax.scatter(points[min_idx, 0], points[min_idx, 1], c="gray", s=200, lw=0, alpha=1, zorder=1_000_000)
-
-
-def add_extrema_to_3d_axis(ax, extrema):
-    if extrema is None:
-        return
-    maxima = extrema["maxima"]["values"]
-    minima = extrema["minima"]["values"]
-    if len(maxima):
-        ax.scatter(maxima[:, 0], maxima[:, 1], maxima[:, 2], color="black", s=70, alpha=1, marker="o", zorder=1_000_000)
-    if len(minima):
-        ax.scatter(minima[:, 0], minima[:, 1], minima[:, 2], color="gray", s=70, alpha=1, marker="o", zorder=1_000_000)
-
-
-def sea_colors(X):
-    values = (X[:, 0] - X[:, 0].min()) / max(np.ptp(X[:, 0]), 1e-12)
-    return plt.cm.jet(values)
-
-
-def sea_run_key(optimizer, metric_name, alpha_current, alpha_embedding, *, tobler=None):
-    optimizer = normalize_optimizer(optimizer)
-    metric = "randers" if optimizer == "smacof" else normalize_metric_name(metric_name)
-    metric_tag = metric_abbrev(metric)
-    parameter_tag = f"a{alpha_tag(alpha_embedding)}"
-    if metric == "convexified_tobler":
-        tobler = {} if tobler is None else tobler
-        parameter_tag = f"ta{alpha_tag(tobler.get('a', 3.5))}_tb{alpha_tag(tobler.get('b', 0.05))}"
-    return (
-        f"sea_a{alpha_tag(alpha_current)}_"
-        f"{optimizer_abbrev(optimizer)}_{metric_tag}_"
-        f"{parameter_tag}"
+def plot_embedding(embedding, X, *, title, path):
+    if embedding.shape[1] != 3:
+        raise ValueError("Sea embeddings must be 3D.")
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(
+        embedding[:, 0],
+        embedding[:, 1],
+        embedding[:, 2],
+        c=plt.get_cmap("jet")(normalized_x(X)),
+        s=14,
+        lw=0,
     )
+    ax.view_init(elev=25, azim=-60)
+    ax.set_box_aspect((1, 1, 1))
+    utils.set_axes_equal(ax)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
 
 
-def normalize_optimizer(optimizer):
-    name = str(optimizer).lower().replace("-", "_")
-    aliases = {
-        "smacof": "smacof",
-        "randers_smacof": "smacof",
-        "smacof_randers": "smacof",
-        "gd": "gd",
-        "gradient_descent": "gd",
-        "path_frozen": "path_frozen",
-        "pf": "path_frozen",
-        "soft_bf": "soft_bf",
-        "sbf": "soft_bf",
-        "soft_bellman_ford": "soft_bf",
-    }
-    if name not in aliases:
-        raise ValueError("optimizer must be one of {'smacof', 'gd', 'path_frozen', 'soft_bf'}.")
-    return aliases[name]
+def merged_config(overrides):
+    config = deepcopy(CONFIG)
+    if overrides:
+        deep_update(config, overrides)
+    return config
 
 
-def normalize_metric_name(metric_name):
-    name = str(metric_name).lower().replace("-", "_")
-    aliases = {
-        "randers": "randers",
-        "r": "randers",
-        "matsumoto": "matsumoto",
-        "mats": "matsumoto",
-        "convexified_matsumoto": "convexified_matsumoto",
-        "convexifiedmatsumoto": "convexified_matsumoto",
-        "cmats": "convexified_matsumoto",
-        "convmats": "convexified_matsumoto",
-        "convexified_tobler": "convexified_tobler",
-        "convexifiedtobler": "convexified_tobler",
-        "tobler_convexified": "convexified_tobler",
-        "ctobler": "convexified_tobler",
-        "ctobl": "convexified_tobler",
-    }
-    if name not in aliases:
-        raise ValueError(
-            "metric_name must be one of "
-            "{'randers', 'matsumoto', 'convexified_matsumoto', 'convexified_tobler'}."
-        )
-    return aliases[name]
-
-
-def normalize_init_source(init_source):
-    name = str(init_source).lower().replace("-", "_")
-    aliases = {
-        "isomap": "isomap",
-        "target_mds": "target_mds",
-        "mds": "target_mds",
-        "classical_mds": "target_mds",
-        "latest": "latest_same",
-        "latest_same": "latest_same",
-        "saved": "latest_same",
-    }
-    if name not in aliases:
-        raise ValueError("init_source must be one of {'isomap', 'target_mds', 'latest_same'}.")
-    return aliases[name]
-
-
-def optimizer_abbrev(optimizer):
-    return {"smacof": "smacof", "gd": "gd", "path_frozen": "pf", "soft_bf": "sbf"}[optimizer]
-
-
-def metric_abbrev(metric_name):
-    return {
-        "randers": "r",
-        "matsumoto": "mats",
-        "convexified_matsumoto": "cmats",
-        "convexified_tobler": "ctobl",
-    }[metric_name]
-
-
-def display_optimizer_name(optimizer):
-    return {"smacof": "SMACOF", "gd": "GD", "path_frozen": "Path-frozen", "soft_bf": "Soft-BF"}[optimizer]
-
-
-def display_metric_name(metric_name):
-    return {
-        "randers": "Randers",
-        "matsumoto": "Matsumoto",
-        "convexified_matsumoto": "Convexified Matsumoto",
-        "convexified_tobler": "Convexified Tobler",
-    }[normalize_metric_name(metric_name)]
-
-
-def metric_parameter_summary(metric_name, alpha_embedding, *, tobler):
-    if normalize_metric_name(metric_name) == "convexified_tobler":
-        return f"Tobler a={tobler['a']:g}, b={tobler['b']:g}"
-    return f"embedding alpha={alpha_embedding:g}"
-
-
-def alpha_tag(alpha):
-    alpha = float(alpha)
-    if alpha.is_integer():
-        return str(int(alpha))
-    return f"{alpha:g}".replace("-", "m").replace(".", "p")
+def deep_update(target, updates):
+    for key, value in updates.items():
+        if key not in target:
+            raise KeyError(f"Unknown main_sea option: {key!r}.")
+        if isinstance(target[key], dict):
+            if not isinstance(value, dict):
+                raise TypeError(f"Override {key!r} must be a dictionary.")
+            deep_update(target[key], value)
+        else:
+            target[key] = value
 
 
 if __name__ == "__main__":

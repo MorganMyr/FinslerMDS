@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import scipy.optimize
 
@@ -16,24 +14,15 @@ from finsler_mds.optimizers.common import (
 from finsler_mds.optimizers.metric_kernels import (
     cupy_metric_length_and_grad,
     gpu_metric_supported,
+    load_cupy,
 )
-from finsler_mds.optimizers.path_frozen import (
-    _load_cupy,
-)
-
-
-@dataclass(frozen=True)
-class GradientDescentResult:
-    embedding: np.ndarray
-    stress: float
-    n_iter: int
-    optimizer_result: scipy.optimize.OptimizeResult
 
 
 def _stress_and_grad(X_flat, *, shape, dissimilarities, weight, metric, normalized_stress):
     X = X_flat.reshape(shape)
     active = weight != 0
-    embedded = metric.pairwise(X)
+    diff = X[None, :, :] - X[:, None, :]
+    embedded = metric.length(diff)
     embedded_active = np.where(active, embedded, 0.0)
     if not np.all(np.isfinite(embedded_active)):
         raise ValueError(
@@ -44,12 +33,9 @@ def _stress_and_grad(X_flat, *, shape, dissimilarities, weight, metric, normaliz
 
     residual = np.zeros_like(dissimilarities, dtype=float)
     residual[active] = weight[active] * (embedded[active] - dissimilarities[active])
-    stress = np.sum(weight[active] * (embedded[active] - dissimilarities[active]) ** 2)
-
-    if normalized_stress:
-        stress, _ = normalized_stress_scale(stress, dissimilarities, weight)
-
-    diff = X[None, :, :] - X[:, None, :]
+    raw_stress = np.sum(
+        weight[active] * (embedded[active] - dissimilarities[active]) ** 2
+    )
     grad_u = metric.grad_u(diff)
     if not np.all(np.isfinite(np.where(active[..., None], grad_u, 0.0))):
         raise ValueError(
@@ -59,9 +45,9 @@ def _stress_and_grad(X_flat, *, shape, dissimilarities, weight, metric, normaliz
         )
 
     if normalized_stress:
-        raw_stress = np.sum(weight[active] * (embedded[active] - dissimilarities[active]) ** 2)
-        _, scale = normalized_stress_scale(raw_stress, dissimilarities, weight)
+        stress, scale = normalized_stress_scale(raw_stress, dissimilarities, weight)
     else:
+        stress = raw_stress
         scale = 2.0
 
     pair_grad = scale * residual[..., None] * grad_u
@@ -77,7 +63,7 @@ def _resolve_gpu_backend(device, metric, verbose):
     if not gpu_metric_supported(metric):
         message = (
             "gradient_descent GPU backend currently supports RandersMetric, "
-            "MatsumotoMetric, ConvexifiedMatsumotoMetric, and ConvexifiedToblerMetric only."
+            "MatsumotoMetric, and ConvexifiedMatsumotoMetric only."
         )
         if device == "auto":
             if verbose:
@@ -85,7 +71,7 @@ def _resolve_gpu_backend(device, metric, verbose):
             return None
         raise ValueError(message)
 
-    cp, error = _load_cupy()
+    cp, error = load_cupy()
     if cp is None:
         message = f"gradient_descent GPU backend unavailable: {error}"
         if device == "auto":
@@ -133,7 +119,7 @@ class _GpuDenseStressObjective:
     def __call__(self, X_flat):
         cp = self.cp
         X = cp.asarray(X_flat.reshape(self.shape), dtype=cp.float64)
-        raw_stress = self._raw_stress(X)
+        raw_stress, grad = self._raw_stress_and_grad(X)
         if self.normalized_stress:
             if self.denom is None or self.denom <= 0:
                 return np.inf, np.zeros_like(X_flat)
@@ -142,33 +128,11 @@ class _GpuDenseStressObjective:
         else:
             stress = raw_stress
             scale = 2.0
-        grad = self._grad(X, scale)
-        return float(stress), cp.asnumpy(grad).ravel()
+        return float(stress), cp.asnumpy(scale * grad).ravel()
 
-    def _raw_stress(self, X):
+    def _raw_stress_and_grad(self, X):
         cp = self.cp
         stress = cp.asarray(0.0, dtype=cp.float64)
-        n_samples = X.shape[0]
-        for start in range(0, n_samples, self.block_size):
-            stop = min(start + self.block_size, n_samples)
-            vectors = X[None, :, :] - X[start:stop, None, :]
-            lengths, _ = cupy_metric_length_and_grad(
-                cp,
-                vectors.reshape(-1, X.shape[1]),
-                self.metric,
-            )
-            lengths = lengths.reshape(stop - start, n_samples)
-            active_lengths = cp.where(self.W[start:stop] != 0, lengths, 0.0)
-            if not cp.all(cp.isfinite(active_lengths)).item():
-                raise ValueError(
-                    "The metric produced non-finite embedded distances on active pairs."
-                )
-            residual = lengths - self.D[start:stop]
-            stress += cp.sum(self.W[start:stop] * residual * residual)
-        return float(cp.asnumpy(stress))
-
-    def _grad(self, X, scale):
-        cp = self.cp
         grad = cp.zeros_like(X)
         n_samples, n_components = X.shape
         for start in range(0, n_samples, self.block_size):
@@ -182,16 +146,25 @@ class _GpuDenseStressObjective:
             block_shape = (stop - start, n_samples)
             lengths = lengths.reshape(block_shape)
             grad_u = grad_u.reshape(block_shape + (n_components,))
+            active_lengths = cp.where(self.W[start:stop] != 0, lengths, 0.0)
+            if not cp.all(cp.isfinite(active_lengths)).item():
+                raise ValueError(
+                    "The metric produced non-finite embedded distances on active pairs."
+                )
             active_grad = cp.where(self.W[start:stop, :, None] != 0, grad_u, 0.0)
             if not cp.all(cp.isfinite(active_grad)).item():
                 raise ValueError(
                     "The metric produced non-finite gradients on active pairs."
                 )
-            residual = self.W[start:stop] * (lengths - self.D[start:stop])
-            pair_grad = scale * residual[:, :, None] * grad_u
+            block_weight = self.W[start:stop]
+            residual = cp.where(
+                block_weight != 0, lengths - self.D[start:stop], 0.0
+            )
+            stress += cp.sum(block_weight * residual * residual)
+            pair_grad = block_weight[:, :, None] * residual[:, :, None] * active_grad
             grad += cp.sum(pair_grad, axis=0)
             grad[start:stop] -= cp.sum(pair_grad, axis=1)
-        return grad
+        return float(cp.asnumpy(stress)), grad
 
 
 def gradient_descent(
@@ -211,7 +184,6 @@ def gradient_descent(
     device="cpu",
     gpu_block_size=256,
     return_n_iter=False,
-    return_result=False,
 ):
     """Optimize Finsler-MDS stress with a generic gradient-based optimizer.
 
@@ -263,27 +235,9 @@ def gradient_descent(
     X = result.x.reshape(shape)
     stress = float(result.fun)
     n_iter = int(getattr(result, "nit", max_iter))
-    gd_result = GradientDescentResult(
-        embedding=X,
-        stress=stress,
-        n_iter=n_iter,
-        optimizer_result=result,
-    )
-
-    if return_result:
-        return gd_result
     if return_n_iter:
-        return gd_result.embedding, gd_result.stress, gd_result.n_iter
-    return gd_result.embedding, gd_result.stress
+        return X, stress, n_iter
+    return X, stress
 
 
-def optimize_gradient_descent(*args, **kwargs):
-    """Alias used by the higher-level API layer."""
-    return gradient_descent(*args, **kwargs)
-
-
-__all__ = [
-    "GradientDescentResult",
-    "gradient_descent",
-    "optimize_gradient_descent",
-]
+__all__ = ["gradient_descent"]

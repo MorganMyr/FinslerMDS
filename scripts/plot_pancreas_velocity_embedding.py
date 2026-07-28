@@ -2,15 +2,14 @@
 
 Examples:
 
-    python scripts/plot_pancreas_velocity_embedding.py gd_2d_vrand2_r0p05_s42.npz
-    python scripts/plot_pancreas_velocity_embedding.py umap_dynamical_s42.npy --point-fraction 0.15
+    python scripts/plot_pancreas_velocity_embedding.py gd_2d_vrand2_r0p05.npz
+    python scripts/plot_pancreas_velocity_embedding.py umap_2d_k50_md0p5.npz
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import re
 import sys
 
 import matplotlib
@@ -25,25 +24,26 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from finsler_mds.utils import plot_3d_embedding_views, plot_categorical_embedding  # noqa: E402
-from finsler_mds.utils.pancreas import (  # noqa: E402
-    PANCREAS_CLUSTER_COLORS,
-    project_velocity_to_embedding,
+from finsler_mds.utils.pancreas import PANCREAS_CLUSTER_COLORS  # noqa: E402
+from finsler_mds.utils.pancreas_files import (  # noqa: E402
+    load_pancreas_embedding,
+    pancreas_artifact_dir,
+    resolve_pancreas_embedding_path,
 )
 from scripts.evaluate_pancreas_embedding import (  # noqa: E402
     N_EVAL_NEIGHBORS,
-    load_embedding,
+    SEED,
     load_pancreas_evaluation_context,
-    resolve_embedding_path,
+    project_velocity_to_embedding_from_transition,
 )
 
 
-# Defaults exposed here so quick visual tuning does not require touching argparse.
+# Visual settings.
 POINT_FRACTION = 0.07
 VECTOR_LENGTH_FRACTION = 0.025
 VELOCITY_SCALE = 1.0
 VELOCITY_NORM_POWER = 0.4
 N_NEIGHBORS = N_EVAL_NEIGHBORS
-SEED = 42
 TITLE = None
 OUTPUT_NAME = None
 
@@ -57,53 +57,53 @@ ARROW_LENGTH_RATIO_3D = 0.25
 
 
 def main() -> None:
-    args = parse_args()
+    embedding_name = parse_args().embedding
     script_dir = Path(__file__).resolve().parent
     pancreas_dir = script_dir / "res" / "pancreas"
     raw_dir = pancreas_dir / "raw"
-    output_dir = pancreas_dir / "vector_plot"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    embedding_path = resolve_embedding_path(args.embedding, raw_dir)
-    embedding = load_embedding(embedding_path)
+    embedding_path = resolve_pancreas_embedding_path(embedding_name, raw_dir)
+    output_dir = pancreas_artifact_dir(
+        pancreas_dir / "vector_plot",
+        embedding_path.name,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
     context = load_pancreas_evaluation_context(
         raw_dir,
         pancreas_dir / "rna_velocity_evaluation",
-        n_eval_neighbors=args.n_neighbors,
-        load_adata=True,
+        n_eval_neighbors=N_NEIGHBORS,
     )
-    if len(embedding) != len(context.labels):
-        raise ValueError(
-            f"Embedding has {len(embedding)} rows, but pancreas state has {len(context.labels)} cells."
-        )
+    embedding = load_pancreas_embedding(
+        embedding_path,
+        cell_ids=context.cell_ids,
+    )
 
-    rng = np.random.default_rng(args.seed)
-    vector_idx = sample_indices(len(embedding), args.point_fraction, rng)
-    velocity_embedding = project_velocity_to_embedding(
-        context.adata,
+    rng = np.random.default_rng(SEED)
+    vector_idx = sample_indices(len(embedding), POINT_FRACTION, rng)
+    velocity_embedding = project_velocity_to_embedding_from_transition(
+        context.velocity_transition,
         embedding,
-        basis="vector_plot",
     )[vector_idx]
     velocity_embedding = temper_velocity_norms(
         velocity_embedding,
-        power=args.velocity_norm_power,
+        power=VELOCITY_NORM_POWER,
     )
     velocity_embedding *= auto_velocity_scale(
         embedding,
         velocity_embedding,
-        target_fraction=args.vector_length_fraction,
-        multiplier=args.velocity_scale,
+        target_fraction=VECTOR_LENGTH_FRACTION,
+        multiplier=VELOCITY_SCALE,
     )
 
-    save_path = output_dir / f"{args.output_name or figure_stem(embedding_path)}.pdf"
+    save_path = output_dir / f"{OUTPUT_NAME or embedding_path.stem}.pdf"
     plot_embedding_with_vectors(
         embedding,
         labels=context.labels,
         vector_idx=vector_idx,
         velocity_embedding=velocity_embedding,
-        title=args.title or embedding_path.stem,
+        title=TITLE or embedding_path.stem,
         save_path=save_path,
-        seed=args.seed,
+        seed=SEED,
     )
     print(f"Saved vector plot: {save_path}")
 
@@ -122,7 +122,7 @@ def temper_velocity_norms(velocity_embedding, *, power):
     """Compress vector length variation while preserving directions."""
     power = float(power)
     if not (0 <= power <= 1):
-        raise ValueError("--velocity-norm-power must be between 0 and 1.")
+        raise ValueError("VELOCITY_NORM_POWER must be between 0 and 1.")
     velocity_embedding = np.asarray(velocity_embedding, dtype=float).copy()
     norms = np.linalg.norm(velocity_embedding, axis=1, keepdims=True)
     nonzero = norms[:, 0] > 0
@@ -150,8 +150,6 @@ def plot_embedding_with_vectors(
             embedding,
             labels=labels,
             title=title,
-            xlabel="Finsler 1",
-            ylabel="Finsler 2",
             cmap=cmap,
             s=POINT_SIZE,
         )
@@ -201,7 +199,7 @@ def plot_embedding_with_vectors(
 def sample_indices(n_points, point_fraction, rng):
     point_fraction = float(point_fraction)
     if not (0 < point_fraction <= 1):
-        raise ValueError("--point-fraction must be in (0, 1].")
+        raise ValueError("POINT_FRACTION must be in (0, 1].")
     n_sample = max(1, int(round(point_fraction * n_points)))
     return np.sort(rng.choice(n_points, size=n_sample, replace=False))
 
@@ -216,31 +214,12 @@ def whiten_palette(cmap, amount):
     }
 
 
-def figure_stem(path):
-    return re.sub(r"_s\d+$", "", Path(path).stem)
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Plot a saved pancreas embedding with sampled projected velocity vectors."
-    )
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "embedding",
-        help="Embedding filename. Relative names are first searched in scripts/res/pancreas/raw/.",
+        help="Embedding filename or NPZ path.",
     )
-    parser.add_argument("--point-fraction", type=float, default=POINT_FRACTION)
-    parser.add_argument("--vector-length-fraction", type=float, default=VECTOR_LENGTH_FRACTION)
-    parser.add_argument("--velocity-scale", type=float, default=VELOCITY_SCALE)
-    parser.add_argument(
-        "--velocity-norm-power",
-        type=float,
-        default=VELOCITY_NORM_POWER,
-        help="Vector norm compression in [0, 1]: 0 gives equal arrow lengths, 1 keeps projected norms.",
-    )
-    parser.add_argument("--n-neighbors", type=int, default=N_NEIGHBORS)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--title", default=TITLE)
-    parser.add_argument("--output-name", default=OUTPUT_NAME)
     return parser.parse_args()
 
 

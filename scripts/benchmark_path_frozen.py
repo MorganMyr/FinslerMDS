@@ -1,8 +1,7 @@
-"""Benchmark path-frozen landmark selection on branching and Swiss roll data.
+"""Benchmark Path-Frozen convergence on branching and Swiss roll data.
 
-The campaign compares fixed farthest landmarks, fixed random landmarks,
-resampled random landmarks, and mixed farthest/random landmark sets. It records
-path-frozen history at ``log_frequency`` into CSV files.
+The campaign compares landmark mixes and direct-MDS regularization weights. It
+records the Path-Frozen history at the selected log frequency into CSV files.
 """
 
 from __future__ import annotations
@@ -26,38 +25,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from finsler_mds import RandersMetric, fit_finsler_mds, utils  # noqa: E402
-from scripts import main_branching as branching  # noqa: E402
+from finsler_mds.utils.branching import load_branching_problem  # noqa: E402
 
 
 @dataclass(frozen=True)
 class LandmarkStrategy:
     name: str
     random_landmark_fraction: float
-    resample_random_landmarks: bool
 
 
-@dataclass(frozen=True)
-class DirectStressConfig:
-    mode: str
-    weight: float
-    margin: float = 0.5
-
-
-DATASETS = ("swiss_roll",)
+DATASETS = ("swiss_roll", "branching")
 N_SAMPLES = 1000
-SEEDS = (42,43,44,45,46)
+SEEDS = (42, 43, 44, 45, 46)
 LANDMARK_STRATEGIES = (
-    LandmarkStrategy("farthest", 0.0, False),
+    LandmarkStrategy("farthest", 0.0),
 )
-DIRECT_STRESS_CONFIGS = (
-    DirectStressConfig("none", 0.0),
-    DirectStressConfig("hinge", 1, 0.5),
-    DirectStressConfig("hinge", 5e-1, 0.5),
-    DirectStressConfig("hinge", 1e-1, 0.5),
-    DirectStressConfig("mds", 1),
-    DirectStressConfig("mds", 5e-1),
-    DirectStressConfig("mds", 1e-1),
-)
+DIRECT_STRESS_WEIGHTS = (0.0, 1.0, 0.5, 0.1)
 LANDMARK_FRACTIONS = (0.10,)
 TARGETS_PER_LANDMARK_FRACTION = 0.35
 INNER_ITER = 50
@@ -70,8 +53,6 @@ LOG_FREQUENCY_BY_LANDMARK_FRACTION = {
     0.10: 2,
 }
 
-LOCAL_PAIR_MODE = "direct"
-LOCAL_GLOBAL_REWEIGHTING = "energy"
 LOCAL_WEIGHT = 1.0
 OVERWRITE = False
 RUN_BENCHMARKS = True
@@ -91,6 +72,12 @@ SWISS_ROLL_NOISE_LEVEL = 0.0
 SWISS_ROLL_ALPHA_MANIFOLD = 0.35
 SWISS_ROLL_ALPHA_EMBEDDING = 0.5
 SWISS_ROLL_LOCAL_PAIRS = 8
+DATASET_SEED = 42
+BRANCHING_K = 10
+BRANCHING_CORRIDOR_WIDTH = 0.11
+BRANCHING_N_COMPONENTS = 2
+BRANCHING_EMBEDDING_K = 20
+BRANCHING_LOCAL_PAIRS = 20
 
 
 @dataclass(frozen=True)
@@ -118,13 +105,13 @@ def main():
                 for strategy in LANDMARK_STRATEGIES:
                     for landmark_fraction in LANDMARK_FRACTIONS:
                         for outer_step_size in OUTER_STEP_SIZES:
-                            for direct_stress in DIRECT_STRESS_CONFIGS:
+                            for direct_stress_weight in DIRECT_STRESS_WEIGHTS:
                                 summary_rows.append(
                                     run_benchmark(
                                         dataset,
                                         seed=seed,
                                         strategy=strategy,
-                                        direct_stress=direct_stress,
+                                        direct_stress_weight=direct_stress_weight,
                                         landmark_fraction=landmark_fraction,
                                         outer_step_size=outer_step_size,
                                         csv_dir=csv_dir,
@@ -161,39 +148,30 @@ def load_benchmark_dataset(dataset_name, raw_dir, *, n_samples=None):
 
 
 def load_branching_dataset(raw_dir, *, n_samples):
-    stem = (
-        f"branching_n{n_samples}_k{branching.GRAPH_NEIGHBORS}_"
-        f"w{branching.format_float(branching.CORRIDOR_WIDTH)}_s{branching.SEED}"
-    )
-    dataset = branching.load_or_create_dataset(
-        raw_dir / f"{stem}_dataset.npz",
+    problem = load_branching_problem(
+        raw_dir,
         n_samples=n_samples,
-        graph_neighbors=branching.GRAPH_NEIGHBORS,
-        corridor_width=branching.CORRIDOR_WIDTH,
-        seed=branching.SEED,
-        force=False,
-    )
-    init = branching.load_or_create_contracted_init(
-        raw_dir / f"{stem}_contracted_init.npz",
-        dataset,
+        graph_neighbors=BRANCHING_K,
+        corridor_width=BRANCHING_CORRIDOR_WIDTH,
+        seed=DATASET_SEED,
         force=False,
     )
     return BenchmarkDataset(
         name="branching",
-        D=dataset.D,
-        init=init,
+        D=problem.dissimilarities,
+        init=problem.init,
         metric=RandersMetric(alpha=0.0),
-        n_components=branching.N_COMPONENTS,
-        graph_neighbors=branching.PATH_FROZEN_OPTIONS["graph_neighbors"],
-        n_local_pairs=branching.PATH_FROZEN_OPTIONS["n_local_pairs"],
+        n_components=BRANCHING_N_COMPONENTS,
+        graph_neighbors=BRANCHING_EMBEDDING_K,
+        n_local_pairs=BRANCHING_LOCAL_PAIRS,
     )
 
 
 def load_swiss_roll_dataset(raw_dir, *, n_samples):
     stem = (
         f"swiss_n{n_samples}_k{SWISS_ROLL_K}_"
-        f"ma{branching.format_float(SWISS_ROLL_ALPHA_MANIFOLD)}_"
-        f"ea{branching.format_float(SWISS_ROLL_ALPHA_EMBEDDING)}_s{branching.SEED}"
+        f"ma{float_code(SWISS_ROLL_ALPHA_MANIFOLD)}_"
+        f"ea{float_code(SWISS_ROLL_ALPHA_EMBEDDING)}_s{DATASET_SEED}"
     )
     path = raw_dir / f"{stem}.npz"
     if path.exists():
@@ -202,13 +180,13 @@ def load_swiss_roll_dataset(raw_dir, *, n_samples):
         return swiss_roll_benchmark_dataset(data["D"], data["init"])
 
     print(f"Creating Swiss roll benchmark data: n={n_samples}, k={SWISS_ROLL_K}")
-    rng = np.random.default_rng(branching.SEED)
+    rng = np.random.default_rng(DATASET_SEED)
     params = rng.random((n_samples, 2))
     x = np.empty((n_samples, 2), dtype=float)
     x[:, 0] = params[:, 0] * 3 * np.pi + 1.5 * np.pi
     x[:, 1] = params[:, 1] * 20
 
-    X_noiseless = np.empty((N_SAMPLES, 3), dtype=float)
+    X_noiseless = np.empty((n_samples, 3), dtype=float)
     X_noiseless[:, 0] = x[:, 0] * np.cos(x[:, 0])
     X_noiseless[:, 1] = x[:, 1]
     X_noiseless[:, 2] = x[:, 0] * np.sin(x[:, 0])
@@ -260,9 +238,24 @@ def swiss_roll_benchmark_dataset(D, init):
     )
 
 
-def run_benchmark(dataset, *, seed, strategy, direct_stress, landmark_fraction, outer_step_size, csv_dir):
-    options = benchmark_options(dataset, seed, strategy, direct_stress, landmark_fraction, outer_step_size)
-    path = csv_dir / benchmark_filename(dataset, seed, strategy, direct_stress, landmark_fraction, outer_step_size)
+def run_benchmark(dataset, *, seed, strategy, direct_stress_weight, landmark_fraction, outer_step_size, csv_dir):
+    options = benchmark_options(
+        dataset,
+        seed,
+        strategy,
+        direct_stress_weight,
+        landmark_fraction,
+        outer_step_size,
+    )
+    n_samples = len(dataset.D)
+    path = csv_dir / benchmark_filename(
+        seed,
+        strategy,
+        direct_stress_weight,
+        landmark_fraction,
+        outer_step_size,
+        n_samples=n_samples,
+    )
     if path.exists() and not OVERWRITE:
         print(f"Skipping existing benchmark: {path}")
         return read_last_summary_row(path)
@@ -270,11 +263,10 @@ def run_benchmark(dataset, *, seed, strategy, direct_stress, landmark_fraction, 
     print(
         f"Running {dataset.name}: {strategy.name}, "
         f"random_landmark_fraction={strategy.random_landmark_fraction:g}, "
-        f"resample_random_landmarks={strategy.resample_random_landmarks}, "
-        f"landmarks={percent_code(options['n_landmark'], N_SAMPLES)}, "
-        f"targets={percent_code(options['targets_per_landmark'], N_SAMPLES)}, "
+        f"landmarks={percent_code(options['n_landmark'], n_samples)}, "
+        f"targets={percent_code(options['targets_per_landmark'], n_samples)}, "
         f"inner={INNER_ITER}, outer={options['outer_iter']}, "
-        f"direct_stress={direct_stress_code(direct_stress)}, "
+        f"direct_stress={direct_stress_code(direct_stress_weight)}, "
         f"outer_step={outer_step_size:g}, seed={seed}"
     )
     wall_start = perf_counter()
@@ -295,7 +287,7 @@ def run_benchmark(dataset, *, seed, strategy, direct_stress, landmark_fraction, 
         dataset=dataset,
         seed=seed,
         landmark_strategy=strategy,
-        direct_stress=direct_stress,
+        direct_stress_weight=direct_stress_weight,
         landmark_fraction=landmark_fraction,
         outer_step_size=outer_step_size,
         options=options,
@@ -304,11 +296,11 @@ def run_benchmark(dataset, *, seed, strategy, direct_stress, landmark_fraction, 
     return read_last_summary_row(path)
 
 
-def benchmark_options(dataset, seed, strategy, direct_stress, landmark_fraction, outer_step_size):
+def benchmark_options(dataset, seed, strategy, direct_stress_weight, landmark_fraction, outer_step_size):
     outer_iter = OUTER_ITER_BY_LANDMARK_FRACTION[landmark_fraction]
     log_frequency = LOG_FREQUENCY_BY_LANDMARK_FRACTION[landmark_fraction]
-    options = dict(branching.PATH_FROZEN_OPTIONS)
-    options.update(
+    n_samples = len(dataset.D)
+    return dict(
         graph_neighbors=dataset.graph_neighbors,
         outer_iter=outer_iter,
         inner_iter=INNER_ITER,
@@ -316,57 +308,50 @@ def benchmark_options(dataset, seed, strategy, direct_stress, landmark_fraction,
         verbose=0,
         record_history=True,
         random_state=seed,
-        mask_random_state=seed,
-        target_random_state=seed + 10_000,
-        n_landmark=count_from_fraction(N_SAMPLES, landmark_fraction),
+        n_landmark=count_from_fraction(n_samples, landmark_fraction),
         random_landmark_fraction=strategy.random_landmark_fraction,
-        resample_random_landmarks=strategy.resample_random_landmarks,
-        targets_per_landmark=count_from_fraction(N_SAMPLES, TARGETS_PER_LANDMARK_FRACTION),
+        targets_per_landmark=count_from_fraction(
+            n_samples, TARGETS_PER_LANDMARK_FRACTION
+        ),
         n_local_pairs=dataset.n_local_pairs,
-        local_pair_mode=LOCAL_PAIR_MODE,
-        local_global_reweighting=LOCAL_GLOBAL_REWEIGHTING,
         local_weight=LOCAL_WEIGHT,
-        direct_stress_mode=direct_stress.mode,
-        direct_stress_weight=direct_stress.weight,
-        direct_stress_margin=direct_stress.margin,
+        direct_stress_weight=direct_stress_weight,
         outer_step_size=outer_step_size,
+        device="auto",
+        optimizer_options={"ftol": 1e-9, "maxls": 50},
     )
-    return options
 
 
-def benchmark_filename(dataset, seed, strategy, direct_stress, landmark_fraction, outer_step_size=1.0):
-    n_landmark = count_from_fraction(N_SAMPLES, landmark_fraction)
-    targets = count_from_fraction(N_SAMPLES, TARGETS_PER_LANDMARK_FRACTION)
+def benchmark_filename(
+    seed,
+    strategy,
+    direct_stress_weight,
+    landmark_fraction,
+    outer_step_size=1.0,
+    *,
+    n_samples=N_SAMPLES,
+):
+    n_landmark = count_from_fraction(n_samples, landmark_fraction)
+    targets = count_from_fraction(n_samples, TARGETS_PER_LANDMARK_FRACTION)
     outer_iter = OUTER_ITER_BY_LANDMARK_FRACTION[landmark_fraction]
     step_tag = "" if float(outer_step_size) == 1.0 else f"_oss{float_code(outer_step_size)}"
     return (
-        f"n{N_SAMPLES}_lm{percent_code(n_landmark, N_SAMPLES)}_"
+        f"n{n_samples}_lm{percent_code(n_landmark, n_samples)}_"
         f"{landmark_strategy_code(strategy)}_"
-        f"{direct_stress_code(direct_stress)}_"
-        f"targ{percent_code(targets, N_SAMPLES)}_"
+        f"{direct_stress_code(direct_stress_weight)}_"
+        f"targ{percent_code(targets, n_samples)}_"
         f"locdir_ii{INNER_ITER}_oi{outer_iter}{step_tag}_s{seed}.csv"
     )
 
 
 def landmark_strategy_code(strategy):
-    return (
-        f"rf{percent_code(int(round(100 * strategy.random_landmark_fraction)), 100)}_"
-        f"res{int(bool(strategy.resample_random_landmarks))}"
-    )
+    return f"rf{percent_code(int(round(100 * strategy.random_landmark_fraction)), 100)}"
 
 
-def direct_stress_code(config):
-    if config.weight == 0.0 or config.mode == "none":
+def direct_stress_code(weight):
+    if weight == 0.0:
         return "dsnone"
-    return f"ds{config.mode}_w{float_code(config.weight)}_m{float_code(config.margin)}"
-
-
-def sampling_code(landmark_sampling):
-    return {"random": "rand", "farthest": "far"}[landmark_sampling]
-
-
-def landmark_random_fraction(landmark_sampling):
-    return {"random": 1.0, "farthest": 0.0}[landmark_sampling]
+    return f"dsmds_w{float_code(weight)}"
 
 
 def count_from_fraction(n_samples, fraction):
@@ -388,7 +373,7 @@ def write_history_csv(
         dataset,
         seed,
         landmark_strategy,
-        direct_stress,
+        direct_stress_weight,
         landmark_fraction,
         outer_step_size,
         options,
@@ -400,10 +385,7 @@ def write_history_csv(
         "seed",
         "landmark_strategy",
         "random_landmark_fraction",
-        "resample_random_landmarks",
-        "direct_stress_mode",
         "direct_stress_weight",
-        "direct_stress_margin",
         "landmark_fraction",
         "inner_iter",
         "outer_iter_total",
@@ -412,8 +394,6 @@ def write_history_csv(
         "n_landmark",
         "targets_per_landmark",
         "n_local_pairs",
-        "local_pair_mode",
-        "local_global_reweighting",
         "local_weight",
         "outer_step_size",
         "wall_time",
@@ -432,14 +412,11 @@ def write_history_csv(
             writer.writerow(
                 {
                     "dataset": dataset.name,
-                    "n_samples": N_SAMPLES,
+                    "n_samples": len(dataset.D),
                     "seed": seed,
                     "landmark_strategy": landmark_strategy.name,
                     "random_landmark_fraction": landmark_strategy.random_landmark_fraction,
-                    "resample_random_landmarks": int(landmark_strategy.resample_random_landmarks),
-                    "direct_stress_mode": direct_stress.mode,
-                    "direct_stress_weight": direct_stress.weight,
-                    "direct_stress_margin": direct_stress.margin,
+                    "direct_stress_weight": direct_stress_weight,
                     "landmark_fraction": landmark_fraction,
                     "inner_iter": INNER_ITER,
                     "outer_iter_total": options["outer_iter"],
@@ -448,8 +425,6 @@ def write_history_csv(
                     "n_landmark": options["n_landmark"],
                     "targets_per_landmark": options["targets_per_landmark"],
                     "n_local_pairs": options["n_local_pairs"],
-                    "local_pair_mode": options["local_pair_mode"],
-                    "local_global_reweighting": options["local_global_reweighting"],
                     "local_weight": options["local_weight"],
                     "outer_step_size": options["outer_step_size"],
                     "wall_time": wall_time,
@@ -475,10 +450,7 @@ def summary_from_history(path, history, wall_time):
         "seed": final.get("seed", ""),
         "landmark_strategy": final.get("landmark_strategy", ""),
         "random_landmark_fraction": final.get("random_landmark_fraction", ""),
-        "resample_random_landmarks": final.get("resample_random_landmarks", ""),
-        "direct_stress_mode": final.get("direct_stress_mode", ""),
         "direct_stress_weight": final.get("direct_stress_weight", ""),
-        "direct_stress_margin": final.get("direct_stress_margin", ""),
         "landmark_fraction": final.get("landmark_fraction", ""),
         "n_landmark": final.get("n_landmark", ""),
         "targets_per_landmark": final.get("targets_per_landmark", ""),
@@ -516,8 +488,7 @@ def plot_dataset_curves(dataset_name, *, csv_dir, fig_dir):
         return
 
     fig, ax = plt.subplots(figsize=(8.4, 5.4))
-    colors = {"none": "tab:blue", "hinge": "tab:orange", "mds": "tab:green"}
-    linestyles = {0.0: "-", 1e-4: "--", 1e-3: "-.", 1e-2: ":"}
+    colors = {0.0: "tab:blue", 0.1: "tab:orange", 0.5: "tab:green", 1.0: "tab:red"}
     for curve in sorted(curves, key=direct_stress_curve_key):
         step = curve["outer_step_size"]
         label = (
@@ -528,8 +499,7 @@ def plot_dataset_curves(dataset_name, *, csv_dir, fig_dir):
         ax.plot(
             curve["elapsed"],
             curve["stress"],
-            color=colors.get(curve["direct_stress_mode"], "0.2"),
-            linestyle=direct_stress_curve_linestyle(curve, linestyles),
+            color=colors.get(curve["direct_stress_weight"], "0.2"),
             linewidth=1.9,
             label=label,
         )
@@ -548,12 +518,18 @@ def plot_dataset_curves(dataset_name, *, csv_dir, fig_dir):
 def load_curves(csv_dir):
     curves = []
     for strategy in LANDMARK_STRATEGIES:
-        for direct_stress in DIRECT_STRESS_CONFIGS:
+        for direct_stress_weight in DIRECT_STRESS_WEIGHTS:
             for fraction in LANDMARK_FRACTIONS:
                 for outer_step_size in OUTER_STEP_SIZES:
                     seed_curves = []
                     for seed in SEEDS:
-                        path = csv_dir / benchmark_filename(None, seed, strategy, direct_stress, fraction, outer_step_size)
+                        path = csv_dir / benchmark_filename(
+                            seed,
+                            strategy,
+                            direct_stress_weight,
+                            fraction,
+                            outer_step_size,
+                        )
                         if path.exists():
                             seed_curves.append(load_curve(path))
                     if seed_curves:
@@ -571,10 +547,7 @@ def load_curve(path):
         "path": path,
         "strategy": first["landmark_strategy"],
         "random_landmark_fraction": float(first["random_landmark_fraction"]),
-        "resample_random_landmarks": bool(int(first["resample_random_landmarks"])),
-        "direct_stress_mode": first["direct_stress_mode"],
         "direct_stress_weight": float(first["direct_stress_weight"]),
-        "direct_stress_margin": float(first["direct_stress_margin"]),
         "fraction": float(first["landmark_fraction"]),
         "outer_step_size": float(first.get("outer_step_size", 1.0)),
         "outer_iter": np.array([int(row["outer_iter"]) for row in rows], dtype=int),
@@ -598,10 +571,7 @@ def average_seed_curves(curves):
     return {
         "strategy": curves[0]["strategy"],
         "random_landmark_fraction": curves[0]["random_landmark_fraction"],
-        "resample_random_landmarks": curves[0]["resample_random_landmarks"],
-        "direct_stress_mode": curves[0]["direct_stress_mode"],
         "direct_stress_weight": curves[0]["direct_stress_weight"],
-        "direct_stress_margin": curves[0]["direct_stress_margin"],
         "fraction": curves[0]["fraction"],
         "outer_step_size": curves[0]["outer_step_size"],
         "outer_iter": outer,
@@ -612,30 +582,12 @@ def average_seed_curves(curves):
 
 
 def direct_stress_curve_key(curve):
-    mode_order = {"none": 0, "hinge": 1, "mds": 2}
-    return (
-        mode_order.get(curve["direct_stress_mode"], 9),
-        curve["direct_stress_weight"],
-        curve["direct_stress_margin"],
-    )
+    return curve["direct_stress_weight"]
 
 
 def direct_stress_curve_label(curve):
-    mode = curve["direct_stress_mode"]
     weight = curve["direct_stress_weight"]
-    margin = curve["direct_stress_margin"]
-    if mode == "none":
-        return "none"
-    if mode == "hinge":
-        return f"hinge, w={weight:g}, margin={margin:g}"
-    return f"{mode}, w={weight:g}"
-
-
-def direct_stress_curve_linestyle(curve, weight_linestyles):
-    if curve["direct_stress_mode"] != "hinge":
-        return weight_linestyles.get(curve["direct_stress_weight"], "-")
-    margin_linestyles = {0.3: "-", 0.5: "--", 0.7: "-.", 1.0: ":"}
-    return margin_linestyles.get(curve["direct_stress_margin"], weight_linestyles.get(curve["direct_stress_weight"], "-"))
+    return "none" if weight == 0 else f"direct MDS, w={weight:g}"
 
 
 if __name__ == "__main__":

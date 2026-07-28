@@ -79,7 +79,6 @@ axe de l'embedding.
 | `RandersMetric` | métrique de Finsler la plus simple, utilisée dans le papier Finsler-MDS |
 | `MatsumotoMetric` | dépendance non linéaire à la direction, peut être vue comme un temps de déplacement le long d'une pente ; |
 | `ConvexifiedMatsumotoMetric` | version "corrigeant" la non-convexité de Matsumoto pour ‖ω‖ > 1/2 ; |
-| `ToblerMetric`, `ConvexifiedToblerMetric`, `MinettiMetric` | modèles de déplacement sur pente implémentés pour des comparaisons exploratoires. |
 
 Le sous-package `finsler_mds/evaluation` fournit le stress direct ou
 géodésique, des mesures de préservation de l'asymétrie et les métriques
@@ -220,22 +219,22 @@ dans des constantes ou dictionnaires au début du fichier.
 
 | Scripts | Expérience |
 | --- | --- |
-| `main_nested_rectangles_path_frozen.py` | cas contrôlé pour GeoMDS : deux rectangles imbriqués dont les distances géodésiques ne peuvent pas être bien représentées par un MDS direct ; |
-| `main_parallel_bridges_path_frozen.py` | cas avec asymétrie que Finsler-GeoMDS peut mieux préserver que Finsler-MDS direct ; |
+| `main_nested.py` | cas contrôlé pour GeoMDS : deux rectangles imbriqués dont les distances géodésiques ne peuvent pas être bien représentées par un MDS direct ; |
+| `main_converging_flow.py` | cas avec un courant convergent dont l’asymétrie peut être mieux préservée par Finsler-GeoMDS que par Finsler-MDS direct ; |
 | `main_spiral_path_frozen.py` | cas synthétique montrant qu'on ne peut pas juste garder le graphe kNN d'origine dans Path-Frozen ; |
 | `main_mountains.py` | géodésiques sur une surface à trois montagnes ; |
-| `main_sea.py`, `main_sea_paths.py` | cartes de courants synthétiques, comparaison des métriques et visualisation de chemins source-cible. `sea_datasets.py` contient les générateurs associés ; |
-| `main_branching.py` | dataset pour le benchmarking de temps d'exécution de Path-Frozen/soft-Bellman-Ford ; |
-| `benchmark_branching_path_frozen.py`, `benchmark_soft_bellman_ford.py` | mesures de stress au cours du temps sur Branching et Swiss roll, pour comparer différents paramètres et heuristiques de Path-Frozen/soft-Bellman-Ford. |
+| `main_sea.py`, `main_sea_paths.py` | carte de courants Sea1 issue du papier Finsler-MDS, comparaison des métriques et visualisation de chemins source-cible. Les chemins affichés sont les plus courts chemins de graphes k-NN, et non des géodésiques continues exactes ; |
+| `main_branching.py` | dataset ramifié utilisé pour tester Path-Frozen ; |
+| `benchmark_path_frozen.py` | mesures de stress au cours du temps sur Branching et Swiss roll, pour comparer différents paramètres et heuristiques de Path-Frozen. |
 
 Les figures (et dans certains cas les embeddings) sont écrites dans `scripts/res/`, qui est ignoré par Git.
 
 ### Exemples issus du papier Finsler-MDS
 
-`main_swiss_roll_full.py`, `main_swiss_roll_hole.py` et `main_2D_maps.py`
+`main_swiss_roll_full.py` et `main_swiss_roll_hole.py`
 conservent les expériences de visualisation du dépôt d'origine, avec quelques
-adaptations pour utiliser l'API actuelle. Elles couvrent le Swiss roll, la
-robustesse à un trou et les cartes de rivière ou de mer.
+adaptations pour utiliser l'API actuelle. Elles couvrent le Swiss roll et sa
+robustesse à un trou.
 
 La partie Link Prediction est dans un autre dépôt : https://github.com/MorganMyr/FinslerLinkPrediction.
 

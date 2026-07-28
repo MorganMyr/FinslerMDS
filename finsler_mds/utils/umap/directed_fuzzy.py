@@ -13,17 +13,10 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.sparse
 from sklearn.manifold import SpectralEmbedding
-
-try:  # Optional acceleration, matching UMAP's use of numba for these loops.
-    import numba as nb
-except Exception:  # pragma: no cover - depends on the local environment.
-    nb = None
+from umap.umap_ import smooth_knn_dist as umap_smooth_knn_dist
 
 
 _EPS = 1e-12
-_SMOOTH_K_TOLERANCE = 1e-5
-_MIN_K_DIST_SCALE = 1e-3
-_FLOAT_MAX = np.finfo(np.float64).max
 
 
 @dataclass(frozen=True)
@@ -41,25 +34,20 @@ def directed_fuzzy_graph_from_dense(
         n_neighbors,
         *,
         weight=None,
-        symmetrize_local_scales=True,
         symmetrize_support=False,
-        symmetrize_rho=None,
-        symmetrize_sigma=None,
+        symmetrize_rho=True,
+        symmetrize_sigma=True,
         local_connectivity=1.0,
         bandwidth=1.0,
 ):
     """Build directed UMAP-style edge probabilities from a dense distance matrix."""
     D = np.asarray(dissimilarities, dtype=float)
-    if symmetrize_rho is None:
-        symmetrize_rho = bool(symmetrize_local_scales)
-    if symmetrize_sigma is None:
-        symmetrize_sigma = bool(symmetrize_local_scales)
     indices, distances, edge_weight = directed_knn_from_dense(
         D,
         n_neighbors,
         weight=weight,
     )
-    sigma, rho = smooth_knn_dist(
+    sigma, rho = _smooth_knn_dist(
         distances,
         float(n_neighbors),
         local_connectivity=float(local_connectivity),
@@ -80,7 +68,6 @@ def directed_fuzzy_graph_from_dense(
         sigma,
         rho,
         edge_weight=active_edge_weight,
-        symmetrize_local_scales=bool(symmetrize_local_scales),
         symmetrize_rho=bool(symmetrize_rho),
         symmetrize_sigma=bool(symmetrize_sigma),
     )
@@ -171,21 +158,30 @@ def directed_support_edges(
     return row[keep], col[keep], dist[keep], active_weight[keep]
 
 
-def smooth_knn_dist(distances, k, *, local_connectivity=1.0, bandwidth=1.0):
+def _smooth_knn_dist(distances, k, *, local_connectivity, bandwidth):
+    """Call UMAP with the leading self-distance column it expects."""
     distances = np.asarray(distances, dtype=float)
-    if nb is not None:
-        return _smooth_knn_dist_numba(
-            distances,
-            float(k),
-            float(local_connectivity),
-            float(bandwidth),
+    sigma = np.ones(distances.shape[0], dtype=float)
+    rho = np.zeros(distances.shape[0], dtype=float)
+
+    complete = np.all(np.isfinite(distances), axis=1)
+    if np.any(complete):
+        with_self = np.column_stack(
+            (np.zeros(np.count_nonzero(complete)), distances[complete])
         )
-    return _smooth_knn_dist_numpy(
-        distances,
-        float(k),
-        float(local_connectivity),
-        float(bandwidth),
-    )
+        sigma[complete], rho[complete] = umap_smooth_knn_dist(
+            with_self, k, local_connectivity=local_connectivity, bandwidth=bandwidth
+        )
+
+    for i in np.flatnonzero(~complete):
+        finite = distances[i, np.isfinite(distances[i])]
+        if len(finite) == 0:
+            continue
+        with_self = np.concatenate(([0.0], finite))[None, :]
+        sigma[i : i + 1], rho[i : i + 1] = umap_smooth_knn_dist(
+            with_self, k, local_connectivity=local_connectivity, bandwidth=bandwidth
+        )
+    return sigma, rho
 
 
 def directed_membership_strengths(
@@ -196,9 +192,8 @@ def directed_membership_strengths(
         rho,
         *,
         edge_weight,
-        symmetrize_local_scales,
-        symmetrize_rho=None,
-        symmetrize_sigma=None,
+        symmetrize_rho,
+        symmetrize_sigma,
 ):
     row = np.asarray(row, dtype=np.int64)
     col = np.asarray(col, dtype=np.int64)
@@ -207,10 +202,6 @@ def directed_membership_strengths(
     rho = np.asarray(rho, dtype=float)
     edge_weight = np.asarray(edge_weight, dtype=float)
 
-    if symmetrize_rho is None:
-        symmetrize_rho = bool(symmetrize_local_scales)
-    if symmetrize_sigma is None:
-        symmetrize_sigma = bool(symmetrize_local_scales)
     edge_rho = 0.5 * (rho[row] + rho[col]) if symmetrize_rho else rho[row]
     if symmetrize_sigma:
         edge_sigma = _harmonic_mean(sigma[row], sigma[col])
@@ -220,19 +211,6 @@ def directed_membership_strengths(
     probability = np.exp(-np.maximum(0.0, dist - edge_rho) / np.maximum(edge_sigma, _EPS))
     probability[dist - edge_rho <= 0.0] = 1.0
     return row, col, probability, edge_weight
-
-
-def make_epochs_per_sample(weights, n_epochs):
-    """UMAP's edge scheduler: stronger edges are sampled more frequently."""
-    weights = np.asarray(weights, dtype=float)
-    result = np.full(weights.shape[0], -1.0, dtype=float)
-    max_weight = float(np.max(weights)) if len(weights) else 0.0
-    if max_weight <= 0.0:
-        return result
-    n_samples = float(n_epochs) * (weights / max_weight)
-    active = n_samples > 0.0
-    result[active] = float(n_epochs) / n_samples[active]
-    return result
 
 
 def spectral_initial_embedding(row, col, probability, n_samples, n_components, rng):
@@ -279,52 +257,6 @@ def symmetric_fuzzy_union(row, col, probability, n_samples):
     return graph
 
 
-def _smooth_knn_dist_numpy(distances, k, local_connectivity, bandwidth):
-    target = np.log2(k) * bandwidth
-    rho = np.zeros(distances.shape[0], dtype=float)
-    sigma = np.ones(distances.shape[0], dtype=float)
-    finite_distances = distances[np.isfinite(distances)]
-    mean_distances = float(np.mean(finite_distances)) if len(finite_distances) else 1.0
-
-    for i in range(distances.shape[0]):
-        ith = distances[i][np.isfinite(distances[i])]
-        if len(ith) == 0:
-            continue
-        positive = ith[ith > 0.0]
-        if len(positive) >= local_connectivity:
-            index = int(np.floor(local_connectivity))
-            interpolation = local_connectivity - index
-            if index > 0:
-                rho[i] = positive[index - 1]
-                if interpolation > _SMOOTH_K_TOLERANCE and index < len(positive):
-                    rho[i] += interpolation * (positive[index] - positive[index - 1])
-            else:
-                rho[i] = interpolation * positive[0]
-        elif len(positive) > 0:
-            rho[i] = np.max(positive)
-
-        lo = 0.0
-        hi = _FLOAT_MAX
-        mid = 1.0
-        for _ in range(64):
-            shifted = ith - rho[i]
-            value = np.where(shifted > 0.0, np.exp(-(shifted / mid)), 1.0).sum()
-            if abs(value - target) < _SMOOTH_K_TOLERANCE:
-                break
-            if value > target:
-                hi = mid
-                mid = 0.5 * (lo + hi)
-            else:
-                lo = mid
-                mid = 2.0 * mid if hi >= _FLOAT_MAX else 0.5 * (lo + hi)
-        sigma[i] = mid
-        mean_ith = float(np.mean(ith))
-        floor = _MIN_K_DIST_SCALE * (mean_ith if rho[i] > 0.0 else mean_distances)
-        if sigma[i] < floor:
-            sigma[i] = floor
-    return sigma, rho
-
-
 def _harmonic_mean(a, b):
     denom = a + b
     return np.divide(
@@ -341,85 +273,3 @@ def _scale_coords(coords, *, max_coord):
     if max_abs <= _EPS:
         return coords.copy()
     return coords * (float(max_coord) / max_abs)
-
-
-if nb is not None:
-
-    @nb.njit(cache=True, parallel=True)
-    def _smooth_knn_dist_numba(distances, k, local_connectivity, bandwidth):
-        target = np.log2(k) * bandwidth
-        rho = np.zeros(distances.shape[0], dtype=np.float64)
-        sigma = np.ones(distances.shape[0], dtype=np.float64)
-        mean_sum = 0.0
-        mean_count = 0
-        for i in range(distances.shape[0]):
-            for j in range(distances.shape[1]):
-                value = distances[i, j]
-                if np.isfinite(value):
-                    mean_sum += value
-                    mean_count += 1
-        mean_distances = mean_sum / mean_count if mean_count else 1.0
-
-        for i in nb.prange(distances.shape[0]):
-            positive = np.empty(distances.shape[1], dtype=np.float64)
-            ith = np.empty(distances.shape[1], dtype=np.float64)
-            n_positive = 0
-            n_ith = 0
-            mean_ith = 0.0
-            for j in range(distances.shape[1]):
-                value = distances[i, j]
-                if not np.isfinite(value):
-                    continue
-                ith[n_ith] = value
-                n_ith += 1
-                mean_ith += value
-                if value > 0.0:
-                    positive[n_positive] = value
-                    n_positive += 1
-            if n_ith == 0:
-                continue
-            mean_ith /= n_ith
-
-            if n_positive >= local_connectivity:
-                index = int(np.floor(local_connectivity))
-                interpolation = local_connectivity - index
-                if index > 0:
-                    rho[i] = positive[index - 1]
-                    if interpolation > _SMOOTH_K_TOLERANCE and index < n_positive:
-                        rho[i] += interpolation * (positive[index] - positive[index - 1])
-                else:
-                    rho[i] = interpolation * positive[0]
-            elif n_positive > 0:
-                max_value = positive[0]
-                for j in range(1, n_positive):
-                    if positive[j] > max_value:
-                        max_value = positive[j]
-                rho[i] = max_value
-
-            lo = 0.0
-            hi = _FLOAT_MAX
-            mid = 1.0
-            for _ in range(64):
-                psum = 0.0
-                for j in range(n_ith):
-                    d = ith[j] - rho[i]
-                    if d > 0.0:
-                        psum += np.exp(-(d / mid))
-                    else:
-                        psum += 1.0
-                if abs(psum - target) < _SMOOTH_K_TOLERANCE:
-                    break
-                if psum > target:
-                    hi = mid
-                    mid = 0.5 * (lo + hi)
-                else:
-                    lo = mid
-                    if hi >= _FLOAT_MAX:
-                        mid *= 2.0
-                    else:
-                        mid = 0.5 * (lo + hi)
-            sigma[i] = mid
-            floor = _MIN_K_DIST_SCALE * (mean_ith if rho[i] > 0.0 else mean_distances)
-            if sigma[i] < floor:
-                sigma[i] = floor
-        return sigma, rho

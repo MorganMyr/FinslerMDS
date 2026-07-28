@@ -1,162 +1,203 @@
-"""Path helpers for pancreas embeddings and figures."""
+"""Paths and minimal embedding I/O for pancreas experiments."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 
+import numpy as np
 
-PREFIX_TO_METHOD = (
-    ("s_new_", "new_smacof"),
-    ("s_old_", "old_smacof"),
-    ("smacof_", "smacof"),
-    ("sklearn_mds_", "sklearn_mds"),
-    ("gd_", "gradient_descent"),
-    ("fumap_", "finsler_umap"),
-    ("pf_", "path_frozen"),
-    ("sbf_", "soft_bf"),
-    ("umap_", "umap"),
-    ("isomap_", "isomap"),
-)
+from .embedding_io import cache_token, load_saved_embedding, metric_alpha_tag
 
-FAMILY_TO_METHOD = {
+
+_METHOD_TAGS = {
+    "smacof": "smacof",
+    "smacof_randers": "smacof",
+    "gradient_descent": "gd",
+    "gd": "gd",
+    "finsler_umap": "fumap",
+    "fumap": "fumap",
+    "path_frozen": "pf",
+    "pf": "pf",
+}
+_TAG_TO_DIRECTORY = {
+    "smacof": "smacof",
     "gd": "gradient_descent",
-    "gradient_descent": "gradient_descent",
     "fumap": "finsler_umap",
-    "finsler_umap": "finsler_umap",
     "pf": "path_frozen",
-    "path_frozen": "path_frozen",
-    "sbf": "soft_bf",
-    "soft_bf": "soft_bf",
-    "smacof": "new_smacof",
-    "s_new": "new_smacof",
-    "s_old": "old_smacof",
     "umap": "umap",
     "isomap": "isomap",
 }
 
 
-def pancreas_artifact_method(filename: str) -> str | None:
-    name = Path(filename).name
-    if Path(name).stem in {"umap", "isomap"}:
-        return Path(name).stem
-    for prefix, method in PREFIX_TO_METHOD:
-        if name.startswith(prefix):
-            return method
-    return None
+def pancreas_method_tag(method):
+    key = str(method).lower().replace("-", "_")
+    try:
+        return _METHOD_TAGS[key]
+    except KeyError as exc:
+        raise ValueError(f"Unknown pancreas method: {method!r}.") from exc
 
 
-def pancreas_artifact_dimension(filename: str) -> int | None:
-    stem = Path(filename).stem.lower()
-    if re.search(r"(^|_)3d(_|$)", stem):
-        return 3
-    if re.search(r"(^|_)2d(_|$)", stem):
-        return 2
-    if stem in {"umap", "isomap"} or stem.startswith(("umap_", "isomap_")):
-        return 2
-    return None
+def pancreas_result_stem(method, *, n_components, velocity_tag, metric_tag, dataset_prefix="pancreas"):
+    prefix = pancreas_file_prefix(dataset_prefix)
+    return f"{prefix}{pancreas_method_tag(method)}_{int(n_components)}d_{velocity_tag}_{metric_tag}"
 
 
-def pancreas_artifact_dir(base_dir, filename: str):
-    method = pancreas_artifact_method(filename)
-    dim = pancreas_artifact_dimension(filename)
-    if method is None or dim is None:
+def pancreas_reference_stem(
+        method,
+        *,
+        n_components,
+        n_neighbors,
+        min_dist=None,
+        dataset_prefix="pancreas",
+):
+    method = str(method).lower()
+    if method not in {"umap", "isomap"}:
+        raise ValueError("Reference method must be 'umap' or 'isomap'.")
+    stem = (
+        f"{pancreas_file_prefix(dataset_prefix)}{method}_{int(n_components)}d_"
+        f"k{int(n_neighbors)}"
+    )
+    if method == "umap" and min_dist is not None:
+        stem += f"_md{cache_token(min_dist)}"
+    return stem
+
+
+def pancreas_artifact_dir(base_dir, filename):
+    name = Path(filename).name.lower()
+    method = next(
+        (directory for tag, directory in _TAG_TO_DIRECTORY.items() if name.startswith(f"{tag}_")),
+        None,
+    )
+    dimension = re.search(r"(^|_)([23])d(_|$)", Path(filename).stem.lower())
+    if method is None or dimension is None:
         return Path(base_dir)
-    return Path(base_dir) / method / f"{dim}D"
+    return Path(base_dir) / method / f"{dimension.group(2)}D"
 
 
-def pancreas_raw_embedding_path(raw_dir, filename: str):
+def pancreas_embedding_path(raw_dir, stem):
+    filename = f"{stem}.npz"
     path = pancreas_artifact_dir(raw_dir, filename) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def pancreas_velocity_cache_dir(raw_dir):
-    path = Path(raw_dir) / "velocity_inputs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def pancreas_velocity_cache_path(raw_dir, filename: str):
-    return pancreas_velocity_cache_dir(raw_dir) / Path(filename).name
-
-
-def pancreas_figure_path(pancreas_dir, filename: str):
-    path = pancreas_artifact_dir(Path(pancreas_dir) / "figure", filename) / filename
+    path = Path(raw_dir) / "velocity_inputs" / Path(filename).name
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def pancreas_figure_path(pancreas_dir, filename: str):
+    path = pancreas_artifact_dir(Path(pancreas_dir) / "figure", filename) / Path(filename).name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_pancreas_embedding(path, embedding, cell_ids, *, objective=None, metadata=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {
+        "embedding": np.asarray(embedding, dtype=float),
+        "cell_ids": np.asarray(cell_ids, dtype=str),
+    }
+    if objective is not None:
+        arrays["objective"] = np.asarray(objective, dtype=float)
+    if metadata is not None:
+        arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(path, **arrays)
+    print(f"Saved embedding: {path}")
+
+
+def load_pancreas_embedding(
+        path,
+        *,
+        cell_ids=None,
+        expected_shape=None,
+        expected_metadata=None,
+):
+    if Path(path).suffix != ".npz":
+        raise ValueError("Pancreas embeddings must use the .npz format.")
+    embedding = load_saved_embedding(path, cell_ids=cell_ids)
+    if expected_metadata is not None:
+        with np.load(path, allow_pickle=False) as cache:
+            if "metadata_json" not in cache:
+                raise ValueError(f"Saved embedding has no cache metadata: {path}")
+            metadata = json.loads(str(cache["metadata_json"].item()))
+        if metadata != expected_metadata:
+            raise ValueError(f"Saved embedding has incompatible cache metadata: {path}")
+    if expected_shape is not None and embedding.shape != tuple(expected_shape):
+        raise ValueError(
+            f"Saved embedding has shape {embedding.shape}, expected {expected_shape}: {path}"
+        )
+    return embedding
+
+
 def resolve_pancreas_embedding_path(value: str, raw_dir):
+    """Resolve an arbitrary initialization path; new embeddings are NPZ-only."""
     path = Path(str(value))
-    candidates = []
-    if path.is_absolute():
-        candidates.append(path)
-    else:
-        raw_dir = Path(raw_dir)
-        candidates.extend([
-            raw_dir / path,
-            pancreas_raw_embedding_path(raw_dir, path.name),
-        ])
-        if path.suffix == "":
-            for suffix in (".npz", ".npy"):
-                candidates.extend([
-                    raw_dir / path.with_suffix(suffix),
-                    pancreas_raw_embedding_path(raw_dir, path.with_suffix(suffix).name),
-                ])
-    for candidate in candidates:
-        if candidate.exists() and candidate.suffix in {".npz", ".npy"}:
-            return candidate
+    if path.suffix not in {"", ".npz"}:
+        raise ValueError("Pancreas initialization files must use the .npz format.")
+    if path.suffix == "":
+        path = path.with_suffix(".npz")
+
     raw_dir = Path(raw_dir)
-    for suffix in ([path.suffix] if path.suffix else [".npz", ".npy"]):
-        matches = list(raw_dir.glob(f"*/*/{path.stem}{suffix}"))
-        if matches:
-            return max(matches, key=lambda item: item.stat().st_mtime)
-    searched = ", ".join(str(candidate) for candidate in candidates)
+    candidates = [path] if path.is_absolute() else [Path.cwd() / path, raw_dir / path]
+    if not path.is_absolute():
+        candidates.extend(raw_dir.glob(f"*/*/{path.name}"))
+    existing = [candidate for candidate in candidates if candidate.is_file()]
+    if existing:
+        return max(existing, key=lambda candidate: candidate.stat().st_mtime)
+    searched = ", ".join(map(str, candidates))
     raise FileNotFoundError(f"Embedding file not found. Searched: {searched}")
 
 
-def latest_pancreas_embedding_path(raw_dir, family: str, embedding_dim: int, dataset_prefix=""):
+def latest_pancreas_embedding_path(raw_dir, method, embedding_dim, dataset_prefix="pancreas"):
+    """Return the latest result, preferring the requested dimension over 2D."""
+    tag = pancreas_method_tag(method)
+    prefix = pancreas_file_prefix(dataset_prefix)
     raw_dir = Path(raw_dir)
-    method = FAMILY_TO_METHOD.get(family, family)
-    prefix = "" if dataset_prefix == "pancreas" else (f"{dataset_prefix}_" if dataset_prefix else "")
-    dim_patterns = [[f"{prefix}{family}_{int(embedding_dim)}d_*.npz"]]
-    if int(embedding_dim) == 3:
-        dim_patterns.append([f"{prefix}{family}_2d_*.npz"])
-    candidate_groups = []
-    for patterns in dim_patterns:
-        candidates = []
-        for pattern in patterns:
-            dim = 2 if "_2d_" in pattern else int(embedding_dim)
-            candidates.extend((raw_dir / method / f"{dim}D").glob(pattern))
-            candidates.extend(raw_dir.glob(pattern))
-        candidate_groups.append(candidates)
-    if family == "smacof":
-        for short_family, short_method in (("s_new", "new_smacof"), ("s_old", "old_smacof")):
-            patterns = [[f"{prefix}{short_family}_{int(embedding_dim)}d_*.npz"]]
-            if int(embedding_dim) == 3:
-                patterns.append([f"{prefix}{short_family}_2d_*.npz"])
-            for pattern_group in patterns:
-                candidates = []
-                for pattern in pattern_group:
-                    dim = 2 if "_2d_" in pattern else int(embedding_dim)
-                    candidates.extend((raw_dir / short_method / f"{dim}D").glob(pattern))
-                    candidates.extend(raw_dir.glob(pattern))
-                candidate_groups.append(candidates)
-    for candidates in candidate_groups:
+    dimensions = [int(embedding_dim)] + ([2] if int(embedding_dim) == 3 else [])
+    for dimension in dimensions:
+        pattern = f"{prefix}{tag}_{dimension}d_*.npz"
+        directory = raw_dir / _TAG_TO_DIRECTORY[tag] / f"{dimension}D"
+        candidates = list(directory.glob(pattern)) + list(raw_dir.glob(pattern))
         if candidates:
             return max(set(candidates), key=lambda path: path.stat().st_mtime)
     return None
 
 
+def pancreas_file_prefix(dataset_prefix):
+    return "" if dataset_prefix == "pancreas" else f"{dataset_prefix}_"
+
+
+def pancreas_velocity_inputs_path(raw_dir, *, velocity, dataset_prefix="pancreas", seed=42):
+    formula = str(velocity["distance_formula"]).lower()
+    formula_tag = {"randers": "vrand", "matsumoto": "vmats"}.get(formula)
+    if formula_tag is None:
+        raise ValueError("velocity distance formula must be 'randers' or 'matsumoto'.")
+    name = (
+        f"{pancreas_file_prefix(dataset_prefix)}velocity_inputs_{velocity['mode']}_"
+        f"{formula_tag}_valpha{metric_alpha_tag(velocity['alpha'])}_"
+        f"cclip{cache_token(velocity['cos_clip'])}_"
+        f"ke{int(velocity['kNN_euclid'])}_kf{int(velocity['kNN_finsler'])}_s{int(seed)}.npz"
+    )
+    return pancreas_velocity_cache_path(raw_dir, name)
+
+
 __all__ = [
-    "pancreas_artifact_dimension",
-    "pancreas_artifact_dir",
-    "pancreas_artifact_method",
-    "pancreas_figure_path",
-    "pancreas_raw_embedding_path",
-    "pancreas_velocity_cache_dir",
-    "pancreas_velocity_cache_path",
-    "resolve_pancreas_embedding_path",
     "latest_pancreas_embedding_path",
+    "load_pancreas_embedding",
+    "pancreas_artifact_dir",
+    "pancreas_embedding_path",
+    "pancreas_figure_path",
+    "pancreas_file_prefix",
+    "pancreas_method_tag",
+    "pancreas_reference_stem",
+    "pancreas_result_stem",
+    "pancreas_velocity_cache_path",
+    "pancreas_velocity_inputs_path",
+    "resolve_pancreas_embedding_path",
+    "save_pancreas_embedding",
 ]

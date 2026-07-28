@@ -21,6 +21,7 @@ from sklearn.utils import check_array, check_random_state
 from sklearn.utils.parallel import Parallel, delayed
 
 from finsler_mds.metrics import RandersMetric
+from finsler_mds.optimizers.metric_kernels import load_cupy
 
 
 @dataclass(frozen=True)
@@ -41,25 +42,6 @@ def _validate_randers_metric(metric):
     return metric
 
 
-def _load_cupy():
-    try:
-        import cupy as cp
-    except Exception as exc:
-        return None, exc
-
-    try:
-        if cp.cuda.runtime.getDeviceCount() <= 0:
-            return None, RuntimeError("CuPy did not find a CUDA device.")
-        values = cp.arange(4, dtype=cp.float64)
-        indices = cp.asarray([0, 2], dtype=cp.int32)
-        cp.asnumpy(values[indices] + 1.0)
-        matrix = cp.eye(2, dtype=cp.float64)
-        cp.asnumpy(matrix @ matrix)
-    except Exception as exc:
-        return None, exc
-    return cp, None
-
-
 def _resolve_gpu_backend(device, alpha, verbose, *, allow_zero_alpha=False):
     if device not in {"cpu", "auto", "gpu", "cuda"}:
         raise ValueError("device must be one of 'cpu', 'auto', 'gpu', or 'cuda'.")
@@ -76,7 +58,7 @@ def _resolve_gpu_backend(device, alpha, verbose, *, allow_zero_alpha=False):
             return None
         raise ValueError(message)
 
-    cp, error = _load_cupy()
+    cp, error = load_cupy()
     if cp is None:
         message = f"smacof_randers GPU backend unavailable: {error}"
         if device == "auto":

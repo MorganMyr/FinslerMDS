@@ -334,9 +334,6 @@ def plot_3d_embedding_views(
         ax.set_title(view_name)
         ax.set_box_aspect([1, 1, 1])
         set_axes_equal(ax)
-        ax.set_xlabel("Embedding 1")
-        ax.set_ylabel("Embedding 2")
-        ax.set_zlabel("Embedding 3")
 
     for empty_id in range(n_views, n_rows * n_cols):
         ax = fig.add_subplot(n_rows, n_cols, empty_id + 1, projection="3d")
@@ -461,15 +458,15 @@ def plot_3d_continuous_embedding_views(
         ax.set_title(view_name)
         ax.set_box_aspect([1, 1, 1])
         set_axes_equal(ax)
-        ax.set_xlabel("Embedding 1")
-        ax.set_ylabel("Embedding 2")
-        ax.set_zlabel("Embedding 3")
 
     if title is not None:
         fig.suptitle(title)
     if mappable is not None:
-        fig.colorbar(mappable, ax=fig.axes, fraction=0.025, pad=0.02)
-    fig.tight_layout(rect=(0, 0, 0.96, 0.96))
+        fig.subplots_adjust(left=0.02, right=0.80, bottom=0.04, top=0.91)
+        colorbar_ax = fig.add_axes((0.88, 0.18, 0.025, 0.64))
+        fig.colorbar(mappable, cax=colorbar_ax)
+    else:
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
     if save_path is not None:
         fig.savefig(save_path)
     return fig, fig.axes
@@ -587,7 +584,87 @@ def geodesic_path_indices(
         indices=int(source),
         return_predecessors=True,
     )
-    return _path_from_predecessors(predecessors, int(source), int(target))
+    return path_from_predecessors(predecessors, int(source), int(target))
+
+
+def path_from_predecessors(predecessors, source, target):
+    """Reconstruct a source-target path from one row of a predecessor matrix."""
+    predecessors = np.asarray(predecessors)
+    if predecessors.ndim == 2:
+        predecessors = predecessors[int(source)]
+    if predecessors.ndim != 1:
+        raise ValueError("predecessors must be one-dimensional or a square matrix.")
+    if source == target:
+        return [int(source)]
+
+    path = [int(target)]
+    current = int(target)
+    while current != source:
+        current = int(predecessors[current])
+        if current < 0:
+            return None
+        path.append(current)
+    path.reverse()
+    return path
+
+
+def add_index_path(
+        ax,
+        points,
+        path,
+        *,
+        color="crimson",
+        linewidth=3,
+        linestyle="-",
+        alpha=1.0,
+        label=None,
+        endpoint_color="black",
+        endpoint_size=60,
+        source_marker="o",
+        target_marker="X",
+        show_endpoints=True,
+        show_arrow=False,
+        arrow_size=0.5,
+        zorder=10,
+):
+    """Add a known vertex path to an existing 2D or 3D point plot."""
+    points = np.asarray(points)
+    path = np.asarray(path, dtype=int)
+    if path.ndim != 1 or len(path) == 0:
+        raise ValueError("path must contain at least one vertex index.")
+    _plot_path(
+        ax,
+        points,
+        path,
+        color=color,
+        linewidth=linewidth,
+        linestyle=linestyle,
+        alpha=alpha,
+        label=label,
+        zorder=zorder,
+    )
+    if show_endpoints:
+        _plot_path_endpoints(
+            ax,
+            points,
+            path,
+            color=endpoint_color,
+            size=endpoint_size,
+            source_marker=source_marker,
+            target_marker=target_marker,
+            zorder=zorder + 1,
+        )
+    if show_arrow:
+        _plot_path_arrow(
+            ax,
+            points,
+            path,
+            color=endpoint_color,
+            arrow_size=arrow_size,
+            alpha=alpha,
+            zorder=zorder + 2,
+        )
+    return path
 
 
 def add_geodesic_path(
@@ -623,28 +700,21 @@ def add_geodesic_path(
     )
     if path is None:
         return None
-    _plot_path(ax, embedding, path, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
-    _plot_path_endpoints(
+    return add_index_path(
         ax,
         embedding,
         path,
-        color=endpoint_color,
-        size=endpoint_size,
+        color=color,
+        linewidth=linewidth,
+        alpha=alpha,
+        endpoint_color=endpoint_color,
+        endpoint_size=endpoint_size,
         source_marker=source_marker,
         target_marker=target_marker,
-        zorder=zorder + 1,
+        show_arrow=show_arrow,
+        arrow_size=arrow_size,
+        zorder=zorder,
     )
-    if show_arrow:
-        _plot_path_arrow(
-            ax,
-            embedding,
-            path,
-            color=endpoint_color,
-            arrow_size=arrow_size,
-            alpha=alpha,
-            zorder=zorder + 2,
-        )
-    return path
 
 
 def add_geodesic_path_by_coords(
@@ -714,7 +784,7 @@ def add_random_geodesic_paths(
     paths = []
     for path_id, (source, target) in enumerate(pairs):
         pred_row = predecessors[source_to_row[source]]
-        path = _path_from_predecessors(pred_row, int(source), int(target))
+        path = path_from_predecessors(pred_row, int(source), int(target))
         if path is None:
             continue
         path_color = colors[path_id]
@@ -771,23 +841,18 @@ def _random_distinct_pairs(n_points, n_pairs, rng):
     return pairs
 
 
-def _path_from_predecessors(predecessors, source, target):
-    if source == target:
-        return [source]
-
-    path = [target]
-    current = target
-    while current != source:
-        previous = int(predecessors[current])
-        if previous < 0:
-            return None
-        path.append(previous)
-        current = previous
-    path.reverse()
-    return path
-
-
-def _plot_path(ax, embedding, path, *, color, linewidth, alpha, zorder):
+def _plot_path(
+        ax,
+        embedding,
+        path,
+        *,
+        color,
+        linewidth,
+        linestyle="-",
+        alpha,
+        label=None,
+        zorder,
+):
     path_points = embedding[path]
     if embedding.shape[1] == 2:
         ax.plot(
@@ -795,7 +860,9 @@ def _plot_path(ax, embedding, path, *, color, linewidth, alpha, zorder):
             path_points[:, 1],
             color=color,
             linewidth=linewidth,
+            linestyle=linestyle,
             alpha=alpha,
+            label=label,
             zorder=zorder,
         )
     elif embedding.shape[1] == 3:
@@ -805,7 +872,9 @@ def _plot_path(ax, embedding, path, *, color, linewidth, alpha, zorder):
             path_points[:, 2],
             color=color,
             linewidth=linewidth,
+            linestyle=linestyle,
             alpha=alpha,
+            label=label,
             zorder=zorder,
         )
     else:
@@ -1000,6 +1069,8 @@ __all__ = [
     "nearest_point_index",
     "build_geodesic_plot_graph",
     "geodesic_path_indices",
+    "path_from_predecessors",
+    "add_index_path",
     "add_geodesic_path",
     "add_geodesic_path_by_coords",
     "add_random_geodesic_paths",

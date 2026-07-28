@@ -69,40 +69,6 @@ def symmetric_knn_graph(
     return graph
 
 
-def softmin_with_probs(values, beta, axis=-1, prob_dtype=None):
-    """Return softmin values and the associated probabilities.
-
-    The soft minimum is ``-log(sum(exp(-beta*x))) / beta``. Non-finite
-    candidates are ignored; if all candidates are infinite, the softmin is
-    infinite and all probabilities are zero.
-    """
-    values = np.asarray(values, dtype=float)
-    if beta <= 0:
-        raise ValueError("beta must be positive.")
-
-    finite = np.isfinite(values)
-    any_finite = np.any(finite, axis=axis, keepdims=True)
-    shifted_min = np.min(np.where(finite, values, np.inf), axis=axis, keepdims=True)
-
-    scores = np.zeros_like(values, dtype=float)
-    broadcast_min = np.broadcast_to(shifted_min, values.shape)
-    valid = finite & np.broadcast_to(any_finite, values.shape)
-    scores[valid] = np.exp(-beta * (values[valid] - broadcast_min[valid]))
-
-    denom = np.sum(scores, axis=axis, keepdims=True)
-    probs = np.divide(scores, denom, out=np.zeros_like(scores), where=denom > 0)
-
-    soft = np.full(np.squeeze(shifted_min, axis=axis).shape, np.inf, dtype=float)
-    finite_out = np.squeeze(any_finite, axis=axis)
-    soft[finite_out] = (
-        np.squeeze(shifted_min, axis=axis)[finite_out]
-        - np.log(np.squeeze(denom, axis=axis)[finite_out]) / beta
-    )
-    if prob_dtype is not None:
-        probs = probs.astype(prob_dtype, copy=False)
-    return soft, probs
-
-
 def metric_graph_from_support(X, support_graph, finsler_metric):
     support = support_graph.tocoo()
     edge_vectors = X[support.col] - X[support.row]
@@ -545,7 +511,6 @@ def compute_dist_matrix(
 __all__ = [
     "nearest_neighbors",
     "symmetric_knn_graph",
-    "softmin_with_probs",
     "average_vectors_on_graph",
     "velocity_directed_graph",
     "compute_velocity_dist_matrix",

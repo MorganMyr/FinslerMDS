@@ -1,5 +1,5 @@
 from .api import fit_finsler_mds
-from .optimizers import FinslerUmapResult, finsler_umap, optimize_finsler_umap
+from .optimizers import finsler_umap
 from .evaluation import (
     AsymmetryPreservationResult,
     DistanceEmbeddingEvaluation,
@@ -26,21 +26,13 @@ from .evaluation.rna_velocity import (
 from .metrics import (
     AlphaBetaMetric,
     ConvexifiedMatsumotoMetric,
-    ConvexifiedToblerMetric,
-    MinettiMetric,
     MatsumotoMetric,
     RandersMetric,
-    ToblerMetric,
-    canonical_randers_metric,
-    canonical_randers_dissimilarity,
-    get_metric,
 )
 
 __all__ = [
     "fit_finsler_mds",
-    "FinslerUmapResult",
     "finsler_umap",
-    "optimize_finsler_umap",
     "geodesic_embedding_stress",
     "evaluate_geodesic_stress",
     "AsymmetryPreservationResult",
@@ -64,10 +56,4 @@ __all__ = [
     "RandersMetric",
     "MatsumotoMetric",
     "ConvexifiedMatsumotoMetric",
-    "ToblerMetric",
-    "ConvexifiedToblerMetric",
-    "MinettiMetric",
-    "canonical_randers_metric",
-    "canonical_randers_dissimilarity",
-    "get_metric",
 ]

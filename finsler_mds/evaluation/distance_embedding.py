@@ -259,8 +259,6 @@ def _normalize_distance_mode(mode):
         "gd": "direct",
         "geodesic": "geodesic",
         "path_frozen": "geodesic",
-        "soft_bf": "geodesic",
-        "soft_bellman_ford": "geodesic",
     }
     if key not in aliases:
         raise ValueError("mode must be one of {'direct', 'geodesic'}.")

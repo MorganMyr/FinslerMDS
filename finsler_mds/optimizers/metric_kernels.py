@@ -4,10 +4,29 @@ from __future__ import annotations
 
 from finsler_mds.metrics import (
     ConvexifiedMatsumotoMetric,
-    ConvexifiedToblerMetric,
     MatsumotoMetric,
     RandersMetric,
 )
+
+
+def load_cupy():
+    """Load CuPy and check that its CUDA runtime is usable."""
+    try:
+        import cupy as cp
+    except Exception as exc:
+        return None, exc
+
+    try:
+        if cp.cuda.runtime.getDeviceCount() <= 0:
+            return None, RuntimeError("CuPy did not find a CUDA device.")
+        values = cp.arange(4, dtype=cp.float64)
+        indices = cp.asarray([0, 2], dtype=cp.int32)
+        cp.asnumpy(values[indices] + 1.0)
+        matrix = cp.eye(2, dtype=cp.float64)
+        cp.asnumpy(matrix @ matrix)
+    except Exception as exc:
+        return None, exc
+    return cp, None
 
 
 def gpu_metric_supported(metric):
@@ -19,7 +38,6 @@ def gpu_metric_supported(metric):
             RandersMetric,
             MatsumotoMetric,
             ConvexifiedMatsumotoMetric,
-            ConvexifiedToblerMetric,
         ),
     )
 
@@ -61,21 +79,6 @@ def cupy_metric_length_and_grad(cp, edge_vectors, metric):
             denominator = 1 - metric.alpha * s
             phi = cp.where(linear, 4 * metric.alpha * s, 1 / denominator)
             dphi = cp.where(linear, 4 * metric.alpha, metric.alpha / denominator**2)
-    elif isinstance(metric, ConvexifiedToblerMetric):
-        slope_denominator = cp.sqrt(cp.maximum(1 - s**2, 0.0))
-        finite_slope = slope_denominator > 1e-12
-        slope = cp.where(finite_slope, s / slope_denominator, cp.sign(s) * cp.inf)
-        dslope = cp.where(finite_slope, 1.0 / slope_denominator**3, cp.inf)
-        shifted = slope + metric.b
-        base_phi = cp.exp(metric.a * cp.abs(shifted)) / metric.speed
-        base_dphi = base_phi * metric.a * cp.sign(shifted) * dslope
-
-        uphill = s > metric.s_uphill
-        downhill = s < metric.s_downhill
-        phi = cp.where(uphill, s / metric.z_max, base_phi)
-        phi = cp.where(downhill, s / metric.z_min, phi)
-        dphi = cp.where(uphill, 1.0 / metric.z_max, base_dphi)
-        dphi = cp.where(downhill, 1.0 / metric.z_min, dphi)
     else:
         raise TypeError(f"Unsupported GPU metric {type(metric).__name__}.")
 
@@ -91,4 +94,5 @@ def cupy_metric_length_and_grad(cp, edge_vectors, metric):
 __all__ = [
     "cupy_metric_length_and_grad",
     "gpu_metric_supported",
+    "load_cupy",
 ]

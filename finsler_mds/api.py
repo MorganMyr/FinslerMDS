@@ -7,13 +7,10 @@ from time import perf_counter
 
 from finsler_mds.metrics import RandersMetric
 from finsler_mds.optimizers import (
-    datasp,
     finsler_umap,
     gradient_descent,
     path_frozen,
-    relaxed_bellman_ford,
     smacof_randers,
-    soft_bellman_ford,
 )
 
 
@@ -24,13 +21,6 @@ _OPTIMIZERS = {
     "fumap": finsler_umap,
     "path_frozen": path_frozen,
     "frozen_paths": path_frozen,
-    "datasp": datasp,
-    "dataSP": datasp,
-    "soft_floyd_warshall": datasp,
-    "soft_bellman_ford": soft_bellman_ford,
-    "sbf": soft_bellman_ford,
-    "relaxed_bellman_ford": relaxed_bellman_ford,
-    "rbf": relaxed_bellman_ford,
     "smacof": smacof_randers,
     "smacof_randers": smacof_randers,
     "randers_smacof": smacof_randers,

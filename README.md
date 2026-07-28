@@ -78,7 +78,6 @@ embedding axis.
 | `RandersMetric` | simplest Finsler metric, used in the Finsler-MDS paper |
 | `MatsumotoMetric` | nonlinear directional dependence, interpretable as travel time along a slope |
 | `ConvexifiedMatsumotoMetric` | version that “corrects” the non-convexity of Matsumoto for ‖ω‖ > 1/2 |
-| `ToblerMetric`, `ConvexifiedToblerMetric`, `MinettiMetric` | slope-dependent travel models implemented for exploratory comparisons |
 
 The `finsler_mds/evaluation` subpackage provides direct and geodesic stress,
 asymmetry-preservation measures, and the evaluation metrics used for RNA
@@ -230,23 +229,23 @@ dictionaries near the beginning of each file.
 
 | Scripts | Experiment |
 | --- | --- |
-| `main_nested_rectangles_path_frozen.py` | controlled GeoMDS case: two nested rectangles whose geodesic distances cannot be represented well by direct MDS |
-| `main_parallel_bridges_path_frozen.py` | asymmetric case whose structure can be preserved better by Finsler-GeoMDS than by direct Finsler-MDS |
+| `main_nested.py` | controlled GeoMDS case: two nested rectangles whose geodesic distances cannot be represented well by direct MDS |
+| `main_converging_flow.py` | converging-current case whose asymmetry can be preserved better by Finsler-GeoMDS than by direct Finsler-MDS |
 | `main_spiral_path_frozen.py` | synthetic case showing that the original kNN graph cannot simply be kept fixed in Path-Frozen |
 | `main_mountains.py` | geodesics on a surface with three mountains |
-| `main_sea.py`, `main_sea_paths.py` | synthetic current maps, metric comparisons, and source-target path visualization; `sea_datasets.py` contains the corresponding generators |
-| `main_branching.py` | dataset used to benchmark Path-Frozen and soft Bellman-Ford execution time |
-| `benchmark_branching_path_frozen.py`, `benchmark_soft_bellman_ford.py` | stress-over-time measurements on Branching and Swiss roll, used to compare Path-Frozen and soft Bellman-Ford parameters and heuristics |
+| `main_sea.py`, `main_sea_paths.py` | the Sea1 current map from the Finsler-MDS paper, metric comparisons, and source-target path visualization. Displayed paths are shortest paths on k-NN graphs rather than exact continuous geodesics |
+| `main_branching.py` | branching dataset used to test Path-Frozen |
+| `benchmark_path_frozen.py` | stress-over-time measurements on Branching and Swiss roll, used to compare Path-Frozen parameters and heuristics |
 
 Figures, and in some cases embeddings, are written to `scripts/res/`, which is
 ignored by Git.
 
 ### Examples from the Finsler-MDS Paper
 
-`main_swiss_roll_full.py`, `main_swiss_roll_hole.py`, and `main_2D_maps.py`
+`main_swiss_roll_full.py` and `main_swiss_roll_hole.py`
 retain the visualization experiments from the original repository, with some
-adaptations for the current API. They cover the Swiss roll, robustness to a
-hole, and river or sea maps.
+adaptations for the current API. They cover the Swiss roll and robustness to a
+hole.
 
 The Link Prediction component is maintained in a
 [separate repository](https://github.com/MorganMyr/FinslerLinkPrediction).
